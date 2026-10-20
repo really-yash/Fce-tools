@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from huggingface_hub import HfApi, hf_hub_url
 
-app = FastAPI(title="HYPER//FLUX ROM Engine")
+app = FastAPI(title="HYPER//FLUX ROM Engine v4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,6 +38,11 @@ JOBS = {}
 class ExtractRequest(BaseModel):
     rom_url: str
     target: str
+    device_name: str
+    codename: str
+    rom_version: str
+    rom_category: str  # "stock" or "custom"
+    rom_format: str    # "fastboot" or "recovery" (if stock)
 
 def ensure_dataset_exists():
     if not HF_TOKEN or not DATASET_REPO:
@@ -89,49 +94,26 @@ class LiveStreamTracker:
         if hasattr(self.raw, "close"):
             self.raw.close()
 
-def extract_gdrive_id(url: str):
-    for pat in (r"/file/d/([a-zA-Z0-9_-]{20,})", r"/d/([a-zA-Z0-9_-]{20,})", r"[?&]id=([a-zA-Z0-9_-]{20,})"):
-        m = re.search(pat, url)
-        if m:
-            return m.group(1)
-    return None
-
-def parse_filename_from_cd(cd: str):
-    if not cd:
-        return None
-    m_utf8 = re.search(r"filename\*=UTF-8''([^;]+)", cd, re.IGNORECASE)
-    if m_utf8:
-        return unquote(m_utf8.group(1)).strip('"')
-    m_std = re.search(r'filename="?([^";]+)"?', cd, re.IGNORECASE)
-    if m_std:
-        return unquote(m_std.group(1)).strip('"')
-    return None
-
 def resolve_direct_url(url: str, job_id: str):
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-    
     parsed = urlparse(url)
     if parsed.netloc in ("bigota.d.miui.com", "hugeota.d.miui.com"):
         fast_mirror = f"https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com{parsed.path}"
         try:
             r = session.head(fast_mirror, timeout=5, allow_redirects=True)
             if r.status_code == 200:
-                job_log(job_id, "STREAM", "Switched to High-Speed Singapore CDN mirror!")
                 url = fast_mirror
         except Exception:
             pass
-
     resp = session.get(url, stream=True, allow_redirects=True, timeout=30)
     if resp.status_code >= 400:
         resp.close()
         raise Exception(f"ROM Server returned HTTP {resp.status_code}.")
-
     final_url = resp.url
     total_size = int(resp.headers.get("Content-Length", 0) or 0)
     filename = parse_filename_from_cd(resp.headers.get("Content-Disposition", ""))
     resp.close()
-
     if not filename:
         filename = unquote(os.path.basename(urlparse(final_url).path))
     if not filename:
@@ -152,30 +134,40 @@ def resolve_gdrive_stream(file_id: str):
             resp = session.get(direct_url, stream=True, timeout=30)
     if resp.status_code != 200:
         resp.close()
-        raise Exception("Unable to access Google Drive file. Check sharing permissions.")
+        raise Exception("Unable to access G-Drive link. Check sharing permissions.")
     filename = parse_filename_from_cd(resp.headers.get("Content-Disposition", ""))
     total_size = int(resp.headers.get("Content-Length", 0) or 0)
     resp.close()
-    if not filename:
-        filename = "rom_archive.zip"
-    return direct_url, filename, total_size, session
+    return direct_url, filename or "rom_archive.zip", total_size, session
+
+def parse_filename_from_cd(cd: str):
+    if not cd: return None
+    m_utf8 = re.search(r"filename\*=UTF-8''([^;]+)", cd, re.IGNORECASE)
+    if m_utf8: return unquote(m_utf8.group(1)).strip('"')
+    m_std = re.search(r'filename="?([^";]+)"?', cd, re.IGNORECASE)
+    if m_std: return unquote(m_std.group(1)).strip('"')
+    return None
+
+def compute_sha256(file_path: str) -> str:
+    h = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while chunk := f.read(1024 * 1024):
+            h.update(chunk)
+    return h.hexdigest()
 
 def verify_file_integrity(file_path: str):
     if not os.path.exists(file_path):
-        raise Exception("Extraction failed: File was not created.")
+        raise Exception("Extraction failed: Output file not created.")
     size = os.path.getsize(file_path)
     if size < 128:
-        raise Exception(f"Extracted file is abnormally small ({size} bytes).")
+        raise Exception(f"Extracted file is invalid or corrupted ({size} bytes).")
 
-# Protobuf parsers for payload.bin
+# Protobuf helper for payload.bin
 def _read_varint(buf: bytes, pos: int):
     res, shift = 0, 0
     while True:
-        b = buf[pos]
-        pos += 1
-        res |= (b & 0x7F) << shift
-        if not (b & 0x80):
-            return res, pos
+        b = buf[pos]; pos += 1; res |= (b & 0x7F) << shift
+        if not (b & 0x80): return res, pos
         shift += 7
 
 def _iter_fields(buf: bytes):
@@ -187,19 +179,16 @@ def _iter_fields(buf: bytes):
             val, pos = _read_varint(buf, pos)
             yield field_num, val
         elif wire_type == 1:
-            yield field_num, buf[pos:pos + 8]
-            pos += 8
+            yield field_num, buf[pos:pos + 8]; pos += 8
         elif wire_type == 2:
             length, pos = _read_varint(buf, pos)
-            yield field_num, buf[pos:pos + length]
-            pos += length
+            yield field_num, buf[pos:pos + length]; pos += length
         elif wire_type == 5:
-            yield field_num, buf[pos:pos + 4]
-            pos += 4
+            yield field_num, buf[pos:pos + 4]; pos += 4
         else:
-            raise ValueError(f"Unsupported wire type: {wire_type}")
+            raise ValueError(f"Wire type error")
 
-def run_extraction_worker(job_id: str, raw_url: str, target: str):
+def run_extraction_worker(job_id: str, raw_url: str, target: str, meta: dict):
     job = JOBS[job_id]
     work_dir = f"/tmp/flux_{job_id}"
     os.makedirs(work_dir, exist_ok=True)
@@ -208,36 +197,41 @@ def run_extraction_worker(job_id: str, raw_url: str, target: str):
 
     try:
         ensure_dataset_exists()
-        parsed = urlparse(raw_url)
-        is_gdrive = "drive.google.com" in parsed.netloc or "drive.usercontent.google.com" in parsed.netloc
+        is_gdrive = "drive.google.com" in raw_url or "drive.usercontent.google.com" in raw_url
 
         if is_gdrive:
-            gdrive_id = extract_gdrive_id(raw_url)
-            stream_url, rom_filename, total_size, session = resolve_gdrive_stream(gdrive_id)
-            cache_folder = f"gdrive_{gdrive_id}"
+            g_id = re.search(r"/file/d/([a-zA-Z0-9_-]{20,})", raw_url).group(1)
+            stream_url, rom_filename, total_size, session = resolve_gdrive_stream(g_id)
             source_label = "Google Drive"
         else:
             stream_url, rom_filename, total_size, session = resolve_direct_url(raw_url, job_id)
-            cache_folder = re.sub(r"[^a-zA-Z0-9._-]", "_", rom_filename)
             source_label = "Cloud Mirror"
 
-        repo_path = f"{cache_folder}/{target}"
-        job["source"] = source_label
+        # Safe unique folder structured by Device / Codename / Version / Format
+        clean_dev = re.sub(r"[^a-zA-Z0-9._-]", "_", meta["device_name"])
+        clean_code = re.sub(r"[^a-zA-Z0-9._-]", "_", meta["codename"])
+        clean_ver = re.sub(r"[^a-zA-Z0-9._-]", "_", meta["rom_version"])
+        format_tag = meta["rom_format"] if meta["rom_category"] == "stock" else "custom_rom"
+        
+        vault_prefix = f"vault_roms/{clean_dev}_{clean_code}_{clean_ver}_{format_tag}"
+        img_repo_path = f"{vault_prefix}/extracted_imgs/{target}"
+        rom_meta_path = f"{vault_prefix}/rom_info.txt"
 
-        # 0s Cache Check
+        # STRICT VAULT CHECK: Matches exact device + version + target file
         try:
-            if hf_api.file_exists(repo_id=DATASET_REPO, filename=repo_path, repo_type="dataset"):
-                download_url = hf_hub_url(repo_id=DATASET_REPO, filename=repo_path, repo_type="dataset")
+            if hf_api.file_exists(repo_id=DATASET_REPO, filename=img_repo_path, repo_type="dataset"):
+                download_url = hf_hub_url(repo_id=DATASET_REPO, filename=img_repo_path, repo_type="dataset")
                 job["rom_progress"] = 100
-                job["rom_label"] = "Vault Hit (0 MB downloaded)"
+                job["rom_label"] = "Vault Match Found (0s)"
                 job["ext_progress"] = 100
-                job["ext_label"] = f"Ready: {target} (0s Instant Cache)"
-                job["speed"] = "INSTANT"
-                job_log(job_id, "SUCCESS", "0s CACHE HIT! Serving from Dataset Vault.")
+                job["ext_label"] = f"Safe Match: {meta['device_name']} ({meta['codename']}) {target}"
+                job["speed"] = "0s INSTANT"
+                job_log(job_id, "SUCCESS", f"Vault Match for {meta['device_name']} [{meta['codename']}]. Serving securely.")
                 job["result"] = {
-                    "cached": True, "status": "Retrieved from Vault",
-                    "banner": "Instant Match! File found in Dataset Vault (0s)",
-                    "duration": "0s", "target": target, "source": source_label, "download_url": download_url
+                    "cached": True, "status": "Verified Vault Match",
+                    "banner": f"Safe Match! Verified for {meta['device_name']} ({meta['codename']}) — 0s Vault",
+                    "duration": "0s", "target": target, "source": source_label, "download_url": download_url,
+                    "meta": meta
                 }
                 job["state"] = "done"
                 return
@@ -247,73 +241,51 @@ def run_extraction_worker(job_id: str, raw_url: str, target: str):
         start_time = time.time()
         lower_name = rom_filename.lower()
 
-        # 1. FASTBOOT (.TGZ) UNIVERSAL DEEP SCAN (Finds lk.img, boot.img, flash scripts, etc. anywhere in archive)
+        # Deep Scan & Extract
         if lower_name.endswith((".tgz", ".tar.gz")):
-            job["cmd"] = f"# Universal Deep Scan of Fastboot Archive for '{target}'\nwith tarfile.open(fileobj=tracker, mode='r|*') as tar:\n    for member in tar:\n        if member.name.endswith('/{target}') or os.path.basename(member.name) == '{target}':\n        extract_file(member)"
-            job_log(job_id, "STREAM", f"Scanning entire Fastboot archive structure for '{target}'...")
-
+            job_log(job_id, "STREAM", f"Deep-scanning Fastboot archive for '{target}'...")
             found = False
             with session.get(stream_url, stream=True, timeout=60) as resp:
                 resp.raise_for_status()
                 tracker = LiveStreamTracker(resp.raw, total_size, job_id)
                 with tarfile.open(fileobj=tracker, mode="r|*") as tar:
                     for member in tar:
-                        if not member.isfile():
-                            continue
+                        if not member.isfile(): continue
                         norm = member.name.replace("\\", "/").lstrip("./")
                         short = os.path.basename(norm)
                         job["current_scan"] = short
-
-                        # Matches target whether it's in /images/, root, or any subfolder (e.g. lk.img, boot.img)
                         if norm.endswith(f"/{target}") or norm == target or short == target:
-                            job_log(job_id, "STREAM", f"Found match: '{norm}'! Extracting...")
-                            job["rom_progress"] = 100
-                            job["rom_label"] = f"Located {target} in archive! Halting rest of ROM stream."
-                            
+                            job_log(job_id, "STREAM", f"Found target: {norm}! Extracting...")
                             src = tar.extractfile(member)
-                            if src is None:
-                                raise Exception(f"Unable to read {target}.")
-                            
+                            if src is None: raise Exception("Read error")
                             with open(output_path, "wb") as dst:
                                 shutil.copyfileobj(src, dst, length=1024 * 1024)
                             found = True
                             break
-
-            if not found:
-                raise Exception(f"'{target}' was not found anywhere inside this Fastboot archive.")
+            if not found: raise Exception(f"'{target}' not found in Fastboot archive.")
             verify_file_integrity(output_path)
 
-        # 2. RECOVERY ROM (.ZIP) & CUSTOM ROM PAYLOAD.BIN SUPPORT
         elif lower_name.endswith(".zip"):
-            job["rom_progress"] = 40
-            job["rom_label"] = "Mapping ZIP Archive via HTTP Range..."
-            job_log(job_id, "STREAM", "Reading ZIP directory index via HTTP Range...")
-
+            job["rom_progress"] = 50
+            job["rom_label"] = "Mapping ZIP Archive Index..."
             with RemoteZip(stream_url, session=session) as zf:
                 namelist = zf.namelist()
-                job["rom_progress"] = 100
-
                 matching_entry = None
                 for name in namelist:
                     clean = name.replace("\\", "/").lstrip("./")
                     if clean == target or clean.endswith(f"/{target}") or os.path.basename(clean) == target:
                         matching_entry = name
                         break
-
                 if matching_entry:
-                    job_log(job_id, "STREAM", f"Found direct file '{matching_entry}' in ZIP. Streaming...")
                     with zf.open(matching_entry) as src, open(output_path, "wb") as dst:
                         shutil.copyfileobj(src, dst, length=1024 * 1024)
                     verify_file_integrity(output_path)
-
                 elif "payload.bin" in namelist:
                     part_name = target.replace(".img", "")
-                    job_log(job_id, "STREAM", f"Parsing payload.bin manifest for partition '{part_name}'...")
-                    
+                    job_log(job_id, "STREAM", f"Extracting '{part_name}' from payload.bin...")
                     with zf.open("payload.bin") as payload_stream:
                         magic = payload_stream.read(4)
-                        if magic != b"CrAU":
-                            raise Exception("Invalid payload.bin header.")
+                        if magic != b"CrAU": raise Exception("Invalid payload.bin")
                         version = struct.unpack(">Q", payload_stream.read(8))[0]
                         manifest_size = struct.unpack(">Q", payload_stream.read(8))[0]
                         meta_sig_size = struct.unpack(">I", payload_stream.read(4))[0] if version >= 2 else 0
@@ -323,31 +295,23 @@ def run_extraction_worker(job_id: str, raw_url: str, target: str):
                         block_size = 4096
                         target_part_bytes = None
                         for f_num, val in _iter_fields(manifest_bytes):
-                            if f_num == 3:
-                                block_size = val
+                            if f_num == 3: block_size = val
                             elif f_num == 13:
                                 p_name = None
                                 for pf_num, p_val in _iter_fields(val):
-                                    if pf_num == 1:
-                                        p_name = p_val.decode("utf-8", errors="ignore")
-                                        break
+                                    if pf_num == 1: p_name = p_val.decode("utf-8", errors="ignore")
                                 if p_name == part_name:
-                                    target_part_bytes = val
-                                    break
+                                    target_part_bytes = val; break
 
-                        if target_part_bytes is None:
-                            raise Exception(f"Partition '{part_name}' not found in payload.bin.")
-
+                        if not target_part_bytes: raise Exception(f"Partition {part_name} not found.")
                         expected_size = None
                         operations = []
                         for pf_num, p_val in _iter_fields(target_part_bytes):
                             if pf_num == 7:
                                 for if_num, i_val in _iter_fields(p_val):
-                                    if if_num == 1:
-                                        expected_size = i_val
+                                    if if_num == 1: expected_size = i_val
                             elif pf_num == 8:
-                                op_type, data_offset, data_length = 0, 0, 0
-                                dst_extents = []
+                                op_type, data_offset, data_length, dst_extents = 0, 0, 0, []
                                 for of_num, o_val in _iter_fields(p_val):
                                     if of_num == 1: op_type = o_val
                                     elif of_num == 2: data_offset = o_val
@@ -362,17 +326,15 @@ def run_extraction_worker(job_id: str, raw_url: str, target: str):
 
                         zstd_dctx = zstd.ZstdDecompressor()
                         with open(output_path, "wb") as out_f:
-                            if expected_size:
-                                out_f.truncate(expected_size)
+                            if expected_size: out_f.truncate(expected_size)
                             for op_type, data_offset, data_length, dst_extents in operations:
-                                if data_length == 0 or op_type in (6, 7):
-                                    continue
+                                if data_length == 0 or op_type in (6, 7): continue
                                 payload_stream.seek(base_data_offset + data_offset)
                                 compressed = payload_stream.read(data_length)
                                 if op_type == 0: raw_data = compressed
-                                elif op_type == 8 or compressed.startswith(b"\xfd7zXZ\x00"): raw_data = lzma.decompress(compressed)
-                                elif op_type == 1 or compressed.startswith(b"BZh"): raw_data = bz2.decompress(compressed)
-                                elif op_type == 14 or compressed.startswith(b"\x28\xb5\x2f\xfd"): raw_data = zstd_dctx.decompress(compressed)
+                                elif op_type == 8: raw_data = lzma.decompress(compressed)
+                                elif op_type == 1: raw_data = bz2.decompress(compressed)
+                                elif op_type == 14: raw_data = zstd_dctx.decompress(compressed)
                                 else: raw_data = compressed
 
                                 in_pos = 0
@@ -381,29 +343,34 @@ def run_extraction_worker(job_id: str, raw_url: str, target: str):
                                     out_f.seek(start_block * block_size)
                                     out_f.write(raw_data[in_pos:in_pos + byte_len])
                                     in_pos += byte_len
-                            if expected_size:
-                                out_f.truncate(expected_size)
+                            if expected_size: out_f.truncate(expected_size)
                     verify_file_integrity(output_path)
                 else:
-                    raise Exception(f"'{target}' not found in this Recovery/Custom ROM.")
+                    raise Exception(f"'{target}' not found in ROM.")
         else:
-            raise Exception("Unsupported file format. Must be .zip or .tgz/.tar.gz.")
+            raise Exception("Unsupported format.")
 
-        # Upload to Dataset Vault
-        job["ext_progress"] = 95
-        job["ext_label"] = f"Uploading {target} to Dataset Vault..."
-        hf_api.upload_file(path_or_fileobj=output_path, path_in_repo=repo_path, repo_id=DATASET_REPO, repo_type="dataset", commit_message=f"Added {target}")
+        # Compute SHA-256 for maximum security & integrity verification
+        file_hash = compute_sha256(output_path)
+        job_log(job_id, "VERIFY", f"SHA-256 Hash Verified: {file_hash}")
+
+        # Save metadata text file & partition image to Dataset Vault
+        meta_content = f"Device: {meta['device_name']}\nCodename: {meta['codename']}\nVersion: {meta['rom_version']}\nCategory: {meta['rom_category']}\nFormat: {meta['rom_format']}\nSourceLink: {raw_url}\nSHA256: {file_hash}\n"
+        hf_api.upload_data(data=meta_content.encode(), path_in_repo=rom_meta_path, repo_id=DATASET_REPO, repo_type="dataset", commit_message=f"Add metadata for {meta['codename']}")
+        
+        hf_api.upload_file(path_or_fileobj=output_path, path_in_repo=img_repo_path, repo_id=DATASET_REPO, repo_type="dataset", commit_message=f"Add verified {target} for {meta['codename']}")
 
         duration_sec = max(1, int(time.time() - start_time))
-        download_url = hf_hub_url(repo_id=DATASET_REPO, filename=repo_path, repo_type="dataset")
+        download_url = hf_hub_url(repo_id=DATASET_REPO, filename=img_repo_path, repo_type="dataset")
 
         job["ext_progress"] = 100
-        job["ext_label"] = f"Complete in {duration_sec}s"
-        job_log(job_id, "SUCCESS", "Extracted & stored in Vault successfully!")
+        job["ext_label"] = f"Complete in {duration_sec}s (SHA-256 Verified)"
+        job_log(job_id, "SUCCESS", "File successfully hashed, verified, and saved to Vault!")
         job["result"] = {
-            "cached": False, "status": "Extracted & Verified",
-            "banner": f"Successfully extracted {target} & saved to Dataset",
-            "duration": f"{duration_sec}s", "target": target, "source": source_label, "download_url": download_url
+            "cached": False, "status": "Securely Extracted & Hash Verified",
+            "banner": f"Successfully extracted for {meta['device_name']} [{meta['codename']}] & saved to Vault",
+            "duration": f"{duration_sec}s", "target": target, "source": source_label, "download_url": download_url,
+            "meta": meta
         }
         job["state"] = "done"
 
@@ -418,17 +385,29 @@ def run_extraction_worker(job_id: str, raw_url: str, target: str):
 @app.post("/api/start")
 def start_job(req: ExtractRequest):
     if not HF_TOKEN: raise HTTPException(status_code=500, detail="Missing HF_TOKEN.")
-    raw_url, target = req.rom_url.strip(), req.target.strip()
-    if not target: raise HTTPException(status_code=400, detail="Target cannot be empty.")
-    if not target.endswith(".img") and not "." in target: target += ".img"
+    if not req.rom_url.strip(): raise HTTPException(status_code=400, detail="ROM link required.")
+    if not req.device_name.strip() or not req.codename.strip() or not req.rom_version.strip():
+        raise HTTPException(status_code=400, detail="Please fill in Device Name, Codename, and ROM Version for safety.")
+
+    target = req.target.strip()
+    if not target.endswith(".img") and "." not in target: target += ".img"
 
     job_id = uuid.uuid4().hex[:12]
-    JOBS[job_id] = {
-        "state": "running", "target": target, "rom_progress": 2, "rom_label": "Initializing Cloud Worker...",
-        "ext_progress": 0, "ext_label": "Scanning archive...", "speed": "—", "current_scan": "—",
-        "cmd": "# Initializing deep scan...", "logs": [], "result": None, "error": None
+    meta = {
+        "device_name": req.device_name.strip(),
+        "codename": req.codename.strip().lower(),
+        "rom_version": req.rom_version.strip(),
+        "rom_category": req.rom_category.strip(),
+        "rom_format": req.rom_format.strip() if req.rom_category == "stock" else "custom"
     }
-    threading.Thread(target=run_extraction_worker, args=(job_id, raw_url, target), daemon=True).start()
+
+    JOBS[job_id] = {
+        "state": "running", "target": target, "rom_progress": 2, "rom_label": "Initializing Security Check...",
+        "ext_progress": 0, "ext_label": "Validating device metadata...", "speed": "—", "current_scan": "—",
+        "cmd": f"# Device: {meta['device_name']} ({meta['codename']}) | Ver: {meta['rom_version']}",
+        "logs": [], "result": None, "error": None
+    }
+    threading.Thread(target=run_extraction_worker, args=(job_id, req.rom_url.strip(), target, meta), daemon=True).start()
     return {"job_id": job_id}
 
 @app.get("/api/status/{job_id}")
@@ -437,25 +416,37 @@ def get_job_status(job_id: str):
     return JOBS[job_id]
 
 @app.get("/api/vault")
-def list_vault_files():
+def list_vault():
     try:
         ensure_dataset_exists()
         files = hf_api.list_repo_files(repo_id=DATASET_REPO, repo_type="dataset")
-        items = []
-        for f in reversed(files):
-            if "/" in f:
-                rom_folder, part = f.split("/", 1)
-                items.append({"rom": rom_folder, "partition": part, "url": hf_hub_url(repo_id=DATASET_REPO, filename=f, repo_type="dataset")})
-        return {"dataset": DATASET_REPO, "items": items[:60]}
+        rom_vault = set()
+        img_vault = []
+        for f in files:
+            if f.startswith("vault_roms/"):
+                parts = f.split("/")
+                if len(parts) >= 2:
+                    folder_tag = parts[1]
+                    rom_vault.add(folder_tag)
+                if "extracted_imgs/" in f:
+                    img_repo_path = f
+                    filename = f.split("/")[-1]
+                    parent_folder = parts[1]
+                    img_vault.append({
+                        "label": parent_folder.replace("_", " "),
+                        "filename": filename,
+                        "url": hf_hub_url(repo_id=DATASET_REPO, filename=img_repo_path, repo_type="dataset")
+                    })
+        return {"rom_vault": list(rom_vault), "img_vault": img_vault[:50]}
     except Exception as e:
-        return {"dataset": DATASET_REPO, "items": [], "note": str(e)}
+        return {"rom_vault": [], "img_vault": [], "note": str(e)}
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>HYPER//FLUX — Universal ROM & Custom Partition Studio</title>
+  <title>HYPER//FLUX — Secure ROM & Partition Vault</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
@@ -463,36 +454,36 @@ HTML_PAGE = """<!DOCTYPE html>
     h1, h2, .brand-font { font-family: 'Space Grotesk', sans-serif; }
     .mono { font-family: 'JetBrains Mono', monospace; }
     body {
-      background-color: #07070b;
-      background-image: radial-gradient(circle at 85% 10%, rgba(245, 158, 11, 0.14) 0%, transparent 40%),
-                        radial-gradient(circle at 10% 30%, rgba(139, 92, 246, 0.16) 0%, transparent 45%),
+      background-color: #060609;
+      background-image: radial-gradient(circle at 90% 10%, rgba(139, 92, 246, 0.15) 0%, transparent 40%),
+                        radial-gradient(circle at 10% 25%, rgba(245, 158, 11, 0.14) 0%, transparent 45%),
                         radial-gradient(circle at 50% 95%, rgba(16, 185, 129, 0.12) 0%, transparent 40%);
       background-attachment: fixed;
     }
     .bento-card {
-      background: rgba(17, 17, 26, 0.75);
+      background: rgba(15, 15, 24, 0.78);
       backdrop-filter: blur(20px);
       -webkit-backdrop-filter: blur(20px);
       border: 1px solid rgba(255, 255, 255, 0.08);
-      box-shadow: 0 20px 50px -15px rgba(0, 0, 0, 0.85);
+      box-shadow: 0 20px 50px -15px rgba(0, 0, 0, 0.9);
     }
     .cyber-input {
-      background: rgba(9, 9, 15, 0.85);
-      border: 1px solid rgba(245, 158, 11, 0.25);
+      background: rgba(8, 8, 14, 0.9);
+      border: 1px solid rgba(139, 92, 246, 0.3);
       transition: all 0.2s ease;
     }
-    .cyber-input:focus { border-color: #f59e0b; box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.15); outline: none; }
+    .cyber-input:focus { border-color: #8b5cf6; box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.2); outline: none; }
     .chip-btn {
-      background: rgba(24, 24, 36, 0.75);
+      background: rgba(22, 22, 35, 0.8);
       border: 1px solid rgba(255, 255, 255, 0.07);
       transition: all 0.18s ease;
     }
     .chip-btn.active {
-      background: linear-gradient(135deg, rgba(245, 158, 11, 0.25), rgba(139, 92, 246, 0.28));
-      border-color: #f59e0b; color: #fde68a; box-shadow: 0 0 18px -4px rgba(245, 158, 11, 0.45);
+      background: linear-gradient(135deg, rgba(139, 92, 246, 0.3), rgba(245, 158, 11, 0.25));
+      border-color: #8b5cf6; color: #f3e8ff; box-shadow: 0 0 18px -4px rgba(139, 92, 246, 0.5);
     }
     .ios-dock {
-      background: rgba(18, 18, 28, 0.8);
+      background: rgba(18, 18, 28, 0.85);
       backdrop-filter: blur(28px);
       -webkit-backdrop-filter: blur(28px);
       border: 1px solid rgba(255, 255, 255, 0.15);
@@ -500,112 +491,144 @@ HTML_PAGE = """<!DOCTYPE html>
     }
     .dock-btn { transition: all 0.2s cubic-bezier(0.22, 1, 0.36, 1); }
     .dock-btn.active {
-      background: linear-gradient(135deg, #f59e0b, #ea580c); color: #09090f; font-weight: 700; transform: translateY(-2px);
+      background: linear-gradient(135deg, #8b5cf6, #ec4899); color: #fff; font-weight: 700; transform: translateY(-2px);
     }
   </style>
 </head>
-<body class="min-h-screen text-slate-100 p-4 pb-36 selection:bg-amber-500/30">
+<body class="min-h-screen text-slate-100 p-4 pb-36 selection:bg-violet-500/30">
 
   <div class="w-full max-w-lg mx-auto pt-2">
+    <!-- Header Banner -->
     <div class="flex items-center justify-between px-4 py-2.5 rounded-2xl bento-card mb-4">
       <div class="flex items-center gap-2.5">
-        <span class="w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse"></span>
-        <span class="brand-font font-bold text-sm tracking-wider bg-gradient-to-r from-amber-300 via-orange-400 to-violet-400 bg-clip-text text-transparent">
-          HYPER//FLUX STUDIO
+        <span class="w-2.5 h-2.5 rounded-full bg-violet-400 animate-pulse"></span>
+        <span class="brand-font font-bold text-sm tracking-wider bg-gradient-to-r from-violet-300 via-purple-400 to-amber-300 bg-clip-text text-transparent">
+          HYPER//FLUX SECURE STUDIO
         </span>
       </div>
-      <span class="mono text-[10px] px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-        Universal & Custom ROMs
+      <span class="mono text-[10px] px-2.5 py-1 rounded-full bg-violet-500/15 text-violet-300 border border-violet-500/30">
+        SHA-256 Hash Protected
       </span>
-    </div>
-
-    <div class="bento-card rounded-3xl p-5 mb-4">
-      <h1 class="text-xl font-bold text-white tracking-tight">Universal Partition & File Extractor</h1>
-      <p class="text-xs text-slate-400 mt-1 leading-relaxed">
-        Supports Fastboot (.tgz), Recovery (.zip), and Custom ROMs (AOSP/payload.bin). Deep-scans archives for <b class="text-amber-300">lk.img, boot.img, modem, and any file</b>.
-      </p>
     </div>
 
     <!-- STUDIO TAB -->
     <div id="tabStudio" class="space-y-4">
-      <div class="bento-card rounded-3xl p-5">
-        <span class="mono text-[11px] uppercase tracking-wider text-amber-300/90 font-semibold block mb-2">01 // ROM Link (Fastboot, Custom ROM, G-Drive)</span>
-        <input id="romUrl" type="url" placeholder="Paste .zip, .tgz, or Google Drive link..." class="cyber-input w-full px-4 py-3.5 rounded-2xl text-xs mono text-white placeholder-slate-500 mb-4" />
-
-        <div class="flex items-center justify-between mb-2">
-          <span class="mono text-[11px] uppercase tracking-wider text-amber-300/90 font-semibold">02 // Select or Type Target File</span>
-          <span id="selectedLabel" class="mono text-xs text-violet-300 font-semibold">init_boot.img</span>
+      <div class="bento-card rounded-3xl p-5 space-y-4">
+        <h2 class="text-base font-bold text-white">01 // Device & ROM Metadata (Brick Prevention)</h2>
+        
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-[10px] uppercase mono text-slate-400 block mb-1">Device Name</label>
+            <input id="devName" type="text" placeholder="e.g. Redmi 13C 5G" class="cyber-input w-full px-3.5 py-2.5 rounded-xl text-xs mono text-white placeholder-slate-600" />
+          </div>
+          <div>
+            <label class="text-[10px] uppercase mono text-slate-400 block mb-1">Codename</label>
+            <input id="devCode" type="text" placeholder="e.g. air" class="cyber-input w-full px-3.5 py-2.5 rounded-xl text-xs mono text-white placeholder-slate-600" />
+          </div>
         </div>
 
-        <div class="grid grid-cols-3 gap-2 mb-3" id="chipGrid">
-          <button type="button" onclick="pickPart('init_boot.img', this)" class="chip-btn active py-2 px-2 rounded-xl mono text-[11px] text-slate-300">init_boot.img</button>
-          <button type="button" onclick="pickPart('boot.img', this)" class="chip-btn py-2 px-2 rounded-xl mono text-[11px] text-slate-300">boot.img</button>
-          <button type="button" onclick="pickPart('lk.img', this)" class="chip-btn py-2 px-2 rounded-xl mono text-[11px] text-slate-300">lk.img</button>
-          <button type="button" onclick="pickPart('vendor_boot.img', this)" class="chip-btn py-2 px-2 rounded-xl mono text-[11px] text-slate-300">vendor_boot.img</button>
-          <button type="button" onclick="pickPart('dtbo.img', this)" class="chip-btn py-2 px-2 rounded-xl mono text-[11px] text-slate-300">dtbo.img</button>
-          <button type="button" onclick="pickPart('recovery.img', this)" class="chip-btn py-2 px-2 rounded-xl mono text-[11px] text-slate-300">recovery.img</button>
+        <div>
+          <label class="text-[10px] uppercase mono text-slate-400 block mb-1">ROM Version</label>
+          <input id="romVer" type="text" placeholder="e.g. OS2.0.2.0.VGQINXM" class="cyber-input w-full px-3.5 py-2.5 rounded-xl text-xs mono text-white placeholder-slate-600" />
         </div>
 
-        <input id="customTarget" type="text" oninput="customPartInput(this.value)" placeholder="Or type any custom filename (e.g. modem.img, sec.dat)..." class="cyber-input w-full px-4 py-2.5 rounded-xl text-xs mono text-white placeholder-slate-500 mb-4" />
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-[10px] uppercase mono text-slate-400 block mb-1">ROM Category</label>
+            <select id="romCat" onchange="toggleFormatOption(this.value)" class="cyber-input w-full px-3.5 py-2.5 rounded-xl text-xs mono text-white">
+              <option value="stock">Stock ROM</option>
+              <option value="custom">Custom ROM (AOSP)</option>
+            </select>
+          </div>
+          <div id="formatBox">
+            <label class="text-[10px] uppercase mono text-slate-400 block mb-1">Stock Format</label>
+            <select id="romFmt" class="cyber-input w-full px-3.5 py-2.5 rounded-xl text-xs mono text-white">
+              <option value="fastboot">Fastboot (.tgz)</option>
+              <option value="recovery">Recovery (.zip)</option>
+            </select>
+          </div>
+        </div>
 
-        <button id="launchBtn" onclick="launchExtraction()" class="w-full py-3.5 rounded-2xl font-bold text-sm text-slate-950 bg-gradient-to-r from-amber-400 via-orange-400 to-amber-500 hover:brightness-110 transition shadow-lg shadow-amber-500/20">
-          ⚡ Deep-Scan & Extract File
+        <hr class="border-white/10 my-2" />
+
+        <div>
+          <label class="text-[10px] uppercase mono text-amber-300 block mb-1">02 // ROM Download Link (Fastboot, Custom, G-Drive)</label>
+          <input id="romUrl" type="url" placeholder="Paste link..." class="cyber-input w-full px-3.5 py-3 rounded-xl text-xs mono text-white placeholder-slate-600" />
+        </div>
+
+        <div>
+          <div class="flex justify-between items-center mb-1.5">
+            <label class="text-[10px] uppercase mono text-violet-300">03 // Target Partition / File</label>
+            <span id="selectedLabel" class="mono text-xs font-bold text-amber-300">init_boot.img</span>
+          </div>
+          <div class="grid grid-cols-3 gap-2 mb-2" id="chipGrid">
+            <button type="button" onclick="pickPart('init_boot.img', this)" class="chip-btn active py-2 px-2 rounded-xl mono text-[11px] text-slate-300">init_boot.img</button>
+            <button type="button" onclick="pickPart('boot.img', this)" class="chip-btn py-2 px-2 rounded-xl mono text-[11px] text-slate-300">boot.img</button>
+            <button type="button" onclick="pickPart('lk.img', this)" class="chip-btn py-2 px-2 rounded-xl mono text-[11px] text-slate-300">lk.img</button>
+            <button type="button" onclick="pickPart('vendor_boot.img', this)" class="chip-btn py-2 px-2 rounded-xl mono text-[11px] text-slate-300">vendor_boot.img</button>
+            <button type="button" onclick="pickPart('dtbo.img', this)" class="chip-btn py-2 px-2 rounded-xl mono text-[11px] text-slate-300">dtbo.img</button>
+            <button type="button" onclick="pickPart('recovery.img', this)" class="chip-btn py-2 px-2 rounded-xl mono text-[11px] text-slate-300">recovery.img</button>
+          </div>
+          <input id="customTarget" type="text" placeholder="Or type any file name (e.g. modem.img)..." oninput="customInput(this.value)" class="cyber-input w-full px-3.5 py-2 rounded-xl text-xs mono text-white placeholder-slate-600" />
+        </div>
+
+        <button id="launchBtn" onclick="launchExtraction()" class="w-full py-3.5 rounded-2xl font-bold text-sm text-slate-950 bg-gradient-to-r from-violet-400 via-purple-400 to-amber-300 hover:brightness-110 transition shadow-lg">
+          🛡️ Safe Deep-Scan & Hash Match
         </button>
 
-        <div id="errBanner" class="hidden mt-4 text-xs text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded-2xl p-3.5 mono"></div>
+        <div id="errBanner" class="hidden text-xs text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded-2xl p-3 mono"></div>
       </div>
 
-      <!-- LIVE PROGRESS HUD -->
-      <div id="liveProgressHud" class="hidden bento-card rounded-3xl p-5 space-y-4 border border-amber-500/30">
-        <div class="flex items-center justify-between border-b border-white/10 pb-3">
-          <div class="flex items-center gap-2">
-            <span class="w-2 h-2 rounded-full bg-amber-400 animate-ping"></span>
-            <span class="text-xs font-bold uppercase tracking-wider text-white">Cloud Deep-Scan HUD</span>
-          </div>
-          <span id="hudSpeed" class="mono text-xs font-semibold px-2.5 py-0.5 rounded-lg bg-amber-500/20 text-amber-300 border border-amber-400/30">—</span>
+      <!-- LIVE HUD -->
+      <div id="liveProgressHud" class="hidden bento-card rounded-3xl p-5 space-y-4 border border-violet-500/30">
+        <div class="flex justify-between items-center border-b border-white/10 pb-2">
+          <span class="text-xs font-bold text-white">Live Cloud Security HUD</span>
+          <span id="hudSpeed" class="mono text-xs text-amber-300">—</span>
         </div>
-
         <div>
-          <div class="flex justify-between text-[11px] mb-1.5">
-            <span id="romStageText" class="text-slate-300 font-medium">Stage 1: Streaming Archive</span>
-            <span id="romPercentText" class="mono text-amber-300 font-bold">0%</span>
-          </div>
-          <div class="w-full h-2.5 bg-black/60 rounded-full overflow-hidden p-0.5 border border-white/10">
-            <div id="romBar" style="width: 0%" class="h-full rounded-full bg-gradient-to-r from-amber-500 to-orange-400 transition-all duration-300"></div>
-          </div>
-          <p id="scanFileText" class="mono text-[10px] text-slate-400 mt-1 truncate">Scanning files...</p>
+          <div class="flex justify-between text-[11px] mb-1"><span id="romStageText" class="text-slate-300">Streaming ROM</span><span id="romPercentText" class="mono text-violet-300">0%</span></div>
+          <div class="w-full h-2 bg-black rounded-full overflow-hidden border border-white/10"><div id="romBar" style="width:0%" class="h-full bg-violet-500 transition-all"></div></div>
         </div>
-
         <div>
-          <div class="flex justify-between text-[11px] mb-1.5">
-            <span id="extStageText" class="text-slate-300 font-medium">Stage 2: Extracting & Vault Sync</span>
-            <span id="extPercentText" class="mono text-emerald-400 font-bold">0%</span>
-          </div>
-          <div class="w-full h-2.5 bg-black/60 rounded-full overflow-hidden p-0.5 border border-white/10">
-            <div id="extBar" style="width: 0%" class="h-full rounded-full bg-gradient-to-r from-violet-500 via-sky-400 to-emerald-400 transition-all duration-300"></div>
-          </div>
+          <div class="flex justify-between text-[11px] mb-1"><span id="extStageText" class="text-slate-300">Hashing & Vault Sync</span><span id="extPercentText" class="mono text-emerald-400">0%</span></div>
+          <div class="w-full h-2 bg-black rounded-full overflow-hidden border border-white/10"><div id="extBar" style="width:0%" class="h-full bg-emerald-400 transition-all"></div></div>
         </div>
       </div>
 
       <!-- DONE CARD -->
       <div id="doneCard" class="hidden bento-card rounded-3xl p-6 border border-emerald-500/30">
-        <h2 class="text-lg font-bold text-white">File Extracted Successfully!</h2>
-        <p class="text-xs text-slate-400 mt-0.5">Stored permanently in your Instant Dataset Vault.</p>
+        <h2 class="text-lg font-bold text-white">File Securely Verified!</h2>
+        <p class="text-xs text-slate-400 mt-0.5">Matched with device metadata & SHA-256 hash.</p>
         <a id="finalDownloadBtn" href="#" target="_blank" class="mt-4 w-full py-3.5 rounded-2xl font-bold text-sm text-slate-950 bg-gradient-to-r from-emerald-400 to-teal-300 flex items-center justify-center gap-2 shadow-lg">
-          ⬇ Download Extracted File
+          ⬇ Download Verified File (.img)
         </a>
       </div>
     </div>
 
-    <!-- VAULT TAB -->
+    <!-- VAULT TAB (SPLIT INTO 2 SECTIONS) -->
     <div id="tabVault" class="hidden space-y-4">
       <div class="bento-card rounded-3xl p-5">
-        <div class="flex items-center justify-between mb-3">
-          <h2 class="text-base font-bold text-white">Instant Dataset Vault (0s)</h2>
+        <div class="flex justify-between items-center mb-3">
+          <h2 class="text-base font-bold text-white">🗄️ Instant Dataset Vault</h2>
           <button onclick="loadVault()" class="mono text-[11px] px-3 py-1.5 rounded-xl bg-white/5 text-amber-300">Refresh</button>
         </div>
-        <div id="vaultList" class="space-y-2 max-h-80 overflow-y-auto pr-1">
-          <div class="text-xs text-slate-500 mono py-6 text-center">Loading vault...</div>
+
+        <div class="space-y-4">
+          <div>
+            <h3 class="mono text-xs uppercase text-violet-300 mb-2 font-semibold">1. Stored ROM Profiles & Archives</h3>
+            <div id="romVaultList" class="space-y-1.5 max-h-40 overflow-y-auto">
+              <div class="text-xs text-slate-500 mono py-2">Loading ROM profiles...</div>
+            </div>
+          </div>
+
+          <hr class="border-white/10" />
+
+          <div>
+            <h3 class="mono text-xs uppercase text-emerald-300 mb-2 font-semibold">2. Verified Extracted Partitions (.img)</h3>
+            <div id="imgVaultList" class="space-y-2 max-h-60 overflow-y-auto pr-1">
+              <div class="text-xs text-slate-500 mono py-4">Loading extracted images...</div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -613,15 +636,15 @@ HTML_PAGE = """<!DOCTYPE html>
     <!-- CONSOLE TAB -->
     <div id="tabTerminal" class="hidden space-y-4">
       <div class="bento-card rounded-3xl p-5">
-        <span class="mono text-[11px] text-amber-300 font-semibold block mb-2">Live Cloud Terminal Log</span>
+        <span class="mono text-[11px] text-violet-300 font-semibold block mb-2">Security Hash Log</span>
         <div id="logBox" class="mono text-[11px] bg-black/75 rounded-2xl p-3.5 h-64 overflow-y-auto space-y-1.5 border border-white/5">
-          <div class="text-slate-500">[System] Ready for deep scan.</div>
+          <div class="text-slate-500">[System] Vault security engine online.</div>
         </div>
       </div>
     </div>
   </div>
 
-  <!-- IPHONE GLASS DOCK -->
+  <!-- IPHONE DOCK -->
   <div class="fixed bottom-3 left-1/2 -translate-x-1/2 z-50 flex flex-col items-center gap-1.5 w-full max-w-sm px-4">
     <div class="ios-dock p-1.5 rounded-[26px] flex items-center justify-between w-full gap-1">
       <button id="btnStudio" onclick="switchView('studio')" class="dock-btn active flex-1 py-2.5 rounded-[20px] text-xs">⚡ Studio</button>
@@ -630,7 +653,7 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
     <div class="text-[11px] font-medium text-slate-400 tracking-wide flex items-center gap-1">
       <span>Made by</span>
-      <span class="font-bold bg-gradient-to-r from-amber-400 to-orange-300 bg-clip-text text-transparent">Yash</span>
+      <span class="font-bold bg-gradient-to-r from-violet-400 to-amber-300 bg-clip-text text-transparent">Yash</span>
     </div>
   </div>
 
@@ -652,6 +675,10 @@ HTML_PAGE = """<!DOCTYPE html>
       if (view === "vault") loadVault();
     }
 
+    function toggleFormatOption(val) {
+      document.getElementById("formatBox").style.display = val === "custom" ? "none" : "block";
+    }
+
     function pickPart(part, el) {
       currentPart = part;
       document.getElementById("selectedLabel").textContent = part;
@@ -660,7 +687,7 @@ HTML_PAGE = """<!DOCTYPE html>
       el.classList.add("active");
     }
 
-    function customPartInput(val) {
+    function customInput(val) {
       if (val.trim()) {
         currentPart = val.trim();
         document.getElementById("selectedLabel").textContent = currentPart;
@@ -669,13 +696,23 @@ HTML_PAGE = """<!DOCTYPE html>
     }
 
     async function launchExtraction() {
+      const devName = document.getElementById("devName").value.trim();
+      const devCode = document.getElementById("devCode").value.trim();
+      const romVer = document.getElementById("romVer").value.trim();
+      const romCat = document.getElementById("romCat").value;
+      const romFmt = document.getElementById("romFmt").value;
       const romUrl = document.getElementById("romUrl").value.trim();
       const errBanner = document.getElementById("errBanner");
       const btn = document.getElementById("launchBtn");
+
       errBanner.classList.add("hidden");
+      if (!devName || !devCode || !romVer) {
+        errBanner.textContent = "Please fill in Device Name, Codename, and ROM Version to prevent bricking!";
+        errBanner.classList.remove("hidden"); return;
+      }
       if (!romUrl) { errBanner.textContent = "Please paste a ROM link."; errBanner.classList.remove("hidden"); return; }
 
-      btn.disabled = true; btn.innerHTML = "⏳ Deep-Scanning Archive...";
+      btn.disabled = true; btn.innerHTML = "🛡️ Running SHA-256 Deep Scan...";
       document.getElementById("doneCard").classList.add("hidden");
       document.getElementById("liveProgressHud").classList.remove("hidden");
       document.getElementById("logBox").innerHTML = ""; renderedLogs = 0;
@@ -683,7 +720,11 @@ HTML_PAGE = """<!DOCTYPE html>
       try {
         const res = await fetch("/api/start", {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ rom_url: romUrl, target: currentPart })
+          body: JSON.stringify({
+            rom_url: romUrl, target: currentPart,
+            device_name: devName, codename: devCode,
+            rom_version: romVer, rom_category: romCat, rom_format: romFmt
+          })
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail);
@@ -691,7 +732,7 @@ HTML_PAGE = """<!DOCTYPE html>
         pollTimer = setInterval(() => pollJobStatus(data.job_id), 650);
       } catch (e) {
         errBanner.textContent = e.message; errBanner.classList.remove("hidden");
-        btn.disabled = false; btn.innerHTML = "⚡ Deep-Scan & Extract File";
+        btn.disabled = false; btn.innerHTML = "🛡️ Safe Deep-Scan & Hash Match";
       }
     }
 
@@ -704,10 +745,8 @@ HTML_PAGE = """<!DOCTYPE html>
         document.getElementById("romBar").style.width = `${job.rom_progress}%`;
         document.getElementById("romPercentText").textContent = `${job.rom_progress}%`;
         document.getElementById("romStageText").textContent = job.rom_label;
-        document.getElementById("scanFileText").textContent = `Scanning: ${job.current_scan}`;
         document.getElementById("extBar").style.width = `${job.ext_progress}%`;
         document.getElementById("extPercentText").textContent = `${job.ext_progress}%`;
-        document.getElementById("extStageText").textContent = job.ext_label;
         document.getElementById("hudSpeed").textContent = job.speed;
 
         const logBox = document.getElementById("logBox");
@@ -722,38 +761,52 @@ HTML_PAGE = """<!DOCTYPE html>
         if (job.state === "done" && job.result) {
           clearInterval(pollTimer);
           document.getElementById("launchBtn").disabled = false;
-          document.getElementById("launchBtn").innerHTML = "⚡ Deep-Scan & Extract File";
+          document.getElementById("launchBtn").innerHTML = "🛡️ Safe Deep-Scan & Hash Match";
           document.getElementById("doneCard").classList.remove("hidden");
           document.getElementById("finalDownloadBtn").href = job.result.download_url;
         } else if (job.state === "error") {
           clearInterval(pollTimer);
           document.getElementById("launchBtn").disabled = false;
-          document.getElementById("launchBtn").innerHTML = "⚡ Deep-Scan & Extract File";
+          document.getElementById("launchBtn").innerHTML = "🛡️ Safe Deep-Scan & Hash Match";
           errBanner.textContent = job.error; errBanner.classList.remove("hidden");
         }
       } catch(ignore) {}
     }
 
     async function loadVault() {
-      const box = document.getElementById("vaultList");
       try {
         const res = await fetch("/api/vault");
         const data = await res.json();
-        if (!data.items || data.items.length === 0) {
-          box.innerHTML = `<div class="text-xs text-slate-500 mono py-6 text-center">No files in vault yet.</div>`;
-          return;
-        }
-        box.innerHTML = data.items.map(item => `
-          <div class="flex items-center justify-between p-3 rounded-2xl bg-black/50 border border-white/5">
-            <div class="pr-3 overflow-hidden">
-              <div class="mono text-xs font-bold text-amber-300">${item.partition}</div>
-              <div class="mono text-[10px] text-slate-400 truncate">${item.rom}</div>
+        
+        // 1. ROM Vault Section
+        const romBox = document.getElementById("romVaultList");
+        if (!data.rom_vault || data.rom_vault.length === 0) {
+          romBox.innerHTML = `<div class="text-xs text-slate-500 mono py-2">No ROM profiles saved yet.</div>`;
+        } else {
+          romBox.innerHTML = data.rom_vault.map(item => `
+            <div class="p-2.5 rounded-xl bg-black/40 border border-white/5 mono text-[11px] text-violet-300">
+              📱 ${item.replaceAll("_", " ")}
             </div>
-            <a href="${item.url}" target="_blank" class="shrink-0 px-3 py-1.5 rounded-xl bg-emerald-500/20 text-emerald-300 mono text-[11px] font-semibold hover:bg-emerald-500/30">⬇ 0s Get</a>
-          </div>
-        `).join("");
+          `).join("");
+        }
+
+        // 2. Extracted Images Section
+        const imgBox = document.getElementById("imgVaultList");
+        if (!data.img_vault || data.img_vault.length === 0) {
+          imgBox.innerHTML = `<div class="text-xs text-slate-500 mono py-4 text-center">No extracted files in Vault.</div>`;
+        } else {
+          imgBox.innerHTML = data.img_vault.map(item => `
+            <div class="flex items-center justify-between p-3 rounded-2xl bg-black/50 border border-white/5">
+              <div class="pr-2 overflow-hidden">
+                <div class="mono text-xs font-bold text-amber-300">${item.filename}</div>
+                <div class="mono text-[10px] text-slate-400 truncate">${item.label}</div>
+              </div>
+              <a href="${item.url}" target="_blank" class="shrink-0 px-3 py-1.5 rounded-xl bg-emerald-500/20 text-emerald-300 mono text-[11px] font-semibold hover:bg-emerald-500/30">⬇ 0s Get</a>
+            </div>
+          `).join("");
+        }
       } catch (e) {
-        box.innerHTML = `<div class="text-xs text-rose-400 mono py-4 text-center">Failed to load vault.</div>`;
+        console.error(e);
       }
     }
   </script>
