@@ -6,6 +6,7 @@ import json
 import zlib
 import time
 import uuid
+import queue
 import struct
 import shutil
 import bisect
@@ -16,14 +17,16 @@ import requests
 import zstandard as zstd
 from datetime import datetime
 from urllib.parse import urlparse, unquote
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from remotezip import RemoteZip
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from huggingface_hub import HfApi, hf_hub_url, hf_hub_download
 
-app = FastAPI(title="HYPER//FLUX Secure Studio v8")
+app = FastAPI(title="HYPER//FLUX Secure Studio v9")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,6 +40,8 @@ DATASET_REPO = os.getenv("DATASET_REPO", "Yash10101/xiaomi-firmware-cache").stri
 hf_api = HfApi(token=HF_TOKEN if HF_TOKEN else None)
 
 JOBS = {}
+MB = 1024 * 1024
+NO_STORE = {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
 
 # Official KHwang9883/MobileModels Xiaomi English Database URL
 KHWANG_XIAOMI_URL = "https://raw.githubusercontent.com/KHwang9883/MobileModels/master/brands/xiaomi_en.md"
@@ -145,6 +150,18 @@ def job_add_code(job_id: str, stage_title: str, code_snippet: str):
     if block not in JOBS[job_id]["cmd_history"]:
         JOBS[job_id]["cmd_history"].append(block)
         JOBS[job_id]["cmd"] = "\n".join(JOBS[job_id]["cmd_history"])
+
+def stage(job, key, pct, label=None):
+    """Sets one of the four progress bars: search | cont | ext | fin."""
+    job[f"{key}_progress"] = max(0, min(100, int(pct)))
+    if label is not None:
+        job[f"{key}_label"] = label
+
+def mark_direct(job):
+    """The wanted file sits directly in the ROM, so there is no container file to download."""
+    job["cont_skip"] = True
+    job["cont_name"] = ""
+    stage(job, "cont", 100, "Not needed — the file is directly inside the ROM")
 
 # ---------------- KHWANG9883 CODENAME LOOKUP & CUSTOM ROM VERSION PARSER ---------------- #
 
@@ -340,6 +357,20 @@ def reconcile_metadata(user_meta: dict, rom_filename: str, archive_root: str, in
 
 # ---------------- URL & GOOGLE DRIVE RESOLVERS ---------------- #
 
+def make_session():
+    """Pooled session: keeps connections warm, retries flaky gateways, never accepts compressed transfer
+    (so byte counts always match Content-Length and the archive bytes are untouched)."""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept-Encoding": "identity",
+    })
+    retry = Retry(total=3, backoff_factor=0.6, status_forcelist=(500, 502, 503, 504), allowed_methods=frozenset(["GET", "HEAD"]))
+    ad = HTTPAdapter(pool_connections=8, pool_maxsize=16, max_retries=retry)
+    s.mount("https://", ad)
+    s.mount("http://", ad)
+    return s
+
 def extract_gdrive_id(url: str):
     for pat in (r"/file/d/([a-zA-Z0-9_-]{20,})", r"/d/([a-zA-Z0-9_-]{20,})", r"[?&]id=([a-zA-Z0-9_-]{20,})"):
         m = re.search(pat, url)
@@ -359,8 +390,7 @@ def parse_filename_from_cd(cd: str):
     return None
 
 def resolve_direct_url(url: str, job_id: str):
-    session = requests.Session()
-    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    session = make_session()
     parsed = urlparse(url)
     if parsed.netloc in ("bigota.d.miui.com", "hugeota.d.miui.com", "cdnorg.d.miui.com"):
         fast_mirror = f"https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com{parsed.path}"
@@ -387,12 +417,11 @@ def resolve_direct_url(url: str, job_id: str):
     if not filename:
         filename = unquote(os.path.basename(urlparse(url).path))
 
-    job_log(job_id, "HTTP", f"HTTP 200 OK | File: {filename} | Size: {total_size / (1024*1024):.1f} MB | Ranges: {accept_ranges}")
+    job_log(job_id, "HTTP", f"HTTP 200 OK | File: {filename} | Size: {total_size / MB:.1f} MB | Ranges: {accept_ranges}")
     return final_url, filename, total_size, session
 
 def resolve_gdrive_stream(file_id: str, job_id: str):
-    session = requests.Session()
-    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    session = make_session()
     direct_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
     resp = session.get(direct_url, stream=True, timeout=30)
     if "text/html" in resp.headers.get("Content-Type", ""):
@@ -408,7 +437,7 @@ def resolve_gdrive_stream(file_id: str, job_id: str):
     filename = parse_filename_from_cd(resp.headers.get("Content-Disposition", "")) or f"gdrive_{file_id}.zip"
     total_size = int(resp.headers.get("Content-Length", 0) or 0)
     resp.close()
-    job_log(job_id, "HTTP", f"Google Drive Stream Ready | File: {filename} | Size: {total_size / (1024*1024):.1f} MB")
+    job_log(job_id, "HTTP", f"Google Drive Stream Ready | File: {filename} | Size: {total_size / MB:.1f} MB")
     return direct_url, filename, total_size, session
 
 def supports_ranges(session, url: str):
@@ -447,7 +476,7 @@ def sniff_format(session, url: str, filename: str):
 # ENGINE:BEGIN — streaming readers, sparse images, super.img (LP) and payload.bin   #
 # ================================================================================ #
 
-PIECE = 1 << 20
+PIECE = 4 << 20          # 4 MB network/disk pieces keep fast links (300 Mbps - 1 Gbps) saturated
 SPARSE_MAGIC = 0xED26FF3A
 LP_GEOMETRY_MAGIC = 0x616C4467
 LP_HEADER_MAGIC = 0x414C5030
@@ -457,10 +486,17 @@ SUPER_RE = re.compile(r"^super(_sparse)?(\.img)?(\.zst)?$")
 class Fatal(Exception):
     """Deterministic failure: do not retry in another mode."""
 
+class Cancelled(Fatal):
+    """The user pressed Cancel."""
+
 class NotInSource(Fatal):
     def __init__(self, msg, available=None):
         super().__init__(msg)
         self.available = available or []
+
+def check_cancel(job):
+    if job.get("cancel"):
+        raise Cancelled("Cancelled by user.")
 
 class IterFile:
     """File-like read()/skip() on top of an iterator of byte chunks (no big copies)."""
@@ -576,10 +612,12 @@ def zst_stream(stream):
 
 def _speed(job, nbytes, t0):
     el = max(0.05, time.time() - t0)
-    job["speed"] = f"{(nbytes * 8) / (el * 1_000_000):.0f} Mbps ({nbytes / (1024 * 1024) / el:.1f} MB/s)"
+    job["speed"] = f"{(nbytes * 8) / (el * 1_000_000):.0f} Mbps ({nbytes / MB / el:.1f} MB/s)"
 
 def net_chunks(session, url, job_id, total_size):
-    """Network byte source that also drives the 'Cloud Scanning' progress bar."""
+    """Network byte source. Drives the 'Locating file' bar until the file is found.
+    If the server closes early (fewer bytes than Content-Length) it raises, so a cut-off
+    download can never be mistaken for a complete ROM."""
     job = JOBS[job_id]
     t0, done, last = time.time(), 0, 0.0
     with session.get(url, stream=True, timeout=(30, 120)) as resp:
@@ -587,39 +625,93 @@ def net_chunks(session, url, job_id, total_size):
         for c in resp.iter_content(chunk_size=PIECE):
             if not c:
                 continue
+            check_cancel(job)
             done += len(c)
             now = time.time()
-            if now - last >= 0.30:
+            if now - last >= 0.25:
                 last = now
-                mb_done = done / (1024 * 1024)
+                mb_done = done / MB
                 job["bytes_streamed_mb"] = f"{mb_done:.1f} MB"
                 job["hex_offset"] = f"0x{done:08X}"
                 _speed(job, done, t0)
-                if job["rom_progress"] < 100:
+                if job["search_progress"] < 100:
                     if total_size > 0:
-                        job["rom_progress"] = min(99, int(done / total_size * 100))
-                        job["rom_label"] = f"Cloud Scanning ROM: {mb_done:.0f} MB / {total_size / (1024 * 1024):.0f} MB"
+                        stage(job, "search", min(99, done / total_size * 100),
+                              f"Scanning ROM for the file: {mb_done:.0f} MB / {total_size / MB:.0f} MB")
                     else:
-                        job["rom_progress"] = min(95, int(mb_done / 40))
-                        job["rom_label"] = f"Cloud Scanning ROM: {mb_done:.0f} MB streamed"
+                        stage(job, "search", min(95, mb_done / 40), f"Scanning ROM for the file: {mb_done:.0f} MB streamed")
             yield c
+    if total_size and done < total_size:
+        raise Exception(f"Download ended early ({done / MB:.1f} of {total_size / MB:.1f} MB). The server closed the connection; nothing was saved.")
+
+def prefetch(gen, depth=24):
+    """Pulls the network in a background thread, so the link keeps downloading while the main
+    thread decompresses and writes to disk."""
+    q = queue.Queue(maxsize=depth)
+    stop = threading.Event()
+    END = object()
+
+    def put(item):
+        while not stop.is_set():
+            try:
+                q.put(item, timeout=0.5)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def pump():
+        try:
+            for c in gen:
+                if not put(c):
+                    return
+            put(END)
+        except BaseException as e:
+            put(e)
+        finally:
+            try:
+                gen.close()
+            except Exception:
+                pass
+
+    threading.Thread(target=pump, daemon=True).start()
+
+    def consume():
+        try:
+            while True:
+                try:
+                    item = q.get(timeout=1)
+                except queue.Empty:
+                    continue
+                if item is END:
+                    return
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            stop.set()
+
+    return consume()
 
 def copy_to_file(job_id, reader, out_path, size, label):
     job = JOBS[job_id]
     t0, copied, last = time.time(), 0, 0.0
     with open(out_path, "wb") as dst:
         while True:
+            check_cancel(job)
             buf = reader.read(PIECE)
             if not buf:
                 break
             dst.write(buf)
             copied += len(buf)
             now = time.time()
-            if now - last >= 0.3:
+            if now - last >= 0.25:
                 last = now
-                job["ext_progress"] = min(78, int(copied / size * 78)) if size else min(78, int(copied / (80 * PIECE) * 78))
-                job["ext_label"] = f"Extracting {label}: {copied / (1024 * 1024):.1f}" + (f" / {size / (1024 * 1024):.1f} MB" if size else " MB")
+                pct = (copied / size * 99) if size else min(95, copied / (300 * MB) * 95)
+                stage(job, "ext", pct, f"Extracting {label}: {copied / MB:.1f}" + (f" / {size / MB:.1f} MB" if size else " MB"))
+                job["bytes_streamed_mb"] = f"{copied / MB:.1f} MB"
                 _speed(job, copied, t0)
+    stage(job, "ext", 100, f"Extracted {label} ({copied / MB:.1f} MB)")
     return copied
 
 # ---------------- Android sparse + raw image expansion ---------------- #
@@ -764,14 +856,20 @@ def resolve_lp_partition(parts, req):
             return k
     return None
 
-def extract_from_super(job_id, stream, part_req, out_path, size_hint=None):
-    """Writes the logical partition `part_req` out of a raw or sparse super image."""
+def extract_from_super(job_id, stream, part_req, out_path, size_hint=None, cname="super.img"):
+    """Writes the logical partition `part_req` out of a raw or sparse super image.
+    Bar 2 = reading the super image up to the last byte the partition needs.
+    Bar 3 = bytes of the partition written to disk."""
     job = JOBS[job_id]
+    job["cont_name"] = cname
+    job["cont_skip"] = False
+    stage(job, "cont", 0, f"Reading {cname} header...")
     reader = ExpandedReader(stream, size_hint)
     gen = reader.pieces()
     head = bytearray(HEAD_BYTES)
     pending = []
     for off, data in gen:
+        check_cancel(job)
         if off < HEAD_BYTES:
             n = min(len(data), HEAD_BYTES - off)
             head[off:off + n] = data[:n]
@@ -783,7 +881,7 @@ def extract_from_super(job_id, stream, part_req, out_path, size_hint=None):
             break
 
     parts = parse_lp(bytes(head))
-    listing = ", ".join(f"{k} ({sum(e[1] for e in v) * 512 / (1024 * 1024):.0f} MB)" for k, v in parts.items() if sum(e[1] for e in v) > 0)
+    listing = ", ".join(f"{k} ({sum(e[1] for e in v) * 512 / MB:.0f} MB)" for k, v in parts.items() if sum(e[1] for e in v) > 0)
     job_log(job_id, "META", f"super.img LP partitions: {listing[:600]}")
 
     pname = resolve_lp_partition(parts, part_req)
@@ -800,14 +898,15 @@ def extract_from_super(job_id, stream, part_req, out_path, size_hint=None):
     ext.sort()
     starts = [e[0] for e in ext]
     max_end = max((s + l) for s, l, _ in ext) if ext else 0
-    mb_total = total / (1024 * 1024)
+    mb_total = total / MB
     job_log(job_id, "STREAM", f"MATCH: logical partition '{pname}' | {len(ext)} extents | {total:,} bytes ({mb_total:.2f} MB)")
-    job["rom_progress"] = 100
-    job["rom_label"] = f"Located '{pname}' inside super.img ({mb_total:.1f} MB)"
+    stage(job, "search", 100, f"Found '{pname}' inside {cname} ({mb_total:.1f} MB)")
 
     def need(off, ln):
         i = bisect.bisect_right(starts, off + ln - 1) - 1
         return i >= 0 and ext[i][0] + ext[i][1] > off
+
+    wr = [0]
 
     def write_piece(out, off, data):
         end = off + len(data)
@@ -818,20 +917,28 @@ def extract_from_super(job_id, stream, part_req, out_path, size_hint=None):
             if a < b:
                 out.seek(dst + (a - ps))
                 out.write(data[a - off:b - off])
+                wr[0] += b - a
             i += 1
 
     t0 = time.time()
     last = [0.0]
 
-    def tick(off):
+    def report(off, force=False):
         now = time.time()
-        if now - last[0] < 0.3:
+        if not force and now - last[0] < 0.25:
             return
         last[0] = now
-        job["ext_progress"] = min(78, int(off / max(1, max_end) * 78))
-        job["ext_label"] = f"Reading super.img for '{pname}': {off / (1024 * 1024):.0f} / {max_end / (1024 * 1024):.0f} MB"
+        stage(job, "cont", min(99, off / max(1, max_end) * 100),
+              f"Downloading {cname}: {off / MB:.0f} / {max_end / MB:.0f} MB")
+        stage(job, "ext", min(99, wr[0] / max(1, total) * 100),
+              f"Writing '{pname}': {wr[0] / MB:.0f} / {mb_total:.0f} MB")
         job["hex_offset"] = f"0x{off:08X}"
+        job["bytes_streamed_mb"] = f"{off / MB:.1f} MB"
         _speed(job, off, t0)
+
+    def tick(off):
+        check_cancel(job)
+        report(off)
 
     reader.need = need
     reader.stop_at = max_end
@@ -843,12 +950,16 @@ def extract_from_super(job_id, stream, part_req, out_path, size_hint=None):
         for off, data in pending:
             write_piece(out, off, data)
         for off, data in gen:
+            check_cancel(job)
             if off >= max_end:
                 break
             write_piece(out, off, data)
             job["chunks_verified"] += 1
+            report(off + len(data))
         out.truncate(total)
 
+    stage(job, "cont", 100, f"Downloaded {cname} ✓")
+    stage(job, "ext", 100, f"Extracted '{pname}' ({mb_total:.1f} MB)")
     return {"expected_size": total, "source": f"super.img → {pname}"}
 
 # ---------------- payload.bin (CrAU) protobuf ---------------- #
@@ -888,8 +999,12 @@ PAYLOAD_OP_NAMES = {0: "RAW", 1: "BZIP2", 8: "XZ", 14: "ZSTD"}
 PAYLOAD_DELTA_OPS = {2, 3, 4, 5, 9, 10, 11, 12, 13}
 
 def extract_from_payload(job_id, stream, part_name, out_path):
-    """Extracts one partition from payload.bin (full OTA). Works on seekable and forward-only streams."""
+    """Extracts one partition from payload.bin (full OTA). Works on seekable and forward-only streams.
+    Bar 2 = compressed bytes fetched from payload.bin. Bar 3 = bytes of the partition written."""
     job = JOBS[job_id]
+    job["cont_name"] = "payload.bin"
+    job["cont_skip"] = False
+    stage(job, "cont", 0, "Reading payload.bin manifest...")
     if stream.read(4) != b"CrAU":
         raise Fatal("Invalid payload.bin CrAU magic header.")
     version = struct.unpack(">Q", stream.read(8))[0]
@@ -943,18 +1058,19 @@ def extract_from_payload(job_id, stream, part_name, out_path):
         raise Fatal("This payload.bin is an incremental/delta OTA; only full OTAs can be extracted.")
 
     todo = sorted((o for o in ops if o[2] > 0 and o[0] not in (6, 7)), key=lambda o: o[1])
-    mb_total = (expected_size or 0) / (1024 * 1024)
+    mb_total = (expected_size or 0) / MB
+    total_dlen = max(1, sum(o[2] for o in todo))
     job_log(job_id, "STREAM", f"payload.bin: '{key}' | {len(todo)} data chunks | {mb_total:.2f} MB")
-    job["rom_progress"] = 100
-    job["rom_label"] = f"Located '{key}' in payload.bin ({mb_total:.1f} MB)"
+    stage(job, "search", 100, f"Found '{key}' in payload.bin ({mb_total:.1f} MB)")
 
     zdec = zstd.ZstdDecompressor()
-    t0, fetched = time.time(), 0
+    t0, fetched, written = time.time(), 0, 0
     total_ops = len(todo)
     with open(out_path, "wb") as out:
         if expected_size:
             out.truncate(expected_size)
         for idx, (otype, doff, dlen, dst, dsha) in enumerate(todo, 1):
+            check_cancel(job)
             absoff = base_data_offset + doff
             gap = absoff - stream.pos
             if gap < 0:
@@ -984,19 +1100,24 @@ def extract_from_payload(job_id, stream, part_name, out_path):
                 out.seek(sb * block_size)
                 out.write(raw[pos:pos + ln])
                 pos += ln
+                written += min(ln, max(0, len(raw) - (pos - ln)))
 
             job["chunks_verified"] = idx
-            job["bytes_streamed_mb"] = f"{fetched / (1024 * 1024):.2f} MB"
+            job["bytes_streamed_mb"] = f"{fetched / MB:.2f} MB"
             job["hex_offset"] = f"0x{absoff:08X}"
             job["current_scan"] = f"Chunk {idx}/{total_ops} [{PAYLOAD_OP_NAMES.get(otype, 'COMP')}]"
             _speed(job, fetched, t0)
-            job["ext_progress"] = min(80, int(idx / max(1, total_ops) * 80))
-            job["ext_label"] = f"Decompressing & Hashing Chunk {idx}/{total_ops} ({mb_total:.1f} MB)"
+            stage(job, "cont", min(99, fetched / total_dlen * 100),
+                  f"Downloading payload.bin data: {fetched / MB:.0f} / {total_dlen / MB:.0f} MB")
+            stage(job, "ext", min(99, (written / expected_size * 100) if expected_size else idx / max(1, total_ops) * 100),
+                  f"Decompressing & hashing chunk {idx}/{total_ops} ({mb_total:.1f} MB)")
             if idx == 1 or idx == total_ops or idx % max(1, total_ops // 6) == 0:
                 job_log(job_id, "CHUNK", f"Chunk {idx}/{total_ops} [{PAYLOAD_OP_NAMES.get(otype, 'COMP')}] @ 0x{absoff:08X} ({dlen:,} B -> {len(raw):,} B) OK")
         if expected_size:
             out.truncate(expected_size)
 
+    stage(job, "cont", 100, "Downloaded payload.bin data ✓")
+    stage(job, "ext", 100, f"Extracted '{key}' ({mb_total:.1f} MB)")
     return {"expected_size": expected_size, "expected_sha": expected_hash, "source": f"payload.bin → {key}"}
 
 # ================================================================================ #
@@ -1035,10 +1156,11 @@ def extract_tgz(job_id, session, url, total_size, rom_filename, want, user_meta,
     """Fastboot .tgz — one forward pass. Direct file, .zst file, or logical partition inside super.img."""
     job = JOBS[job_id]
     resolved, root_seen, searched = None, False, []
-    gen = net_chunks(session, url, job_id, total_size)
+    gen = prefetch(net_chunks(session, url, job_id, total_size))
     try:
         with tarfile.open(fileobj=IterFile(gen), mode="r|*") as tar:
             for member in tar:
+                check_cancel(job)
                 norm = norm_name(member.name)
                 if not root_seen and "/" in norm:
                     root_seen = True
@@ -1059,8 +1181,8 @@ def extract_tgz(job_id, session, url, total_size, rom_filename, want, user_meta,
                 stream = Stream(fp)
 
                 if kind in ("exact", "exact_zst"):
-                    job["rom_progress"] = 100
-                    job["rom_label"] = f"Located {norm} ({member.size / (1024 * 1024):.2f} MB)"
+                    stage(job, "search", 100, f"Located {norm} ({member.size / MB:.2f} MB)")
+                    mark_direct(job)
                     job_log(job_id, "STREAM", f"MATCH FOUND: '{norm}' | {member.size:,} bytes")
                     if kind == "exact":
                         copy_to_file(job_id, stream, out_path, member.size, want.name)
@@ -1071,7 +1193,7 @@ def extract_tgz(job_id, session, url, total_size, rom_filename, want, user_meta,
                 job_log(job_id, "STREAM", f"Opening '{norm}' to look for logical partition '{want.stem}'...")
                 try:
                     src = zst_stream(stream) if kind == "super_zst" else stream
-                    info = extract_from_super(job_id, src, want.stem, out_path, None if kind == "super_zst" else member.size)
+                    info = extract_from_super(job_id, src, want.stem, out_path, None if kind == "super_zst" else member.size, cname=base)
                     info["resolved_meta"] = resolved
                     return info
                 except NotInSource as e:
@@ -1088,8 +1210,8 @@ def extract_zip_ranged(job_id, session, url, rom_filename, want, user_meta, out_
         namelist = zf.namelist()
         internal_meta = inspect_zip_internal_metadata(zf, job_id)
         resolved = reconcile_metadata(user_meta, rom_filename, "", internal_meta, job_id)
-        job["rom_progress"] = 100
-        job["rom_label"] = f"ZIP Mapped ({len(namelist)} files) — Device: {resolved['device_name']}"
+        stage(job, "search", 60, f"ZIP index mapped ({len(namelist)} files) — {resolved['device_name']}")
+        check_cancel(job)
 
         exact = super_e = payload_e = None
         for n in namelist:
@@ -1107,6 +1229,8 @@ def extract_zip_ranged(job_id, session, url, rom_filename, want, user_meta, out_
         if exact:
             n, k = exact
             info = zf.getinfo(n)
+            stage(job, "search", 100, f"Located {n} ({info.file_size / MB:.2f} MB)")
+            mark_direct(job)
             job_log(job_id, "STREAM", f"Direct ZIP Entry: '{n}' | Offset: 0x{info.header_offset:08X} | CRC32: {hex(info.CRC)}")
             with zf.open(n) as fp:
                 if k == "exact":
@@ -1128,12 +1252,12 @@ def extract_zip_ranged(job_id, session, url, rom_filename, want, user_meta, out_
         if super_e:
             n, k = super_e
             zi = zf.getinfo(n)
-            job_log(job_id, "STREAM", f"Opening '{n}' ({zi.file_size / (1024 * 1024):.0f} MB) for logical partition '{want.stem}'...")
+            job_log(job_id, "STREAM", f"Opening '{n}' ({zi.file_size / MB:.0f} MB) for logical partition '{want.stem}'...")
             try:
                 with zf.open(n) as fp:
                     base = Stream(fp, seek_ok=True)
                     info = extract_from_super(job_id, zst_stream(base) if k == "super_zst" else base, want.stem, out_path,
-                                              None if k == "super_zst" else zi.file_size)
+                                              None if k == "super_zst" else zi.file_size, cname=os.path.basename(n))
                 info["resolved_meta"] = resolved
                 return info
             except NotInSource as e:
@@ -1153,13 +1277,14 @@ def extract_zip_sequential(job_id, session, url, total_size, rom_filename, want,
     def resolve():
         return reconcile_metadata(user_meta, rom_filename, "", parse_meta_texts(meta["meta"], meta["script"], job_id), job_id)
 
-    gen = net_chunks(session, url, job_id, total_size)
+    gen = prefetch(net_chunks(session, url, job_id, total_size))
     try:
         try:
             entries = stream_unzip(gen, chunk_size=PIECE)
         except TypeError:
             entries = stream_unzip(gen)
         for name_b, size, chunks in entries:
+            check_cancel(job)
             name = name_b.decode("utf-8", errors="ignore") if isinstance(name_b, (bytes, bytearray)) else str(name_b)
             clean = norm_name(name)
             if clean.endswith("/"):
@@ -1177,8 +1302,8 @@ def extract_zip_sequential(job_id, session, url, total_size, rom_filename, want,
             elif clean == "META-INF/com/google/android/updater-script":
                 meta["script"] = stream.read(65536).decode("utf-8", errors="ignore")
             elif kind in ("exact", "exact_zst"):
-                job["rom_progress"] = 100
-                job["rom_label"] = f"Located {clean}"
+                stage(job, "search", 100, f"Located {clean}")
+                mark_direct(job)
                 job_log(job_id, "STREAM", f"MATCH FOUND (sequential): '{clean}' | size: {size}")
                 if kind == "exact":
                     copy_to_file(job_id, stream, out_path, size or 0, want.name)
@@ -1197,7 +1322,7 @@ def extract_zip_sequential(job_id, session, url, total_size, rom_filename, want,
                 job_log(job_id, "STREAM", f"Opening '{clean}' (sequential) for logical partition '{want.stem}'...")
                 try:
                     src = zst_stream(stream) if kind == "super_zst" else stream
-                    info = extract_from_super(job_id, src, want.stem, out_path, None if kind == "super_zst" else size)
+                    info = extract_from_super(job_id, src, want.stem, out_path, None if kind == "super_zst" else size, cname=os.path.basename(clean))
                     info["resolved_meta"] = resolve()
                     return info
                 except NotInSource as e:
@@ -1215,7 +1340,8 @@ def verify_and_hash_file(
     file_path: str,
     expected_size: int = None,
     expected_sha256_bytes: bytes = None,
-    expected_crc32: int = None
+    expected_crc32: int = None,
+    on_progress=None
 ):
     if not os.path.exists(file_path):
         raise Exception("Anti-Brick Guard: Output file was not created.")
@@ -1231,6 +1357,7 @@ def verify_and_hash_file(
     sha256_hasher = hashlib.sha256()
     crc_val = 0
     header_sample = b""
+    hashed = 0
 
     with open(file_path, "rb") as f:
         while True:
@@ -1242,6 +1369,9 @@ def verify_and_hash_file(
             sha256_hasher.update(chunk)
             if expected_crc32 is not None:
                 crc_val = zlib.crc32(chunk, crc_val)
+            hashed += len(chunk)
+            if on_progress:
+                on_progress(hashed, actual_size)
 
     # A raw super.img legitimately starts with 4096 zero bytes, so test a larger window.
     if len(header_sample) >= 16384 and header_sample[:16384] == b"\x00" * 16384:
@@ -1290,13 +1420,22 @@ def verify_and_hash_file(
 
 # ---------------- VAULT INDEX HELPER ---------------- #
 
+def read_vault_index():
+    """Always fetches a fresh copy (force_download) so a stale local cache can never hide
+    or overwrite entries."""
+    if hf_api.file_exists(repo_id=DATASET_REPO, filename="vault_index.json", repo_type="dataset"):
+        local_idx = hf_hub_download(repo_id=DATASET_REPO, filename="vault_index.json", repo_type="dataset",
+                                    token=HF_TOKEN, force_download=True)
+        with open(local_idx, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
 def update_vault_index(work_dir: str, entry: dict):
     index_data = {"roms": {}, "images": []}
     try:
-        if hf_api.file_exists(repo_id=DATASET_REPO, filename="vault_index.json", repo_type="dataset"):
-            local_idx = hf_hub_download(repo_id=DATASET_REPO, filename="vault_index.json", repo_type="dataset", token=HF_TOKEN)
-            with open(local_idx, "r", encoding="utf-8") as f:
-                index_data = json.load(f)
+        fresh = read_vault_index()
+        if fresh:
+            index_data = fresh
     except Exception:
         pass
 
@@ -1361,6 +1500,7 @@ def run_extraction_worker(job_id: str, raw_url: str, target: str, user_meta: dic
             stream_url, rom_filename, total_size, session = resolve_gdrive_stream(g_id, job_id)
         else:
             stream_url, rom_filename, total_size, session = resolve_direct_url(raw_url, job_id)
+        check_cancel(job)
 
         fmt = sniff_format(session, stream_url, rom_filename)
         job_log(job_id, "STREAM", f"Archive type: {fmt.upper()} | Target: {want.name} (matched case-insensitively)")
@@ -1386,7 +1526,10 @@ def run_extraction_worker(job_id: str, raw_url: str, target: str, user_meta: dic
                     raise
                 except Exception as e:
                     job_log(job_id, "INFO", f"Range mode failed ({e}) → switching to sequential streaming.")
-                    job["rom_progress"], job["ext_progress"] = 2, 0
+                    job["cont_skip"] = False
+                    stage(job, "search", 2, "Retrying in sequential mode...")
+                    stage(job, "cont", 0, "Waiting for the container file...")
+                    stage(job, "ext", 0, "Waiting for the target file...")
             else:
                 job_log(job_id, "STREAM", "Google Drive / no usable HTTP Range support → sequential streaming mode.")
             if info is None:
@@ -1395,17 +1538,29 @@ def run_extraction_worker(job_id: str, raw_url: str, target: str, user_meta: dic
         resolved_meta = info.get("resolved_meta") or reconcile_metadata(user_meta, rom_filename, "", {}, job_id)
         job_log(job_id, "STREAM", f"Source: {info.get('source', '?')}")
 
-        job["ext_progress"] = 84
-        job["ext_label"] = "Running 4-Layer Anti-Brick & SHA-256 Verification..."
+        stage(job, "search", 100)
+        stage(job, "cont", 100)
+        stage(job, "ext", 100)
+        check_cancel(job)
+
+        # ---- Bar 4: verification (0-30%) + vault upload (30-100%) ----
+        stage(job, "fin", 0, "Running 4-Layer Anti-Brick & SHA-256 Verification...")
+
+        def vprog(done, total):
+            check_cancel(job)
+            stage(job, "fin", done / max(1, total) * 30, f"Verifying & hashing: {done / MB:.0f} / {total / MB:.0f} MB")
+
         file_sha256, file_size, file_sig = verify_and_hash_file(
             output_path,
             expected_size=info.get("expected_size"),
             expected_sha256_bytes=info.get("expected_sha"),
             expected_crc32=info.get("expected_crc"),
+            on_progress=vprog,
         )
 
         job_log(job_id, "VERIFY", f"Binary Magic Signature: {file_sig}")
         job_log(job_id, "VERIFY", f"Full File SHA-256 Digest: {file_sha256}")
+        stage(job, "fin", 30, "Verified ✓ — preparing vault upload")
 
         clean_dev = re.sub(r"[^a-zA-Z0-9._-]", "_", resolved_meta["device_name"])[:45]
         clean_code = re.sub(r"[^a-zA-Z0-9._-]", "_", resolved_meta["codename"])
@@ -1429,8 +1584,9 @@ def run_extraction_worker(job_id: str, raw_url: str, target: str, user_meta: dic
             f")"
         )
 
-        job["ext_progress"] = 92
-        job["ext_label"] = f"Uploading {target} to Vault ({resolved_meta['device_name']})..."
+        check_cancel(job)  # last point where Cancel is still honoured; after this the upload commits
+        job["fin_busy"] = True
+        stage(job, "fin", 35, f"Uploading {target} to Vault ({resolved_meta['device_name']}) — cannot cancel now")
         job_log(job_id, "UPLOAD", f"Uploading '{target}' to Hugging Face Dataset '{DATASET_REPO}/{img_repo_path}'...")
 
         hf_api.upload_file(
@@ -1442,7 +1598,8 @@ def run_extraction_worker(job_id: str, raw_url: str, target: str, user_meta: dic
         )
 
         download_url = hf_hub_url(repo_id=DATASET_REPO, filename=img_repo_path, repo_type="dataset")
-        size_mb_str = f"{file_size / (1024 * 1024):.2f} MB"
+        size_mb_str = f"{file_size / MB:.2f} MB"
+        stage(job, "fin", 80, "File uploaded ✓ — writing ROM metadata")
 
         vault_entry = {
             "rom_key": rom_key,
@@ -1474,23 +1631,34 @@ def run_extraction_worker(job_id: str, raw_url: str, target: str, user_meta: dic
             repo_type="dataset",
             commit_message=f"ROM Metadata: {resolved_meta['device_name']} ({resolved_meta['rom_version']})"
         )
+        stage(job, "fin", 92, "Updating Vault index")
 
         update_vault_index(work_dir, vault_entry)
 
         duration_sec = max(1, int(time.time() - start_time))
-        job["ext_progress"] = 100
-        job["ext_label"] = f"100% Complete & Synced to Vault ({duration_sec}s)"
+        job["fin_busy"] = False
+        stage(job, "fin", 100, f"Verified & synced to Vault ({duration_sec}s)")
         job_log(job_id, "SUCCESS", f"Vault Upload Complete in {duration_sec}s! Temporary server storage wiped clean.")
 
         job["result"] = vault_entry
         job["result"]["duration"] = f"{duration_sec}s"
         job["state"] = "done"
 
+    except Cancelled:
+        job_log(job_id, "INFO", "Extraction cancelled by user. Temporary files removed; nothing was added to the Vault.")
+        job["error"] = "Cancelled"
+        job["state"] = "cancelled"
     except Exception as e:
-        job_log(job_id, "ERROR", str(e))
-        job["error"] = str(e)
-        job["state"] = "error"
+        if job.get("cancel"):
+            job_log(job_id, "INFO", "Extraction cancelled by user. Temporary files removed; nothing was added to the Vault.")
+            job["error"] = "Cancelled"
+            job["state"] = "cancelled"
+        else:
+            job_log(job_id, "ERROR", str(e))
+            job["error"] = str(e)
+            job["state"] = "error"
     finally:
+        job["fin_busy"] = False
         if session:
             session.close()
         if os.path.exists(work_dir):
@@ -1524,18 +1692,30 @@ def start_job(req: ExtractRequest):
 
     JOBS[job_id] = {
         "state": "running",
+        "cancel": False,
         "target": target,
-        "rom_progress": 2,
-        "rom_label": "Connecting to Cloud Stream...",
+        # Bar 1: locating the file inside the ROM
+        "search_progress": 2,
+        "search_label": "Connecting to cloud stream...",
+        # Bar 2: downloading the container file (super.img / payload.bin) when the target lives inside one
+        "cont_progress": 0,
+        "cont_label": "Waiting for the file to be located...",
+        "cont_name": "",
+        "cont_skip": False,
+        # Bar 3: extracting the file you asked for
         "ext_progress": 0,
-        "ext_label": "Waiting for target offset...",
+        "ext_label": "Waiting for the target offset...",
+        # Bar 4: 4-layer verification + vault upload
+        "fin_progress": 0,
+        "fin_label": "Waiting for the extracted file...",
+        "fin_busy": False,
         "speed": "Connecting...",
         "bytes_streamed_mb": "0.0 MB",
         "hex_offset": "0x00000000",
         "chunks_verified": 0,
         "current_scan": "—",
         "resolved_meta": None,
-        "cmd": "# Initializing HYPER//FLUX v8 + KHwang9883 MobileModels Engine...",
+        "cmd": "# Initializing HYPER//FLUX v9 + KHwang9883 MobileModels Engine...",
         "cmd_history": [],
         "logs": [],
         "result": None,
@@ -1548,23 +1728,35 @@ def start_job(req: ExtractRequest):
 def get_job_status(job_id: str):
     if job_id not in JOBS:
         raise HTTPException(status_code=404, detail="Job not found.")
-    return JOBS[job_id]
+    return JSONResponse(JOBS[job_id], headers=NO_STORE)
+
+@app.post("/api/cancel/{job_id}")
+def cancel_job(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job["state"] != "running":
+        return {"ok": False, "state": job["state"]}
+    if job.get("fin_busy"):
+        return {"ok": False, "state": "running", "note": "Vault upload already started; it will finish in a few seconds."}
+    job["cancel"] = True
+    job_log(job_id, "INFO", "Cancel requested — stopping the stream and wiping temporary files...")
+    return {"ok": True, "state": "cancelling"}
 
 @app.get("/api/vault")
 def list_vault():
     try:
         ensure_dataset_exists()
-        if hf_api.file_exists(repo_id=DATASET_REPO, filename="vault_index.json", repo_type="dataset"):
-            local_idx = hf_hub_download(repo_id=DATASET_REPO, filename="vault_index.json", repo_type="dataset", token=HF_TOKEN)
-            with open(local_idx, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return {
+        data = read_vault_index()
+        if data:
+            return JSONResponse({
                 "roms": list(data.get("roms", {}).values()),
-                "images": data.get("images", [])
-            }
-        return {"roms": [], "images": []}
+                "images": data.get("images", []),
+                "fetched_at": datetime.now().strftime("%H:%M:%S")
+            }, headers=NO_STORE)
+        return JSONResponse({"roms": [], "images": [], "fetched_at": datetime.now().strftime("%H:%M:%S")}, headers=NO_STORE)
     except Exception as e:
-        return {"roms": [], "images": [], "note": str(e)}
+        return JSONResponse({"roms": [], "images": [], "note": str(e)}, headers=NO_STORE)
 
 # ---------------- FRONTEND UI ---------------- #
 
@@ -1580,74 +1772,225 @@ HTML_PAGE = """<!DOCTYPE html>
     * { font-family: 'Plus Jakarta Sans', sans-serif; -webkit-tap-highlight-color: transparent; }
     h1, h2, .brand-font { font-family: 'Space Grotesk', sans-serif; }
     .mono { font-family: 'JetBrains Mono', monospace; }
+    :root { --ease: cubic-bezier(0.22, 1, 0.36, 1); }
+    html { scroll-behavior: smooth; }
     body {
-      background-color: #060609;
-      background-image: radial-gradient(circle at 90% 10%, rgba(139, 92, 246, 0.16) 0%, transparent 40%),
-                        radial-gradient(circle at 10% 25%, rgba(245, 158, 11, 0.14) 0%, transparent 45%),
-                        radial-gradient(circle at 50% 95%, rgba(16, 185, 129, 0.12) 0%, transparent 40%);
-      background-attachment: fixed;
+      background-color: #05050a;
+      overflow-x: hidden;
     }
-    .bento-card {
-      background: rgba(15, 15, 24, 0.82);
-      backdrop-filter: blur(20px);
-      -webkit-backdrop-filter: blur(20px);
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      box-shadow: 0 20px 50px -15px rgba(0, 0, 0, 0.9);
+
+    /* ---------- AMBIENT BACKDROP ---------- */
+    .ambient { position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden; }
+    .orb { position: absolute; border-radius: 50%; filter: blur(90px); opacity: 0.5; will-change: transform; animation: drift 24s ease-in-out infinite alternate; }
+    .orb.o1 { width: 420px; height: 420px; background: #7c3aed; top: -120px; right: -100px; }
+    .orb.o2 { width: 380px; height: 380px; background: #f59e0b; top: 28%; left: -160px; animation-duration: 30s; animation-delay: -6s; opacity: 0.38; }
+    .orb.o3 { width: 440px; height: 440px; background: #10b981; bottom: -180px; right: 5%; animation-duration: 27s; animation-delay: -12s; opacity: 0.34; }
+    .orb.o4 { width: 300px; height: 300px; background: #ec4899; bottom: 22%; left: 30%; animation-duration: 34s; animation-delay: -3s; opacity: 0.22; }
+    @keyframes drift {
+      0%   { transform: translate3d(0, 0, 0) scale(1); }
+      50%  { transform: translate3d(60px, -70px, 0) scale(1.18); }
+      100% { transform: translate3d(-70px, 50px, 0) scale(0.92); }
     }
+    .grid-glow {
+      position: absolute; inset: 0;
+      background-image: linear-gradient(rgba(255,255,255,0.035) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.035) 1px, transparent 1px);
+      background-size: 46px 46px;
+      mask-image: radial-gradient(ellipse at 50% 30%, #000 20%, transparent 75%);
+      -webkit-mask-image: radial-gradient(ellipse at 50% 30%, #000 20%, transparent 75%);
+      animation: gridpan 40s linear infinite;
+    }
+    @keyframes gridpan { to { background-position: 46px 46px, 46px 46px; } }
+    .spark { position: absolute; width: 3px; height: 3px; border-radius: 50%; background: rgba(253, 230, 138, 0.8); box-shadow: 0 0 10px rgba(253, 230, 138, 0.9); opacity: 0; animation: floatup linear infinite; }
+    @keyframes floatup {
+      0% { transform: translateY(0) scale(0.6); opacity: 0; }
+      15% { opacity: 0.9; }
+      100% { transform: translateY(-110vh) scale(1.2); opacity: 0; }
+    }
+
+    /* ---------- GLASS ---------- */
+    .glass {
+      position: relative;
+      background: linear-gradient(145deg, rgba(255,255,255,0.09), rgba(255,255,255,0.02));
+      backdrop-filter: blur(24px) saturate(165%);
+      -webkit-backdrop-filter: blur(24px) saturate(165%);
+      border: 1px solid rgba(255,255,255,0.1);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.16), inset 0 -1px 0 rgba(255,255,255,0.03), 0 26px 60px -22px rgba(0,0,0,0.9);
+      overflow: hidden;
+      transition: border-color 0.4s var(--ease), box-shadow 0.4s var(--ease), transform 0.4s var(--ease);
+    }
+    .glass::before {
+      content: ""; position: absolute; inset: 0; pointer-events: none; opacity: 0;
+      background: radial-gradient(280px circle at var(--mx, 50%) var(--my, 50%), rgba(167,139,250,0.2), transparent 62%);
+      transition: opacity 0.35s ease;
+    }
+    .glass:hover::before { opacity: 1; }
+    .glass::after {
+      content: ""; position: absolute; top: 0; left: -60%; width: 40%; height: 100%; pointer-events: none;
+      background: linear-gradient(100deg, transparent, rgba(255,255,255,0.07), transparent);
+      transform: skewX(-18deg); animation: sheen 9s ease-in-out infinite;
+    }
+    @keyframes sheen { 0%, 70% { left: -60%; } 100% { left: 140%; } }
+    .glass:hover { border-color: rgba(167,139,250,0.28); }
+
+    /* ---------- ENTRANCE / VIEW TRANSITIONS ---------- */
+    .rise { animation: rise 0.8s var(--ease) both; animation-delay: calc(var(--i, 0) * 90ms); }
+    @keyframes rise { from { opacity: 0; transform: translateY(22px) scale(0.98); filter: blur(6px); } to { opacity: 1; transform: none; filter: none; } }
+    .view-in { animation: viewin 0.55s var(--ease) both; }
+    @keyframes viewin { from { opacity: 0; transform: translateY(18px) scale(0.985); filter: blur(8px); } to { opacity: 1; transform: none; filter: none; } }
+    .pop-in { animation: popin 0.7s cubic-bezier(0.34, 1.56, 0.64, 1) both; }
+    @keyframes popin { from { opacity: 0; transform: scale(0.88) translateY(20px); } to { opacity: 1; transform: none; } }
+    .slide-open { animation: slideopen 0.6s var(--ease) both; transform-origin: top; }
+    @keyframes slideopen { from { opacity: 0; transform: scaleY(0.92) translateY(-12px); filter: blur(5px); } to { opacity: 1; transform: none; filter: none; } }
+
+    /* ---------- INPUTS / CHIPS / BUTTONS ---------- */
     .cyber-input {
-      background: rgba(8, 8, 14, 0.92);
-      border: 1px solid rgba(139, 92, 246, 0.3);
-      transition: all 0.2s ease;
+      background: rgba(6, 6, 12, 0.7);
+      border: 1px solid rgba(139, 92, 246, 0.28);
+      transition: border-color 0.25s ease, box-shadow 0.3s ease, transform 0.3s var(--ease), background 0.3s ease;
     }
-    .cyber-input:focus { border-color: #8b5cf6; box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.2); outline: none; }
+    .cyber-input:focus { border-color: #a78bfa; box-shadow: 0 0 0 4px rgba(139, 92, 246, 0.18), 0 0 28px -6px rgba(139, 92, 246, 0.55); outline: none; transform: translateY(-1px); background: rgba(10, 10, 20, 0.85); }
     .chip-btn {
-      background: rgba(22, 22, 35, 0.85);
-      border: 1px solid rgba(255, 255, 255, 0.07);
-      transition: all 0.18s ease;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      transition: all 0.3s var(--ease);
     }
+    .chip-btn:hover { transform: translateY(-2px); background: rgba(255,255,255,0.09); border-color: rgba(167,139,250,0.4); }
+    .chip-btn:active { transform: scale(0.95); }
     .chip-btn.active {
-      background: linear-gradient(135deg, rgba(139, 92, 246, 0.32), rgba(245, 158, 11, 0.28));
-      border-color: #f59e0b; color: #fde68a; box-shadow: 0 0 18px -4px rgba(245, 158, 11, 0.45);
+      background: linear-gradient(135deg, rgba(139, 92, 246, 0.36), rgba(245, 158, 11, 0.3));
+      border-color: #f59e0b; color: #fde68a; box-shadow: 0 0 22px -4px rgba(245, 158, 11, 0.55);
+      animation: chippulse 0.5s var(--ease);
     }
-    .form-locked {
-      pointer-events: none !important;
-      user-select: none !important;
-      opacity: 0.42 !important;
-      filter: grayscale(35%);
+    @keyframes chippulse { 0% { transform: scale(0.9); } 60% { transform: scale(1.06); } 100% { transform: scale(1); } }
+    .form-locked { pointer-events: none !important; user-select: none !important; opacity: 0.42 !important; filter: grayscale(35%) blur(0.4px); }
+    #lockableControls { transition: opacity 0.5s var(--ease), filter 0.5s var(--ease); }
+
+    .btn { position: relative; overflow: hidden; transition: transform 0.3s var(--ease), filter 0.3s ease, box-shadow 0.3s ease; }
+    .btn:hover:not(:disabled) { transform: translateY(-2px); filter: brightness(1.1); }
+    .btn:active:not(:disabled) { transform: scale(0.97); }
+    .btn:disabled { cursor: not-allowed; }
+    .ripple { position: absolute; border-radius: 50%; background: rgba(255,255,255,0.5); transform: scale(0); animation: ripple 0.7s ease-out forwards; pointer-events: none; }
+    @keyframes ripple { to { transform: scale(4); opacity: 0; } }
+    .btn-main { box-shadow: 0 10px 40px -10px rgba(167, 139, 250, 0.7); background-size: 200% 100%; animation: gradflow 6s ease infinite; }
+    @keyframes gradflow { 0%, 100% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } }
+    .btn-cancel { background: linear-gradient(135deg, rgba(244,63,94,0.28), rgba(244,63,94,0.12)); border: 1px solid rgba(244,63,94,0.5); color: #fecdd3; box-shadow: 0 0 26px -8px rgba(244,63,94,0.7); }
+    .btn-cancel:disabled { opacity: 0.55; box-shadow: none; }
+
+    /* ---------- 4-STAGE PROGRESS ---------- */
+    .stage {
+      padding: 14px; border-radius: 20px;
+      border: 1px solid rgba(255,255,255,0.07);
+      background: rgba(0,0,0,0.3);
+      opacity: 0.5; transform: scale(0.985);
+      transition: all 0.55s var(--ease);
     }
+    .stage[data-state="active"] { opacity: 1; transform: none; border-color: rgba(167,139,250,0.55); box-shadow: 0 0 36px -10px rgba(139,92,246,0.75), inset 0 0 24px -14px rgba(167,139,250,0.6); }
+    .stage[data-state="done"] { opacity: 1; transform: none; border-color: rgba(52,211,153,0.5); box-shadow: 0 0 28px -12px rgba(52,211,153,0.6); }
+    .stage[data-state="skipped"] { opacity: 0.55; transform: none; border-style: dashed; }
+    .stage[data-state="error"] { opacity: 1; border-color: rgba(244,63,94,0.65); box-shadow: 0 0 28px -10px rgba(244,63,94,0.6); }
+    .stage[data-state="cancelled"] { opacity: 0.7; border-color: rgba(251,191,36,0.5); }
+    .stage .ico { display: inline-flex; width: 34px; height: 34px; align-items: center; justify-content: center; border-radius: 12px; background: rgba(255,255,255,0.06); font-size: 16px; flex-shrink: 0; }
+    .stage[data-state="active"] .ico { animation: bob 1.8s ease-in-out infinite; background: rgba(139,92,246,0.22); }
+    .stage[data-state="done"] .ico { background: rgba(52,211,153,0.2); }
+    @keyframes bob { 0%, 100% { transform: translateY(0) rotate(0); } 50% { transform: translateY(-3px) rotate(-6deg); } }
+    .chip-state { font-size: 9px; padding: 2px 8px; border-radius: 999px; background: rgba(255,255,255,0.07); color: #94a3b8; letter-spacing: 0.04em; transition: all 0.4s var(--ease); }
+    .stage[data-state="active"] .chip-state { background: rgba(167,139,250,0.22); color: #ddd6fe; }
+    .stage[data-state="done"] .chip-state { background: rgba(52,211,153,0.2); color: #6ee7b7; }
+    .stage[data-state="error"] .chip-state { background: rgba(244,63,94,0.22); color: #fda4af; }
+    .stage[data-state="cancelled"] .chip-state { background: rgba(251,191,36,0.2); color: #fde68a; }
+
+    .bar { height: 11px; border-radius: 999px; background: rgba(0,0,0,0.6); overflow: hidden; border: 1px solid rgba(255,255,255,0.08); padding: 1.5px; }
+    .bar-fill { height: 100%; width: 0%; border-radius: 999px; position: relative; overflow: hidden; transition: width 0.6s var(--ease); }
+    .c-violet { background: linear-gradient(90deg, #7c3aed, #d946ef); }
+    .c-sky { background: linear-gradient(90deg, #0ea5e9, #6366f1); }
+    .c-amber { background: linear-gradient(90deg, #f59e0b, #f97316); }
+    .c-emerald { background: linear-gradient(90deg, #10b981, #2dd4bf); }
+    .bar-fill::after {
+      content: ""; position: absolute; inset: 0; opacity: 0;
+      background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.55) 50%, transparent 100%);
+      transform: translateX(-100%);
+    }
+    .stage[data-state="active"] .bar-fill::after { opacity: 1; animation: shine 1.5s ease-in-out infinite; }
+    @keyframes shine { to { transform: translateX(100%); } }
+    .stage[data-state="active"] .bar-fill { box-shadow: 0 0 16px 0 rgba(167,139,250,0.7); }
+    .bar.indet .bar-fill { width: 100% !important; background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.28) 0 10px, transparent 10px 20px); background-color: #10b981; animation: stripes 0.9s linear infinite; background-size: 28px 28px; }
+    @keyframes stripes { to { background-position: 28px 0; } }
+    .stage-line { width: 2px; height: 10px; margin: 0 auto; background: linear-gradient(to bottom, rgba(167,139,250,0.5), transparent); }
+
+    /* ---------- DOCK ---------- */
     .ios-dock {
-      background: rgba(18, 18, 28, 0.88);
-      backdrop-filter: blur(28px);
-      -webkit-backdrop-filter: blur(28px);
-      border: 1px solid rgba(255, 255, 255, 0.15);
-      box-shadow: 0 24px 48px -8px rgba(0, 0, 0, 0.9);
+      background: rgba(18, 18, 30, 0.6);
+      backdrop-filter: blur(30px) saturate(180%);
+      -webkit-backdrop-filter: blur(30px) saturate(180%);
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.18), 0 24px 48px -8px rgba(0, 0, 0, 0.9);
+      position: relative;
     }
-    .dock-btn { transition: all 0.2s cubic-bezier(0.22, 1, 0.36, 1); }
-    .dock-btn.active {
-      background: linear-gradient(135deg, #8b5cf6, #ec4899); color: #fff; font-weight: 700; transform: translateY(-2px);
+    .dock-btn { position: relative; z-index: 1; transition: color 0.35s ease, transform 0.35s var(--ease); }
+    .dock-btn:active { transform: scale(0.92); }
+    .dock-btn.active { color: #fff; font-weight: 700; }
+    #dockPill { position: absolute; top: 6px; bottom: 6px; border-radius: 20px; background: linear-gradient(135deg, #8b5cf6, #ec4899); box-shadow: 0 8px 26px -6px rgba(236,72,153,0.7); transition: left 0.5s var(--ease), width 0.5s var(--ease); z-index: 0; }
+
+    /* ---------- MISC ---------- */
+    .skeleton { background: linear-gradient(100deg, rgba(255,255,255,0.04) 30%, rgba(255,255,255,0.12) 50%, rgba(255,255,255,0.04) 70%); background-size: 220% 100%; animation: skel 1.3s linear infinite; border-radius: 16px; }
+    @keyframes skel { to { background-position: -220% 0; } }
+    .spin { animation: spin 0.8s linear infinite; display: inline-block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .vault-item { animation: rise 0.6s var(--ease) both; animation-delay: calc(var(--i, 0) * 60ms); transition: transform 0.3s var(--ease), border-color 0.3s ease, background 0.3s ease; }
+    .vault-item:hover { transform: translateY(-2px) scale(1.01); border-color: rgba(167,139,250,0.35); background: rgba(255,255,255,0.05); }
+    #toasts { position: fixed; top: 14px; left: 50%; transform: translateX(-50%); z-index: 100; display: flex; flex-direction: column; gap: 8px; align-items: center; width: calc(100% - 28px); max-width: 420px; pointer-events: none; }
+    .toast { pointer-events: auto; padding: 10px 16px; border-radius: 16px; font-size: 12px; backdrop-filter: blur(22px); -webkit-backdrop-filter: blur(22px); border: 1px solid rgba(255,255,255,0.18); background: rgba(20,20,32,0.78); color: #e2e8f0; box-shadow: 0 16px 40px -10px rgba(0,0,0,0.9); animation: toastin 0.55s cubic-bezier(0.34, 1.56, 0.64, 1) both; }
+    .toast.out { animation: toastout 0.4s ease forwards; }
+    .toast.ok { border-color: rgba(52,211,153,0.5); }
+    .toast.warn { border-color: rgba(251,191,36,0.5); }
+    .toast.bad { border-color: rgba(244,63,94,0.5); }
+    @keyframes toastin { from { opacity: 0; transform: translateY(-20px) scale(0.9); } to { opacity: 1; transform: none; } }
+    @keyframes toastout { to { opacity: 0; transform: translateY(-14px) scale(0.92); } }
+    .live-dot { animation: ping 1.6s cubic-bezier(0, 0, 0.2, 1) infinite; }
+    @keyframes ping { 75%, 100% { transform: scale(2.2); opacity: 0; } }
+    .glow-ring { animation: glowring 2.8s ease-in-out infinite; }
+    @keyframes glowring { 0%, 100% { box-shadow: 0 0 0 0 rgba(52,211,153,0.0), 0 20px 50px -15px rgba(0,0,0,0.9); } 50% { box-shadow: 0 0 40px 0 rgba(52,211,153,0.28), 0 20px 50px -15px rgba(0,0,0,0.9); } }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-thumb { background: rgba(167,139,250,0.35); border-radius: 99px; }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+      .orb, .spark, .grid-glow { display: none; }
     }
   </style>
 </head>
 <body class="min-h-screen text-slate-100 p-4 pb-36 selection:bg-violet-500/30">
 
-  <div class="w-full max-w-lg mx-auto pt-2">
+  <!-- AMBIENT LAYER -->
+  <div class="ambient" aria-hidden="true">
+    <div class="orb o1"></div><div class="orb o2"></div><div class="orb o3"></div><div class="orb o4"></div>
+    <div class="grid-glow"></div>
+    <div id="sparks"></div>
+  </div>
+
+  <div id="toasts"></div>
+
+  <div class="relative z-10 w-full max-w-lg mx-auto pt-2">
     <!-- Top Header -->
-    <div class="flex items-center justify-between px-4 py-2.5 rounded-2xl bento-card mb-4">
+    <div class="glass flex items-center justify-between px-4 py-2.5 rounded-2xl mb-4 rise" style="--i:0">
       <div class="flex items-center gap-2.5">
-        <span class="w-2.5 h-2.5 rounded-full bg-violet-400 animate-pulse"></span>
+        <span class="relative flex w-2.5 h-2.5">
+          <span class="live-dot absolute inline-flex h-full w-full rounded-full bg-violet-400 opacity-75"></span>
+          <span class="relative inline-flex rounded-full w-2.5 h-2.5 bg-violet-400"></span>
+        </span>
         <span class="brand-font font-bold text-sm tracking-wider bg-gradient-to-r from-violet-300 via-purple-400 to-amber-300 bg-clip-text text-transparent">
           HYPER//FLUX SECURE STUDIO
         </span>
       </div>
-      <span id="lockStatusBadge" class="mono text-[10px] px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+      <span id="lockStatusBadge" class="mono text-[10px] px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 transition-all duration-500">
         KHwang9883 DB + SHA-256
       </span>
     </div>
 
     <!-- ================= TAB 1: STUDIO ================= -->
     <div id="tabStudio" class="space-y-4">
-      <div class="bento-card rounded-3xl p-5 space-y-4">
-        <div id="lockableControls" class="space-y-4 transition-all duration-300">
+      <div class="glass rounded-3xl p-5 space-y-4 rise" style="--i:1">
+        <div id="lockableControls" class="space-y-4">
           <div class="flex items-center justify-between">
             <h2 class="text-xs font-bold text-white uppercase tracking-wider mono">01 // Device & ROM Info (Auto-Verified via KHwang9883 DB)</h2>
             <span class="text-[10px] text-amber-300 mono">✨ Unknown Fallback</span>
@@ -1672,7 +2015,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 <option value="custom">Custom ROM (Lineage / PixelOS / etc.)</option>
               </select>
             </div>
-            <div id="formatBox">
+            <div id="formatBox" style="transition: opacity .35s ease, transform .35s ease">
               <label class="text-[10px] uppercase mono text-slate-400 block mb-1">4. Stock Format</label>
               <select id="romFmt" class="cyber-input w-full px-3.5 py-2.5 rounded-xl text-xs mono text-white">
                 <option value="fastboot">Fastboot (.tgz)</option>
@@ -1715,51 +2058,40 @@ HTML_PAGE = """<!DOCTYPE html>
           </div>
         </div>
 
-        <button id="launchBtn" onclick="launchExtraction()" class="w-full py-3.5 rounded-2xl font-bold text-sm text-slate-950 bg-gradient-to-r from-violet-400 via-purple-400 to-amber-300 hover:brightness-110 transition shadow-lg">
+        <button id="launchBtn" onclick="launchExtraction()" class="btn btn-main rip w-full py-3.5 rounded-2xl font-bold text-sm text-slate-950 bg-gradient-to-r from-violet-400 via-purple-400 to-amber-300">
           🛡️ Auto-Verify ROM & Extract Partition
         </button>
 
         <div id="errBanner" class="hidden text-xs text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded-2xl p-3.5 mono leading-relaxed"></div>
       </div>
 
-      <!-- LIVE PROGRESS HUD -->
-      <div id="liveProgressHud" class="hidden bento-card rounded-3xl p-5 space-y-4 border border-violet-500/30">
+      <!-- LIVE PROGRESS HUD: 4 separate bars -->
+      <div id="liveProgressHud" class="hidden glass rounded-3xl p-5 space-y-3 border border-violet-500/30">
         <div class="flex justify-between items-center border-b border-white/10 pb-2.5">
           <div class="flex items-center gap-2">
-            <span class="w-2 h-2 rounded-full bg-amber-400 animate-ping"></span>
+            <span class="relative flex w-2 h-2">
+              <span class="live-dot absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
+              <span class="relative inline-flex rounded-full w-2 h-2 bg-amber-400"></span>
+            </span>
             <span class="text-xs font-bold text-white">Live Cloud Security HUD</span>
           </div>
           <span id="hudSpeed" class="mono text-xs font-bold text-amber-300">—</span>
         </div>
 
-        <div>
-          <div class="flex justify-between text-[11px] mb-1">
-            <span id="romStageText" class="text-slate-300">Stage 1: Cloud ROM Stream</span>
-            <span id="romPercentText" class="mono text-violet-300 font-bold">0%</span>
-          </div>
-          <div class="w-full h-2.5 bg-black rounded-full overflow-hidden border border-white/10 p-0.5">
-            <div id="romBar" style="width:0%" class="h-full rounded-full bg-gradient-to-r from-violet-500 to-fuchsia-500 transition-all duration-300"></div>
-          </div>
-          <p id="scanEntryText" class="mono text-[10px] text-slate-400 mt-1 truncate">Inspecting ROM headers...</p>
-        </div>
+        <div id="stageList" class="space-y-1"></div>
+        <p id="scanEntryText" class="mono text-[10px] text-slate-400 truncate px-1">Inspecting ROM headers...</p>
 
-        <div>
-          <div class="flex justify-between text-[11px] mb-1">
-            <span id="extStageText" class="text-slate-300">Stage 2: Hashing & Vault Sync</span>
-            <span id="extPercentText" class="mono text-emerald-400 font-bold">0%</span>
-          </div>
-          <div class="w-full h-2.5 bg-black rounded-full overflow-hidden border border-white/10 p-0.5">
-            <div id="extBar" style="width:0%" class="h-full rounded-full bg-gradient-to-r from-amber-400 to-emerald-400 transition-all duration-300"></div>
-          </div>
-        </div>
+        <button id="cancelBtn" onclick="cancelExtraction()" class="btn btn-cancel rip w-full py-2.5 rounded-xl mono text-xs font-bold">
+          ✖ Cancel extraction
+        </button>
 
-        <button onclick="switchView('terminal')" class="w-full py-2 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 mono text-[11px] text-amber-300 transition">
+        <button onclick="switchView('terminal')" class="btn rip w-full py-2 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 mono text-[11px] text-amber-300">
           💻 Open Full Telemetry & Live Code Console →
         </button>
       </div>
 
       <!-- VERIFIED DOWNLOAD RESULT CARD -->
-      <div id="doneCard" class="hidden bento-card rounded-3xl p-6 border border-emerald-500/40 space-y-4">
+      <div id="doneCard" class="hidden glass glow-ring rounded-3xl p-6 border border-emerald-500/40 space-y-4">
         <div class="flex items-center justify-between">
           <span id="doneAutoBadge" class="px-3 py-1 rounded-full bg-emerald-500/15 border border-emerald-400/30 text-emerald-300 mono text-[10px] font-semibold">
             ✓ Auto-Verified from ROM
@@ -1772,7 +2104,7 @@ HTML_PAGE = """<!DOCTYPE html>
           <p id="doneSub" class="text-xs text-slate-400 mt-0.5"></p>
         </div>
 
-        <div class="bg-black/60 rounded-2xl p-3.5 border border-white/5 space-y-2 mono text-[11px]">
+        <div class="bg-black/50 rounded-2xl p-3.5 border border-white/5 space-y-2 mono text-[11px]">
           <div class="flex justify-between"><span class="text-slate-400">KHwang9883 Codename:</span><span id="doneCode" class="text-violet-300 font-bold"></span></div>
           <div class="flex justify-between"><span class="text-slate-400">File & Size:</span><span id="doneFileSize" class="text-amber-300 font-bold"></span></div>
           <div class="flex justify-between gap-3"><span class="text-slate-400 shrink-0">Found in:</span><span id="doneSource" class="text-sky-300 text-right break-all"></span></div>
@@ -1783,363 +2115,24 @@ HTML_PAGE = """<!DOCTYPE html>
           </div>
         </div>
 
-        <a id="finalDownloadBtn" href="#" target="_blank" class="w-full py-3.5 rounded-2xl font-bold text-sm text-slate-950 bg-gradient-to-r from-emerald-400 to-teal-300 hover:brightness-110 transition flex items-center justify-center gap-2 shadow-lg">
+        <a id="finalDownloadBtn" href="#" target="_blank" class="btn rip w-full py-3.5 rounded-2xl font-bold text-sm text-slate-950 bg-gradient-to-r from-emerald-400 to-teal-300 flex items-center justify-center gap-2 shadow-lg">
           ⬇ Download Verified File
         </a>
       </div>
     </div>
 
-    <!-- ================= TAB 2: VAULT (ROMS & EXTRACTED IMGS) ================= -->
+    <!-- ================= TAB 2: VAULT ================= -->
     <div id="tabVault" class="hidden space-y-4">
-      <div class="bento-card rounded-3xl p-5 space-y-4">
+      <div class="glass rounded-3xl p-5 space-y-4">
         <div class="flex justify-between items-center">
           <div>
             <h2 class="text-base font-bold text-white">🗄️ Permanent Dataset Vault</h2>
-            <p class="text-[11px] text-slate-400">Verified via KHwang9883 DB (Unlisted devices marked 'Unknown')</p>
+            <p id="vaultSub" class="text-[11px] text-slate-400">Verified via KHwang9883 DB (Unlisted devices marked 'Unknown')</p>
           </div>
-          <button onclick="loadVault()" class="mono text-[11px] px-3 py-1.5 rounded-xl bg-white/5 text-amber-300 border border-white/10">Refresh</button>
+          <button id="refreshBtn" onclick="loadVault(true)" class="btn rip mono text-[11px] px-3.5 py-2 rounded-xl bg-white/5 text-amber-300 border border-white/10 flex items-center gap-1.5">
+            <span id="refreshIco">⟳</span><span id="refreshTxt">Refresh</span>
+          </button>
         </div>
 
         <div>
-          <h3 class="mono text-xs uppercase text-violet-300 mb-2 font-semibold">1. Saved ROMs (Device, Codename & Version)</h3>
-          <div id="romVaultList" class="space-y-2 max-h-56 overflow-y-auto pr-1">
-            <div class="text-xs text-slate-500 mono py-3 text-center">Loading saved ROMs...</div>
-          </div>
-        </div>
-
-        <hr class="border-white/10" />
-
-        <div>
-          <h3 class="mono text-xs uppercase text-emerald-300 mb-2 font-semibold">2. Verified Extracted Files (SHA-256 Matched)</h3>
-          <div id="imgVaultList" class="space-y-2.5 max-h-72 overflow-y-auto pr-1">
-            <div class="text-xs text-slate-500 mono py-4 text-center">Loading extracted partitions...</div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- ================= TAB 3: FULL TELEMETRY & LIVE CODE CONSOLE ================= -->
-    <div id="tabTerminal" class="hidden space-y-4">
-      <div class="grid grid-cols-2 gap-2.5">
-        <div class="bento-card rounded-2xl p-3.5 border border-white/10">
-          <span class="mono text-[10px] uppercase text-slate-400 block">Live Bandwidth</span>
-          <span id="conSpeed" class="mono text-sm font-bold text-amber-300 mt-0.5 block">—</span>
-        </div>
-        <div class="bento-card rounded-2xl p-3.5 border border-white/10">
-          <span class="mono text-[10px] uppercase text-slate-400 block">Streamed / Offset</span>
-          <span id="conOffset" class="mono text-sm font-bold text-violet-300 mt-0.5 block">0 MB (0x00)</span>
-        </div>
-        <div class="bento-card rounded-2xl p-3.5 border border-white/10">
-          <span class="mono text-[10px] uppercase text-slate-400 block">Entries / Chunks Verified</span>
-          <span id="conChunks" class="mono text-sm font-bold text-emerald-400 mt-0.5 block">0</span>
-        </div>
-        <div class="bento-card rounded-2xl p-3.5 border border-white/10">
-          <span class="mono text-[10px] uppercase text-slate-400 block">Current Stream Entry</span>
-          <span id="conScan" class="mono text-xs font-semibold text-sky-300 mt-0.5 block truncate">—</span>
-        </div>
-      </div>
-
-      <!-- Live Auto-Metadata Corrector Inspector -->
-      <div class="bento-card rounded-3xl p-4 border border-amber-500/25 space-y-2">
-        <div class="flex items-center justify-between">
-          <span class="mono text-[11px] uppercase text-amber-300 font-bold">✨ KHwang9883 DB Auto-Metadata Inspector</span>
-          <span id="metaStatusBadge" class="mono text-[10px] px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300">Standby</span>
-        </div>
-        <div class="grid grid-cols-2 gap-2 mono text-[11px] bg-black/60 p-3 rounded-2xl border border-white/5">
-          <div>
-            <span class="text-[10px] text-slate-400 block">User Typed:</span>
-            <span id="metaUserTyped" class="text-slate-300 truncate block">—</span>
-          </div>
-          <div>
-            <span class="text-[10px] text-slate-400 block">Vault Truth (xiaomi_en.md):</span>
-            <span id="metaAutoTruth" class="text-emerald-300 font-bold truncate block">—</span>
-          </div>
-        </div>
-      </div>
-
-      <!-- Full Executed Engine Code Pipeline -->
-      <div class="bento-card rounded-3xl p-4 space-y-2">
-        <div class="flex items-center justify-between">
-          <div class="flex items-center gap-1.5">
-            <span class="w-2.5 h-2.5 rounded-full bg-rose-500"></span>
-            <span class="w-2.5 h-2.5 rounded-full bg-amber-400"></span>
-            <span class="w-2.5 h-2.5 rounded-full bg-emerald-400"></span>
-            <span class="mono text-[11px] font-bold text-violet-300 ml-1">Live Executed Engine Code</span>
-          </div>
-          <span class="mono text-[10px] px-2 py-0.5 rounded bg-white/5 text-slate-400">Python 3.11 Pipeline</span>
-        </div>
-        <pre id="cmdViewer" class="mono text-[10.5px] leading-relaxed text-amber-200 bg-black/80 p-3.5 rounded-2xl border border-white/5 overflow-x-auto max-h-56 overflow-y-auto"># Launch an extraction to watch every Python stage execute in real time...</pre>
-      </div>
-
-      <!-- Verbose Full-Detail Server Terminal Log -->
-      <div class="bento-card rounded-3xl p-4 space-y-2">
-        <div class="flex items-center justify-between">
-          <span class="mono text-[11px] font-bold text-emerald-300 uppercase">Full Telemetry Terminal Log</span>
-          <button onclick="document.getElementById('logBox').innerHTML=''" class="mono text-[10px] text-slate-400 hover:text-white">Clear</button>
-        </div>
-        <div id="logBox" class="mono text-[10.5px] bg-black/85 rounded-2xl p-3.5 h-64 overflow-y-auto space-y-1.5 border border-white/5">
-          <div class="text-slate-500">[System] HYPER//FLUX v8 + KHwang9883 xiaomi_en.md Database Ready.</div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- IPHONE GLASS DOCK -->
-  <div class="fixed bottom-3 left-1/2 -translate-x-1/2 z-50 flex flex-col items-center gap-1.5 w-full max-w-sm px-4">
-    <div class="ios-dock p-1.5 rounded-[26px] flex items-center justify-between w-full gap-1">
-      <button id="btnStudio" onclick="switchView('studio')" class="dock-btn active flex-1 py-2.5 rounded-[20px] text-xs">⚡ Studio</button>
-      <button id="btnVault" onclick="switchView('vault')" class="dock-btn flex-1 py-2.5 rounded-[20px] text-xs text-slate-300">🗄️ Vault</button>
-      <button id="btnTerminal" onclick="switchView('terminal')" class="dock-btn flex-1 py-2.5 rounded-[20px] text-xs text-slate-300">💻 Console</button>
-    </div>
-    <div class="text-[11px] font-medium text-slate-400 tracking-wide flex items-center gap-1">
-      <span>Made by</span>
-      <span class="font-bold bg-gradient-to-r from-violet-400 to-amber-300 bg-clip-text text-transparent">Yash</span>
-    </div>
-  </div>
-
-  <script>
-    let currentPart = "init_boot.img";
-    let pollTimer = null;
-    let renderedLogs = 0;
-
-    function setFormLocked(locked) {
-      const wrap = document.getElementById("lockableControls");
-      const badge = document.getElementById("lockStatusBadge");
-      const inputs = wrap.querySelectorAll("input, select, button");
-      inputs.forEach(el => el.disabled = locked);
-
-      if (locked) {
-        wrap.classList.add("form-locked");
-        badge.textContent = "🔒 Locked (Extracting)";
-        badge.className = "mono text-[10px] px-2.5 py-1 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40";
-      } else {
-        wrap.classList.remove("form-locked");
-        badge.textContent = "KHwang9883 DB + SHA-256";
-        badge.className = "mono text-[10px] px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30";
-      }
-    }
-
-    function switchView(view) {
-      ["Studio", "Vault", "Terminal"].forEach(v => {
-        document.getElementById("tab" + v).classList.add("hidden");
-        const b = document.getElementById("btn" + v);
-        b.classList.remove("active"); b.classList.add("text-slate-300");
-      });
-      const cap = view.charAt(0).toUpperCase() + view.slice(1);
-      document.getElementById("tab" + cap).classList.remove("hidden");
-      const activeBtn = document.getElementById("btn" + cap);
-      activeBtn.classList.add("active"); activeBtn.classList.remove("text-slate-300");
-      if (view === "vault") loadVault();
-    }
-
-    function toggleFormatOption(val) {
-      document.getElementById("formatBox").style.display = val === "custom" ? "none" : "block";
-    }
-
-    function pickPart(part, el) {
-      currentPart = part;
-      document.getElementById("selectedLabel").textContent = part;
-      document.getElementById("customTarget").value = "";
-      document.querySelectorAll("#chipGrid .chip-btn").forEach(b => b.classList.remove("active"));
-      el.classList.add("active");
-    }
-
-    function customInput(val) {
-      if (val.trim()) {
-        currentPart = val.trim();
-        document.getElementById("selectedLabel").textContent = currentPart;
-        document.querySelectorAll("#chipGrid .chip-btn").forEach(b => b.classList.remove("active"));
-      }
-    }
-
-    async function launchExtraction() {
-      const devName = document.getElementById("devName").value.trim();
-      const romVer = document.getElementById("romVer").value.trim();
-      const romCat = document.getElementById("romCat").value;
-      const romFmt = document.getElementById("romFmt").value;
-      const romUrl = document.getElementById("romUrl").value.trim();
-      const errBanner = document.getElementById("errBanner");
-      const btn = document.getElementById("launchBtn");
-
-      errBanner.classList.add("hidden");
-      if (!romUrl) {
-        errBanner.textContent = "Please paste a valid ROM download link.";
-        errBanner.classList.remove("hidden");
-        return;
-      }
-
-      setFormLocked(true);
-      btn.disabled = true;
-      btn.innerHTML = "🔒 Locked — Checking KHwang9883 DB & Extracting...";
-
-      document.getElementById("doneCard").classList.add("hidden");
-      document.getElementById("liveProgressHud").classList.remove("hidden");
-      document.getElementById("romBar").style.width = "2%";
-      document.getElementById("extBar").style.width = "0%";
-      document.getElementById("logBox").innerHTML = "";
-      renderedLogs = 0;
-
-      try {
-        const res = await fetch("/api/start", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            rom_url: romUrl, target: currentPart,
-            device_name: devName, rom_version: romVer,
-            rom_category: romCat, rom_format: romFmt
-          })
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Failed to start extraction");
-
-        if (pollTimer) clearInterval(pollTimer);
-        pollTimer = setInterval(() => pollJobStatus(data.job_id), 550);
-      } catch (e) {
-        errBanner.textContent = e.message;
-        errBanner.classList.remove("hidden");
-        setFormLocked(false);
-        btn.disabled = false;
-        btn.innerHTML = "🛡️ Auto-Verify ROM & Extract Partition";
-      }
-    }
-
-    async function pollJobStatus(jobId) {
-      const errBanner = document.getElementById("errBanner");
-      const btn = document.getElementById("launchBtn");
-      try {
-        const res = await fetch(`/api/status/${jobId}`);
-        if (!res.ok) return;
-        const job = await res.json();
-
-        document.getElementById("romBar").style.width = `${job.rom_progress}%`;
-        document.getElementById("romPercentText").textContent = `${job.rom_progress}%`;
-        document.getElementById("romStageText").textContent = job.rom_label;
-        document.getElementById("scanEntryText").textContent = job.current_scan !== "—" ? `Scanning: ${job.current_scan}` : "Streaming in cloud RAM (0 MB client data used)";
-
-        document.getElementById("extBar").style.width = `${job.ext_progress}%`;
-        document.getElementById("extPercentText").textContent = `${job.ext_progress}%`;
-        document.getElementById("extStageText").textContent = job.ext_label;
-        document.getElementById("hudSpeed").textContent = job.speed;
-
-        document.getElementById("conSpeed").textContent = job.speed;
-        document.getElementById("conOffset").textContent = `${job.bytes_streamed_mb} (${job.hex_offset})`;
-        document.getElementById("conChunks").textContent = job.chunks_verified;
-        document.getElementById("conScan").textContent = job.current_scan;
-        document.getElementById("cmdViewer").textContent = job.cmd;
-
-        if (job.resolved_meta) {
-          const rm = job.resolved_meta;
-          document.getElementById("metaUserTyped").textContent = rm.user_input_summary;
-          document.getElementById("metaAutoTruth").textContent = `${rm.device_name} [${rm.codename}] • ${rm.rom_version}`;
-          document.getElementById("metaStatusBadge").textContent = rm.device_name === "Unknown" ? "Marked Unknown ⚠️" : "KHwang9883 Match ✓";
-        }
-
-        const logBox = document.getElementById("logBox");
-        while (renderedLogs < job.logs.length) {
-          const item = job.logs[renderedLogs++];
-          const d = document.createElement("div");
-          const colorMap = {
-            ERROR: "text-rose-400 font-bold",
-            SUCCESS: "text-emerald-400 font-bold",
-            META: "text-amber-300 font-semibold",
-            VERIFY: "text-violet-300 font-semibold",
-            CHUNK: "text-sky-300",
-            HTTP: "text-cyan-300",
-            UPLOAD: "text-emerald-300"
-          };
-          d.className = colorMap[item.level] || "text-slate-300";
-          d.textContent = `[${item.ts}] [${item.level}] ${item.message}`;
-          logBox.appendChild(d);
-          logBox.scrollTop = logBox.scrollHeight;
-        }
-
-        if (job.state === "done" && job.result) {
-          clearInterval(pollTimer);
-          setFormLocked(false);
-          btn.disabled = false;
-          btn.innerHTML = "🛡️ Auto-Verify ROM & Extract Partition";
-
-          const r = job.result;
-          document.getElementById("devName").value = r.device_name;
-          document.getElementById("romVer").value = r.rom_version;
-
-          document.getElementById("doneCard").classList.remove("hidden");
-          document.getElementById("doneAutoBadge").textContent = `✨ ${r.auto_status}`;
-          document.getElementById("doneDuration").textContent = r.duration;
-          document.getElementById("doneTitle").textContent = `${r.device_name} — ${r.target}`;
-          document.getElementById("doneSub").textContent = `${r.rom_version} • ${r.rom_category} (${r.rom_format})`;
-          document.getElementById("doneCode").textContent = r.codename;
-          document.getElementById("doneFileSize").textContent = `${r.target} (${r.size})`;
-          document.getElementById("doneSource").textContent = r.source || "—";
-          document.getElementById("doneSig").textContent = r.signature;
-          document.getElementById("doneHash").textContent = r.sha256;
-          document.getElementById("finalDownloadBtn").href = r.download_url;
-        } else if (job.state === "error") {
-          clearInterval(pollTimer);
-          setFormLocked(false);
-          btn.disabled = false;
-          btn.innerHTML = "🛡️ Auto-Verify ROM & Extract Partition";
-          errBanner.textContent = job.error || "Extraction failed.";
-          errBanner.classList.remove("hidden");
-        }
-      } catch (ignore) {}
-    }
-
-    async function loadVault() {
-      try {
-        const res = await fetch("/api/vault");
-        const data = await res.json();
-
-        const romBox = document.getElementById("romVaultList");
-        if (!data.roms || data.roms.length === 0) {
-          romBox.innerHTML = `<div class="text-xs text-slate-500 mono py-3 text-center">No ROMs saved in Vault yet.</div>`;
-        } else {
-          romBox.innerHTML = data.roms.map(r => `
-            <div class="flex items-center justify-between p-3 rounded-2xl bg-black/50 border border-white/5">
-              <div class="pr-2 overflow-hidden">
-                <div class="text-xs font-bold text-white">${r.device_name} <span class="mono text-violet-300">[${r.codename}]</span></div>
-                <div class="mono text-[10px] text-amber-300">${r.rom_version} • ${r.rom_category} (${r.rom_format})</div>
-              </div>
-              <a href="${r.rom_url}" target="_blank" class="shrink-0 px-3 py-1.5 rounded-xl bg-violet-500/20 text-violet-300 border border-violet-400/30 mono text-[10px] font-semibold">
-                ⬇ Full ROM
-              </a>
-            </div>
-          `).join("");
-        }
-
-        const imgBox = document.getElementById("imgVaultList");
-        if (!data.images || data.images.length === 0) {
-          imgBox.innerHTML = `<div class="text-xs text-slate-500 mono py-4 text-center">No extracted files in Vault yet.</div>`;
-        } else {
-          imgBox.innerHTML = data.images.map(img => `
-            <div class="p-3.5 rounded-2xl bg-black/55 border border-white/5 space-y-2">
-              <div class="flex items-center justify-between">
-                <div>
-                  <span class="mono text-xs font-bold text-amber-300">${img.target}</span>
-                  <span class="mono text-[10px] text-slate-400 ml-1.5">(${img.size})</span>
-                  <div class="text-xs font-semibold text-white mt-0.5">${img.device_name} <span class="mono text-violet-300">[${img.codename}]</span></div>
-                  <div class="mono text-[10px] text-slate-400">${img.rom_version} • ${img.rom_category} (${img.rom_format})</div>
-                  <div class="mono text-[10px] text-sky-300">${img.source || ""}</div>
-                </div>
-                <a href="${img.download_url}" target="_blank" class="shrink-0 px-3.5 py-2 rounded-xl bg-emerald-500/20 text-emerald-300 border border-emerald-400/30 mono text-[11px] font-bold">
-                  ⬇ 0s Get
-                </a>
-              </div>
-              <div class="mono text-[9px] text-slate-400 bg-white/5 px-2.5 py-1 rounded-lg truncate">
-                SHA256: <span class="text-emerald-300">${img.sha256}</span>
-              </div>
-            </div>
-          `).join("");
-        }
-      } catch (e) {
-        console.error(e);
-      }
-    }
-  </script>
-</body>
-</html>
-"""
-
-@app.get("/", response_class=HTMLResponse)
-def serve_ui():
-    return HTML_PAGE
+          <h3 class="mono text-xs uppercase text-violet-300 mb-2 font-semibold">1. Saved ROMs
