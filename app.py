@@ -1,6 +1,8 @@
 import os
 import re
 import bz2
+import base64
+import html as htmllib
 import lzma
 import json
 import zlib
@@ -16,7 +18,7 @@ import threading
 import requests
 import zstandard as zstd
 from datetime import datetime
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, urljoin
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from remotezip import RemoteZip
@@ -389,8 +391,8 @@ def parse_filename_from_cd(cd: str):
         return unquote(m_std.group(1)).strip('"')
     return None
 
-def resolve_direct_url(url: str, job_id: str):
-    session = make_session()
+def resolve_direct_url(url: str, job_id: str, session=None):
+    session = session or make_session()
     parsed = urlparse(url)
     if parsed.netloc in ("bigota.d.miui.com", "hugeota.d.miui.com", "cdnorg.d.miui.com"):
         fast_mirror = f"https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com{parsed.path}"
@@ -406,6 +408,9 @@ def resolve_direct_url(url: str, job_id: str):
     if resp.status_code >= 400:
         resp.close()
         raise Exception(f"ROM Server returned HTTP {resp.status_code}.")
+    if "text/html" in resp.headers.get("Content-Type", "").lower():
+        resp.close()
+        raise Fatal("That link opens a web page, not a file, and no download button could be followed from it.")
     final_url = resp.url
     total_size = int(resp.headers.get("Content-Length", 0) or 0)
     accept_ranges = resp.headers.get("Accept-Ranges", "none")
@@ -420,20 +425,48 @@ def resolve_direct_url(url: str, job_id: str):
     job_log(job_id, "HTTP", f"HTTP 200 OK | File: {filename} | Size: {total_size / MB:.1f} MB | Ranges: {accept_ranges}")
     return final_url, filename, total_size, session
 
+def gdrive_html_reason(html: str):
+    """Turns a Google Drive web page (returned instead of the file) into a plain-English reason."""
+    low = html.lower()
+    if "quota exceeded" in low or "too many users" in low or "download quota" in low:
+        return ("Google Drive blocked this download: the file hit its download quota (too many people downloaded it recently). "
+                "Open the file in Drive, choose 'Make a copy', share YOUR copy with 'Anyone with the link' and paste that link. "
+                "Or wait about 24 hours.")
+    if "accounts.google.com" in low or "request access" in low or "you need access" in low or "sign in" in low:
+        return "Google Drive asked for a sign-in, so the link is not public. Set sharing to 'Anyone with the link'."
+    return None
+
 def resolve_gdrive_stream(file_id: str, job_id: str):
     session = make_session()
     direct_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
     resp = session.get(direct_url, stream=True, timeout=30)
-    if "text/html" in resp.headers.get("Content-Type", ""):
+    for _ in range(2):
+        if "text/html" not in resp.headers.get("Content-Type", "").lower():
+            break
         html = resp.text
         resp.close()
-        uuid_match = re.search(r'name="uuid"\s+value="([^"]+)"', html)
-        if uuid_match:
-            direct_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t&uuid={uuid_match.group(1)}"
-            resp = session.get(direct_url, stream=True, timeout=30)
+        reason = gdrive_html_reason(html)
+        if reason:
+            raise Fatal(reason)
+        # Virus-scan / confirm page: submit its hidden form exactly like the Download anyway button does
+        action_m = re.search(r'<form[^>]*action="([^"]+)"', html)
+        params = {n: v for n, v in re.findall(r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"', html)}
+        if not params:
+            uuid_match = re.search(r'name="uuid"\s+value="([^"]+)"', html)
+            if uuid_match:
+                params = {"id": file_id, "export": "download", "confirm": "t", "uuid": uuid_match.group(1)}
+        if not params:
+            break
+        action = (action_m.group(1) if action_m else "https://drive.usercontent.google.com/download").replace("&amp;", "&")
+        resp = session.get(action, params=params, stream=True, timeout=30)
+    if "text/html" in resp.headers.get("Content-Type", "").lower():
+        html = resp.text[:20000]
+        resp.close()
+        raise Fatal(gdrive_html_reason(html) or "Google Drive returned a web page instead of the ROM file. Check that sharing is 'Anyone with the link'.")
     if resp.status_code != 200:
         resp.close()
         raise Exception("Unable to access Google Drive link. Ensure sharing is set to 'Anyone with the link'.")
+    direct_url = resp.url
     filename = parse_filename_from_cd(resp.headers.get("Content-Disposition", "")) or f"gdrive_{file_id}.zip"
     total_size = int(resp.headers.get("Content-Length", 0) or 0)
     resp.close()
@@ -447,6 +480,150 @@ def supports_ranges(session, url: str):
             return r.status_code == 206 and r.headers.get("Content-Range", "").lower().startswith("bytes")
     except Exception:
         return False
+
+# ---------------- SMART LINK FINDER (download PAGES -> real file URL) ---------------- #
+
+FILE_EXT_RE = re.compile(r"\.(zip|tgz|tar\.gz|tar|7z|zst|img|bin)$", re.I)
+JUNK_EXT_RE = re.compile(r"\.(png|jpe?g|gif|svg|webp|ico|css|js|woff2?|ttf|json|xml|txt|md|html?)$", re.I)
+
+def known_host_url(url: str):
+    """Hosts whose real file URL can be built without opening the page."""
+    p = urlparse(url)
+    host = p.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host.endswith(("pixeldrain.com", "pixeldrain.net", "pixeldrain.dev")):
+        m = re.match(r"^/(?:u|api/file)/([A-Za-z0-9_-]+)", p.path)
+        if m:
+            return f"https://{p.netloc}/api/file/{m.group(1)}?download"
+    if host == "sourceforge.net":
+        m = re.match(r"^/projects/([^/]+)/files/(.+?)(?:/download)?/?$", p.path)
+        if m:
+            return f"https://downloads.sourceforge.net/project/{m.group(1)}/{m.group(2)}"
+    if host.endswith("dropbox.com"):
+        if "dl=0" in p.query:
+            return url.replace("dl=0", "dl=1")
+        if "dl=1" not in p.query and "raw=1" not in p.query:
+            return url + ("&" if p.query else "?") + "dl=1"
+    return None
+
+def extract_candidates(page: str, base: str):
+    """Scores every link on a page that might be the real download. Returns [(score, url)] best first."""
+    found = {}
+
+    def add(score, u):
+        u = urljoin(base, htmllib.unescape(u.strip()))
+        if not u.startswith(("http://", "https://")):
+            return
+        path = urlparse(u).path
+        if JUNK_EXT_RE.search(path):
+            return
+        if u not in found or found[u] < score:
+            found[u] = score
+
+    for m in re.finditer(r'data-scrambled-url="([^"]+)"', page):       # MediaFire
+        try:
+            add(100, base64.b64decode(m.group(1)).decode("utf-8", errors="ignore"))
+        except Exception:
+            pass
+    m = re.search(r'<meta[^>]+http-equiv=["\']refresh["\'][^>]*content=["\'][^"\']*?url=([^"\'>]+)', page, re.I)
+    if m:
+        add(90, m.group(1))
+    for m in re.finditer(r'<a\b([^>]*)>(.*?)</a>', page, re.I | re.S):
+        attrs, inner = m.group(1), m.group(2)
+        hm = re.search(r'(?:href|data-href|data-url|data-download-url)=["\']([^"\']+)["\']', attrs, re.I)
+        if not hm:
+            continue
+        href = hm.group(1)
+        if href.startswith(("javascript:", "#", "mailto:")):
+            continue
+        text = (re.sub(r"<[^>]+>", " ", inner) + " " + attrs).lower()
+        path = urlparse(urljoin(base, htmllib.unescape(href))).path
+        score = 0
+        if FILE_EXT_RE.search(path):
+            score += 60
+        if "download" in text:
+            score += 25
+        if "downloadbutton" in attrs.lower().replace("-", "").replace("_", ""):
+            score += 40
+        if re.search(r"/(download|dl|get|file)s?(/|$)", path.lower()):
+            score += 10
+        if score >= 25:
+            add(score, href)
+    plain = page.replace("\\/", "/")
+    for m in re.finditer(r'https?://[^\s"\'<>\\]+?\.(?:zip|tgz|tar\.gz)(?:\?[^\s"\'<>\\]*)?', plain, re.I):
+        add(55, m.group(0))
+    return sorted(((sc, u) for u, sc in found.items()), key=lambda x: -x[0])
+
+def probe_link(session, url: str, referer=None):
+    """Opens a link just long enough to see what it is. Returns ('file', final_url, None),
+    ('html', final_url, page_text) or None when it cannot be opened."""
+    hdr = {"Referer": referer} if referer else {}
+    try:
+        r = session.get(url, headers=hdr, stream=True, allow_redirects=True, timeout=30)
+    except Exception:
+        return None
+    try:
+        if r.status_code >= 400:
+            return None
+        ct = r.headers.get("Content-Type", "").lower()
+        if "text/html" in ct or "application/xhtml" in ct:
+            body, got = [], 0
+            for c in r.iter_content(chunk_size=65536):
+                body.append(c)
+                got += len(c)
+                if got > 1_500_000:
+                    break
+            return "html", r.url, b"".join(body).decode(r.encoding or "utf-8", errors="ignore")
+        return "file", r.url, None
+    finally:
+        r.close()
+
+def find_download_url(session, url: str, job_id: str, depth: int = 0, seen=None):
+    """Turns a page link (SourceForge, PixelDrain, MediaFire, any page with a download button...)
+    into the real file URL. Direct file links are returned untouched."""
+    seen = seen if seen is not None else set()
+    fast = known_host_url(url)
+    if fast:
+        job_log(job_id, "HTTP", f"Recognised download host → direct link: {fast[:110]}")
+        url = fast
+    elif FILE_EXT_RE.search(urlparse(url).path):
+        return url  # already looks like a file link: skip the probe request
+
+    res = probe_link(session, url)
+    if res is None:
+        raise Fatal("Could not open that link (the site refused the request or is down).")
+    kind, final, page = res
+    if kind == "file":
+        session.headers["Referer"] = final
+        return final
+    if depth >= 2:
+        raise Fatal("Followed the page links but never reached a file. The site may need a captcha or a login.")
+
+    cands = extract_candidates(page, final)
+    job_log(job_id, "HTTP", f"Download page detected → checking {min(len(cands), 8)} candidate link(s)...")
+    tried, hops = 0, 0
+    for score, cu in cands:
+        if cu in seen or tried >= 8:
+            continue
+        seen.add(cu)
+        tried += 1
+        r = probe_link(session, cu, final)
+        if r is None:
+            continue
+        if r[0] == "file":
+            job_log(job_id, "HTTP", f"Found the real download link (score {score}): {r[1][:110]}")
+            session.headers["Referer"] = final
+            return r[1]
+        if hops < 3:  # an intermediate page (e.g. 'Your download is ready') -> look one level deeper
+            hops += 1
+            try:
+                return find_download_url(session, cu, job_id, depth + 1, seen)
+            except Fatal:
+                continue
+    raise Fatal("No download button or file link could be found on that page. It may build the link with JavaScript, "
+                "need a captcha / countdown, or need a login. Open the page, start the download, copy the file's real link "
+                "(from the browser's download list) and paste that instead.")
 
 def sniff_format(session, url: str, filename: str):
     """Decides 'zip' or 'tgz'. A clear file extension wins, so no extra request is sent to the server."""
@@ -622,6 +799,11 @@ def net_chunks(session, url, job_id, total_size):
     t0, done, last = time.time(), 0, 0.0
     with session.get(url, stream=True, timeout=(30, 120)) as resp:
         resp.raise_for_status()
+        if "text/html" in resp.headers.get("Content-Type", "").lower():
+            page = resp.text[:20000]
+            reason = gdrive_html_reason(page)
+            snippet = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", page)).strip()[:120]
+            raise Fatal(reason or f"The server returned a web page instead of the ROM ({snippet or 'HTML'}). The link may have expired or is not public.")
         for c in resp.iter_content(chunk_size=PIECE):
             if not c:
                 continue
@@ -1499,7 +1681,11 @@ def run_extraction_worker(job_id: str, raw_url: str, target: str, user_meta: dic
             public_url = f"https://drive.google.com/file/d/{g_id}/view"
             stream_url, rom_filename, total_size, session = resolve_gdrive_stream(g_id, job_id)
         else:
-            stream_url, rom_filename, total_size, session = resolve_direct_url(raw_url, job_id)
+            stage(job, "search", 3, "Finding the real download link...")
+            page_session = make_session()
+            direct_url = find_download_url(page_session, raw_url, job_id)
+            check_cancel(job)
+            stream_url, rom_filename, total_size, session = resolve_direct_url(direct_url, job_id, page_session)
         check_cancel(job)
 
         fmt = sniff_format(session, stream_url, rom_filename)
@@ -2032,7 +2218,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
           <div>
             <label class="text-[10px] uppercase mono text-amber-300 block mb-1">02 // ROM Download Link (Fastboot, Recovery, Custom, Port, G-Drive)</label>
-            <input id="romUrl" type="url" placeholder="Paste .tgz, .zip, or Google Drive link..." class="cyber-input w-full px-3.5 py-3 rounded-xl text-xs mono text-white placeholder-slate-600" />
+            <input id="romUrl" type="url" placeholder="Paste a ROM link or any download page (SourceForge, PixelDrain, MediaFire...)" class="cyber-input w-full px-3.5 py-3 rounded-xl text-xs mono text-white placeholder-slate-600" />
           </div>
 
           <div>
