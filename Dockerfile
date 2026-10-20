@@ -17,8 +17,8 @@ RUN pip install --no-cache-dir \
     huggingface_hub \
     requests \
     remotezip \
-    zstandard
-
+    zstandard \
+    stream-unzip
 # Route Hugging Face staging cache to /tmp so it is wiped after every upload
 ENV HF_HOME=/tmp/hf_cache
 
