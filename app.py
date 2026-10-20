@@ -2169,7 +2169,7 @@ HTML_PAGE = """<!DOCTYPE html>
           <span class="relative inline-flex rounded-full w-2.5 h-2.5 bg-violet-400"></span>
         </span>
         <span class="brand-font font-bold text-sm tracking-wider bg-gradient-to-r from-violet-300 via-purple-400 to-amber-300 bg-clip-text text-transparent">
-          HYPER//FLUX SECURE STUDIO
+          ROM DUMPER
         </span>
       </div>
       <span id="lockStatusBadge" class="mono text-[10px] px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 transition-all duration-500">
