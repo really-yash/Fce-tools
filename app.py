@@ -28,7 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from huggingface_hub import HfApi, hf_hub_url, hf_hub_download
 
-app = FastAPI(title="Rom Dumper")
+app = FastAPI(title="")
 
 app.add_middleware(
     CORSMiddleware,
