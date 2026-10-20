@@ -8,6 +8,7 @@ import time
 import uuid
 import struct
 import shutil
+import bisect
 import tarfile
 import hashlib
 import threading
@@ -22,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from huggingface_hub import HfApi, hf_hub_url, hf_hub_download
 
-app = FastAPI(title="HYPER//FLUX Secure Studio v7")
+app = FastAPI(title="HYPER//FLUX Secure Studio v8")
 
 app.add_middleware(
     CORSMiddleware,
@@ -108,10 +109,7 @@ def load_khwang_xiaomi_db():
             model_names_raw = m.group(1).strip()
             codenames_part = m.group(2)
             codenames = re.findall(r"\(\s*([a-zA-Z0-9_-]+)\s*\)", codenames_part)
-
-            # Split slash-separated model names so we can combine Xiaomi/Redmi/POCO names without duplicates
             names_list = [n.strip() for n in model_names_raw.split("/") if n.strip()]
-
             for code in codenames:
                 c_low = code.lower()
                 if c_low not in parsed_map:
@@ -119,10 +117,8 @@ def load_khwang_xiaomi_db():
                 for nm in names_list:
                     if nm not in parsed_map[c_low]:
                         parsed_map[c_low].append(nm)
-
         for k, v_list in parsed_map.items():
             KHWANG_XIAOMI_MAP[k] = " / ".join(v_list)
-
         print(f"[KHwang9883 DB] Loaded {len(KHWANG_XIAOMI_MAP)} Xiaomi/Redmi/POCO codenames from xiaomi_en.md!")
     except Exception as e:
         print(f"[KHwang9883 DB] Sync warning: {e}")
@@ -153,36 +149,25 @@ def job_add_code(job_id: str, stage_title: str, code_snippet: str):
 # ---------------- KHWANG9883 CODENAME LOOKUP & CUSTOM ROM VERSION PARSER ---------------- #
 
 def lookup_codename_in_khwang(raw_code: str):
-    """
-    Looks up a codename in the KHwang9883 xiaomi_en.md dictionary.
-    Also strips regional Xiaomi suffixes (_in_global, _global, _eea, etc.) if needed.
-    Returns (official_device_name, matched_codename) or ("Unknown", "Unknown") if not in list!
-    """
+    """Returns (official_device_name, matched_codename) or ("Unknown", "Unknown")."""
     if not raw_code:
         return "Unknown", "Unknown"
     c = raw_code.strip().lower()
     if c in KHWANG_XIAOMI_MAP:
         return KHWANG_XIAOMI_MAP[c], c
 
-    # Strip Xiaomi regional build suffixes
     stripped = re.sub(r"_(in|global|eea|ru|id|tw|tr|jp|kr|cn)_global$", "", c)
     stripped = re.sub(r"_(in|global|eea|ru|id|tw|tr|jp|kr|cn)$", "", stripped)
     if stripped in KHWANG_XIAOMI_MAP:
         return KHWANG_XIAOMI_MAP[stripped], stripped
 
-    # Also check without trailing 'in' or 'pro' if base exists
     if stripped.endswith("in") and stripped[:-2] in KHWANG_XIAOMI_MAP:
         return KHWANG_XIAOMI_MAP[stripped[:-2]], stripped[:-2]
 
     return "Unknown", "Unknown"
 
 def extract_custom_rom_version(text_blob: str, rom_filename: str):
-    """
-    Detects Custom ROM distribution & version (e.g., lineage-19.1, PixelOS-15.0, crDroid-v11.2, EvolutionX-10.3)
-    from internal metadata/updater-script or the ZIP filename.
-    """
     combined = f"{rom_filename} {text_blob}"
-
     patterns = [
         (r"\b(lineage-\d+(?:\.\d+)?)\b", lambda m: m.group(1)),
         (r"\b(LineageOS[\s_-]*\d+(?:\.\d+)?)\b", lambda m: m.group(1).replace(" ", "-")),
@@ -205,77 +190,80 @@ def extract_custom_rom_version(text_blob: str, rom_filename: str):
             return fmt_fn(m)
     return None
 
-def inspect_zip_internal_metadata(zf: RemoteZip, job_id: str):
-    """
-    Reads META-INF/com/android/metadata, updater-script, and payload_properties.txt
-    inside a Recovery or Custom ROM ZIP via HTTP Range (~1 KB read).
-    """
-    namelist = zf.namelist()
+# Stock version tag. Uses look-arounds instead of \b because "_" counts as a word character,
+# so "tornado_OS4.0.0.3.XPSCNXM.zip" never matched with \b.
+STOCK_VER_RE = r"(?<![A-Za-z0-9])(OS\d+\.\d+\.\d+\.\d+\.[A-Z]{5,9}|V\d+\.\d+\.\d+\.\d+\.[A-Z]{5,9})(?![A-Za-z0-9])"
+
+def parse_meta_texts(meta_text: str, script_text: str, job_id: str):
+    """Parses META-INF/com/android/metadata and updater-script text (already read)."""
     meta_info = {"codename": None, "version": None, "raw_text": ""}
 
-    # 1. Check META-INF/com/android/metadata
-    if "META-INF/com/android/metadata" in namelist:
-        try:
-            raw_text = zf.read("META-INF/com/android/metadata").decode("utf-8", errors="ignore")
-            meta_info["raw_text"] += "\n" + raw_text
-            kv = {}
-            for line in raw_text.splitlines():
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    kv[k.strip()] = v.strip()
-            job_log(job_id, "META", f"Parsed META-INF/com/android/metadata: {json.dumps(kv)[:160]}")
+    if meta_text:
+        meta_info["raw_text"] += "\n" + meta_text
+        kv = {}
+        for line in meta_text.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                kv[k.strip()] = v.strip()
+        job_log(job_id, "META", f"Parsed META-INF/com/android/metadata: {json.dumps(kv)[:160]}")
 
-            pre_dev = kv.get("pre-device", "").split(",")[0].strip()
-            if pre_dev:
-                meta_info["codename"] = pre_dev
+        pre_dev = kv.get("pre-device", "").split(",")[0].strip()
+        if pre_dev:
+            meta_info["codename"] = pre_dev
 
-            post_inc = kv.get("post-build-incremental", "").strip()
-            post_build = kv.get("post-build", "").strip()
-            ota_id = kv.get("ota-id", "").strip()
+        post_inc = kv.get("post-build-incremental", "").strip()
+        post_build = kv.get("post-build", "").strip()
+        ota_id = kv.get("ota-id", "").strip()
 
-            # Check for Stock OS/MIUI version or Custom ROM version inside post-build / ota-id
-            for candidate in (ota_id, post_inc, post_build):
-                if not candidate:
-                    continue
-                stock_m = re.search(r"\b(OS\d+\.\d+\.\d+\.\d+\.[A-Z]{5,9}|V\d+\.\d+\.\d+\.\d+\.[A-Z]{5,9})\b", candidate)
-                if stock_m:
-                    meta_info["version"] = stock_m.group(1)
-                    break
-                cust_v = extract_custom_rom_version(candidate, "")
-                if cust_v:
-                    meta_info["version"] = cust_v
-                    break
-            if not meta_info["version"] and post_inc:
-                meta_info["version"] = post_inc
-        except Exception as e:
-            job_log(job_id, "INFO", f"metadata read note: {e}")
+        for candidate in (ota_id, post_inc, post_build):
+            if not candidate:
+                continue
+            stock_m = re.search(STOCK_VER_RE, candidate)
+            if stock_m:
+                meta_info["version"] = stock_m.group(1)
+                break
+            cust_v = extract_custom_rom_version(candidate, "")
+            if cust_v:
+                meta_info["version"] = cust_v
+                break
+        if not meta_info["version"] and post_inc:
+            meta_info["version"] = post_inc
 
-    # 2. Check META-INF/com/google/android/updater-script for Custom ROM assertions & banners
-    updater_path = "META-INF/com/google/android/updater-script"
-    if updater_path in namelist:
-        try:
-            script_text = zf.read(updater_path).decode("utf-8", errors="ignore")
-            meta_info["raw_text"] += "\n" + script_text[:4000]
-            if not meta_info["codename"]:
-                dev_m = re.search(r'ro\.(?:product\.device|build\.product)"\)\s*==\s*"([a-zA-Z0-9_-]+)"', script_text)
-                if dev_m:
-                    meta_info["codename"] = dev_m.group(1)
-            if not meta_info["version"]:
-                cust_v = extract_custom_rom_version(script_text[:4000], "")
-                if cust_v:
-                    meta_info["version"] = cust_v
-            job_log(job_id, "META", f"Scanned '{updater_path}' for Custom ROM assertions.")
-        except Exception:
-            pass
+    if script_text:
+        meta_info["raw_text"] += "\n" + script_text[:4000]
+        if not meta_info["codename"]:
+            dev_m = re.search(r'ro\.(?:product\.device|build\.product)"\)\s*==\s*"([a-zA-Z0-9_-]+)"', script_text)
+            if dev_m:
+                meta_info["codename"] = dev_m.group(1)
+        if not meta_info["version"]:
+            cust_v = extract_custom_rom_version(script_text[:4000], "")
+            if cust_v:
+                meta_info["version"] = cust_v
+        job_log(job_id, "META", "Scanned updater-script for Custom ROM assertions.")
 
     return meta_info
 
+def inspect_zip_internal_metadata(zf, job_id: str):
+    """Range mode: reads the two small metadata files straight from the remote ZIP."""
+    namelist = zf.namelist()
+    meta_text, script_text = "", ""
+    try:
+        if "META-INF/com/android/metadata" in namelist:
+            meta_text = zf.read("META-INF/com/android/metadata").decode("utf-8", errors="ignore")
+    except Exception as e:
+        job_log(job_id, "INFO", f"metadata read note: {e}")
+    try:
+        up = "META-INF/com/google/android/updater-script"
+        if up in namelist:
+            script_text = zf.read(up).decode("utf-8", errors="ignore")
+    except Exception:
+        pass
+    return parse_meta_texts(meta_text, script_text, job_id)
+
 def reconcile_metadata(user_meta: dict, rom_filename: str, archive_root: str, internal_zip_meta: dict, job_id: str):
     """
-    Strictly verifies Device Name, Codename, and ROM Version against:
-    1. Internal ROM files (META-INF/metadata, updater-script, Fastboot root folder)
-    2. KHwang9883/MobileModels (xiaomi_en.md) database
-    If the ROM's codename is NOT in KHwang9883's xiaomi_en.md list, writes 'Unknown' in Vault!
+    Verifies Device Name, Codename and ROM Version against the ROM's own files and the
+    KHwang9883/MobileModels database. Unlisted codenames are saved as 'Unknown'.
     """
     combined = f"{archive_root} {rom_filename}"
     raw_codename = internal_zip_meta.get("codename") if internal_zip_meta else None
@@ -283,7 +271,6 @@ def reconcile_metadata(user_meta: dict, rom_filename: str, archive_root: str, in
     detected_cat = None
     detected_fmt = None
 
-    # 1. Check Fastboot root folder / filename: <codename>_images_<version>_<date>
     fb_match = re.search(r"([a-zA-Z0-9_]+?)_images_([A-Za-z0-9._-]+?)_(?:20\d{6}|1\d\.0)", combined)
     if fb_match:
         if not raw_codename:
@@ -292,13 +279,11 @@ def reconcile_metadata(user_meta: dict, rom_filename: str, archive_root: str, in
         detected_cat = "Stock ROM"
         detected_fmt = "FASTBOOT"
 
-    # 2. Check Stock HyperOS / MIUI version tag (OS2.0.208.0.VGQINXM / V14.0.5.0.TMGINXM)
     if not detected_ver:
-        ver_m = re.search(r"\b(OS\d+\.\d+\.\d+\.\d+\.[A-Z]{5,9}|V\d+\.\d+\.\d+\.\d+\.[A-Z]{5,9})\b", combined)
+        ver_m = re.search(STOCK_VER_RE, combined)
         if ver_m:
             detected_ver = ver_m.group(1)
 
-    # 3. Check Custom ROM version (e.g. lineage-19.1, PixelOS-15.0, crDroid-v11.2)
     cust_ver = extract_custom_rom_version(internal_zip_meta.get("raw_text", "") if internal_zip_meta else "", rom_filename)
     if cust_ver:
         detected_cat = "Custom ROM"
@@ -306,7 +291,6 @@ def reconcile_metadata(user_meta: dict, rom_filename: str, archive_root: str, in
         if not detected_ver or not detected_ver.startswith(("OS", "V1")):
             detected_ver = cust_ver
 
-    # 4. If codename wasn't inside META-INF or Fastboot folder, scan tokens in filename against KHwang9883 list
     if not raw_codename:
         ota_m = re.search(r"\b([a-z0-9_]+?)-ota_full-", rom_filename.lower())
         if ota_m:
@@ -319,17 +303,14 @@ def reconcile_metadata(user_meta: dict, rom_filename: str, archive_root: str, in
                     raw_codename = code_check
                     break
 
-    # 5. STRICT KHWANG9883 LOOKUP: If not in xiaomi_en.md, write "Unknown"!
     official_device_name, verified_codename = lookup_codename_in_khwang(raw_codename)
 
-    # 6. Validate ROM Version (if not detected from ROM, set to "Unknown" if user typed garbage)
     user_dev = user_meta.get("device_name", "").strip()
     user_ver = user_meta.get("rom_version", "").strip()
 
     if detected_ver:
         final_ver = detected_ver
     else:
-        # Check if user typed a valid-looking version (contains a dot or known prefix) vs random garbage
         if user_ver and ("." in user_ver or "-" in user_ver) and len(user_ver) <= 32:
             final_ver = user_ver
         else:
@@ -343,11 +324,7 @@ def reconcile_metadata(user_meta: dict, rom_filename: str, archive_root: str, in
         job_log(job_id, "META", f"⚠️ Codename '{raw_codename or 'none'}' not found in KHwang9883 xiaomi_en.md → Saved as 'Unknown'")
     else:
         auto_status = f"Auto-Verified via KHwang9883 DB ({verified_codename})"
-        job_log(
-            job_id,
-            "META",
-            f"✨ Auto-Matched in KHwang9883 DB: {official_device_name} [{verified_codename}] | Version: {final_ver}"
-        )
+        job_log(job_id, "META", f"✨ Auto-Matched in KHwang9883 DB: {official_device_name} [{verified_codename}] | Version: {final_ver}")
 
     resolved = {
         "user_input_summary": f"{user_dev or '(Blank)'} / {user_ver or '(Blank)'}",
@@ -360,46 +337,6 @@ def reconcile_metadata(user_meta: dict, rom_filename: str, archive_root: str, in
     }
     JOBS[job_id]["resolved_meta"] = resolved
     return resolved
-
-# ---------------- LIVE STREAM BYTE TRACKER ---------------- #
-
-class LiveStreamTracker:
-    def __init__(self, raw_stream, total_size: int, job_id: str):
-        self.raw = raw_stream
-        self.total_size = total_size
-        self.job_id = job_id
-        self.bytes_read = 0
-        self.start_time = time.time()
-        self.last_update = 0.0
-
-    def read(self, size=-1):
-        chunk = self.raw.read(size)
-        if chunk:
-            self.bytes_read += len(chunk)
-            now = time.time()
-            if now - self.last_update >= 0.30:
-                elapsed = max(0.05, now - self.start_time)
-                mbps = (self.bytes_read * 8) / (elapsed * 1_000_000)
-                mbs = (self.bytes_read / (1024 * 1024)) / elapsed
-                mb_done = self.bytes_read / (1024 * 1024)
-                JOBS[self.job_id]["bytes_streamed_mb"] = f"{mb_done:.1f} MB"
-                JOBS[self.job_id]["hex_offset"] = f"0x{self.bytes_read:08X}"
-                JOBS[self.job_id]["speed"] = f"{mbps:.0f} Mbps ({mbs:.1f} MB/s)"
-
-                if self.total_size > 0 and JOBS[self.job_id]["rom_progress"] < 100:
-                    mb_total = self.total_size / (1024 * 1024)
-                    pct = min(99, int((self.bytes_read / self.total_size) * 100))
-                    JOBS[self.job_id]["rom_progress"] = pct
-                    JOBS[self.job_id]["rom_label"] = f"Cloud Scanning ROM: {mb_done:.0f} MB / {mb_total:.0f} MB"
-                elif JOBS[self.job_id]["rom_progress"] < 100:
-                    JOBS[self.job_id]["rom_progress"] = min(95, int(mb_done / 40))
-                    JOBS[self.job_id]["rom_label"] = f"Cloud Scanning ROM: {mb_done:.0f} MB streamed"
-                self.last_update = now
-        return chunk
-
-    def close(self):
-        if hasattr(self.raw, "close"):
-            self.raw.close()
 
 # ---------------- URL & GOOGLE DRIVE RESOLVERS ---------------- #
 
@@ -450,11 +387,7 @@ def resolve_direct_url(url: str, job_id: str):
     if not filename:
         filename = unquote(os.path.basename(urlparse(url).path))
 
-    job_log(
-        job_id,
-        "HTTP",
-        f"HTTP 200 OK | File: {filename} | Size: {total_size / (1024*1024):.1f} MB | Ranges: {accept_ranges}"
-    )
+    job_log(job_id, "HTTP", f"HTTP 200 OK | File: {filename} | Size: {total_size / (1024*1024):.1f} MB | Ranges: {accept_ranges}")
     return final_url, filename, total_size, session
 
 def resolve_gdrive_stream(file_id: str, job_id: str):
@@ -478,69 +411,446 @@ def resolve_gdrive_stream(file_id: str, job_id: str):
     job_log(job_id, "HTTP", f"Google Drive Stream Ready | File: {filename} | Size: {total_size / (1024*1024):.1f} MB")
     return direct_url, filename, total_size, session
 
-# ---------------- 4-LAYER ANTI-BRICK & HASH VERIFIER ---------------- #
+def supports_ranges(session, url: str):
+    """Real probe: only a 206 + Content-Range answer counts as range support."""
+    try:
+        with session.get(url, headers={"Range": "bytes=0-1"}, stream=True, timeout=30) as r:
+            return r.status_code == 206 and r.headers.get("Content-Range", "").lower().startswith("bytes")
+    except Exception:
+        return False
 
-def verify_and_hash_file(
-    file_path: str,
-    expected_size: int = None,
-    expected_sha256_bytes: bytes = None,
-    expected_crc32: int = None
-):
-    if not os.path.exists(file_path):
-        raise Exception("Anti-Brick Guard: Output file was not created.")
-
-    actual_size = os.path.getsize(file_path)
-    if expected_size is not None and actual_size != expected_size:
-        raise Exception(
-            f"Anti-Brick Guard: Size mismatch! Downloaded {actual_size} bytes, but archive header requires {expected_size} bytes."
-        )
-    if actual_size < 64:
-        raise Exception(f"Anti-Brick Guard: File is abnormally small ({actual_size} bytes).")
-
-    sha256_hasher = hashlib.sha256()
-    crc_val = 0
-    header_sample = b""
-
-    with open(file_path, "rb") as f:
-        while True:
-            chunk = f.read(1024 * 1024)
-            if not chunk:
+def sniff_format(session, url: str, filename: str):
+    """Decides 'zip' or 'tgz' from the first bytes (Drive often hides the real file name)."""
+    head = b""
+    try:
+        with session.get(url, stream=True, timeout=30) as r:
+            for c in r.iter_content(chunk_size=16):
+                head = c
                 break
-            if not header_sample:
-                header_sample = chunk[:4096]
-            sha256_hasher.update(chunk)
-            if expected_crc32 is not None:
-                crc_val = zlib.crc32(chunk, crc_val)
+    except Exception:
+        pass
+    if head[:2] == b"PK":
+        return "zip"
+    if head[:2] == b"\x1f\x8b":
+        return "tgz"
+    if head[:1] == b"<":
+        raise Fatal("The server returned a web page instead of the ROM (Drive quota exceeded or link is not public).")
+    low = filename.lower()
+    if low.endswith((".tgz", ".tar.gz", ".tar")):
+        return "tgz"
+    if low.endswith(".zip"):
+        return "zip"
+    raise Fatal("Unsupported ROM archive format. Must be .tgz/.tar.gz or .zip.")
 
-    if len(header_sample) >= 512 and header_sample == b"\x00" * len(header_sample):
-        raise Exception("Anti-Brick Guard: Extracted file header contains only null (0x00) bytes!")
+# ================================================================================ #
+# ENGINE:BEGIN — streaming readers, sparse images, super.img (LP) and payload.bin   #
+# ================================================================================ #
 
-    if header_sample.lstrip().startswith((b"<!DOCTYPE", b"<html", b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error>")):
-        raise Exception("Anti-Brick Guard: Remote server returned an HTML/XML error page instead of binary data!")
+PIECE = 1 << 20
+SPARSE_MAGIC = 0xED26FF3A
+LP_GEOMETRY_MAGIC = 0x616C4467
+LP_HEADER_MAGIC = 0x414C5030
+HEAD_BYTES = 1 << 20
+SUPER_RE = re.compile(r"^super(_sparse)?(\.img)?(\.zst)?$")
 
-    if expected_crc32 is not None and (crc_val & 0xFFFFFFFF) != (expected_crc32 & 0xFFFFFFFF):
-        raise Exception(
-            f"Anti-Brick Guard: ZIP CRC-32 mismatch! Expected {hex(expected_crc32)}, got {hex(crc_val & 0xFFFFFFFF)}."
-        )
+class Fatal(Exception):
+    """Deterministic failure: do not retry in another mode."""
 
-    if expected_sha256_bytes is not None and sha256_hasher.digest() != expected_sha256_bytes:
-        raise Exception("Anti-Brick Guard: Payload SHA-256 cryptographic hash mismatch!")
+class NotInSource(Fatal):
+    def __init__(self, msg, available=None):
+        super().__init__(msg)
+        self.available = available or []
 
-    sig = "Verified Raw Binary"
-    if header_sample.startswith(b"ANDROID!"):
-        sig = "ANDROID! Boot Image (Magic: 0x414E4452)"
-    elif header_sample.startswith(b"VNDRBOOT"):
-        sig = "VNDRBOOT Vendor Boot (Magic: 0x564E4452)"
-    elif header_sample.startswith(b"AVB0"):
-        sig = "AVB0 Verified Boot (Magic: 0x41564230)"
-    elif b"LK" in header_sample[:128] or header_sample[:4] in (b"\x88\x16\x88\x58", b"BFBF"):
-        sig = "Little Kernel (LK) Bootloader Binary"
-    elif header_sample.startswith(b"\xd7\xb7\xab\x1e"):
-        sig = "DTBO Device Tree Overlay Table"
+class IterFile:
+    """File-like read()/skip() on top of an iterator of byte chunks (no big copies)."""
+    def __init__(self, it):
+        self.it = iter(it)
+        self.left = b""
+        self.off = 0
 
-    return sha256_hasher.hexdigest(), actual_size, sig
+    def read(self, n=-1):
+        if n is None or n < 0:
+            parts = [self.left[self.off:]] + list(self.it)
+            self.left, self.off = b"", 0
+            return b"".join(parts)
+        parts, need = [], n
+        while need > 0:
+            if self.off >= len(self.left):
+                try:
+                    self.left = next(self.it)
+                    self.off = 0
+                except StopIteration:
+                    break
+                continue
+            take = self.left[self.off:self.off + need]
+            self.off += len(take)
+            need -= len(take)
+            parts.append(take)
+        return b"".join(parts)
 
-# ---------------- PROTOBUF PARSERS FOR PAYLOAD.BIN ---------------- #
+    def skip(self, n):
+        while n > 0:
+            if self.off >= len(self.left):
+                try:
+                    self.left = next(self.it)
+                    self.off = 0
+                except StopIteration:
+                    return
+                continue
+            k = min(n, len(self.left) - self.off)
+            self.off += k
+            n -= k
+
+    def close(self):
+        pass
+
+class Stream:
+    """Forward-only reader with peek/unread/skip. skip() seeks when the source supports it."""
+    def __init__(self, fp, seek_ok=False):
+        self.fp = fp
+        self.seek_ok = seek_ok
+        self.pb = b""
+        self.pos = 0
+
+    def read(self, n):
+        parts, got = [], 0
+        if self.pb:
+            take = self.pb[:n]
+            self.pb = self.pb[len(take):]
+            parts.append(take)
+            got = len(take)
+        while got < n:
+            c = self.fp.read(n - got)
+            if not c:
+                break
+            parts.append(c)
+            got += len(c)
+        data = parts[0] if len(parts) == 1 else b"".join(parts)
+        self.pos += len(data)
+        return data
+
+    def unread(self, data):
+        self.pb = data + self.pb
+        self.pos -= len(data)
+
+    def peek(self, n):
+        d = self.read(n)
+        self.unread(d)
+        return d
+
+    def skip(self, n):
+        if n <= 0:
+            return
+        if self.pb:
+            k = min(n, len(self.pb))
+            self.pb = self.pb[k:]
+            n -= k
+            self.pos += k
+        if n <= 0:
+            return
+        if hasattr(self.fp, "skip"):
+            self.fp.skip(n)
+            self.pos += n
+            return
+        if self.seek_ok:
+            try:
+                self.fp.seek(n, os.SEEK_CUR)
+                self.pos += n
+                return
+            except Exception:
+                pass
+        left = n
+        while left > 0:
+            c = self.fp.read(min(left, PIECE))
+            if not c:
+                break
+            left -= len(c)
+        self.pos += n - left
+
+    def close(self):
+        pass
+
+def zst_stream(stream):
+    return Stream(zstd.ZstdDecompressor().stream_reader(stream, read_across_frames=True))
+
+def _speed(job, nbytes, t0):
+    el = max(0.05, time.time() - t0)
+    job["speed"] = f"{(nbytes * 8) / (el * 1_000_000):.0f} Mbps ({nbytes / (1024 * 1024) / el:.1f} MB/s)"
+
+def net_chunks(session, url, job_id, total_size):
+    """Network byte source that also drives the 'Cloud Scanning' progress bar."""
+    job = JOBS[job_id]
+    t0, done, last = time.time(), 0, 0.0
+    with session.get(url, stream=True, timeout=(30, 120)) as resp:
+        resp.raise_for_status()
+        for c in resp.iter_content(chunk_size=PIECE):
+            if not c:
+                continue
+            done += len(c)
+            now = time.time()
+            if now - last >= 0.30:
+                last = now
+                mb_done = done / (1024 * 1024)
+                job["bytes_streamed_mb"] = f"{mb_done:.1f} MB"
+                job["hex_offset"] = f"0x{done:08X}"
+                _speed(job, done, t0)
+                if job["rom_progress"] < 100:
+                    if total_size > 0:
+                        job["rom_progress"] = min(99, int(done / total_size * 100))
+                        job["rom_label"] = f"Cloud Scanning ROM: {mb_done:.0f} MB / {total_size / (1024 * 1024):.0f} MB"
+                    else:
+                        job["rom_progress"] = min(95, int(mb_done / 40))
+                        job["rom_label"] = f"Cloud Scanning ROM: {mb_done:.0f} MB streamed"
+            yield c
+
+def copy_to_file(job_id, reader, out_path, size, label):
+    job = JOBS[job_id]
+    t0, copied, last = time.time(), 0, 0.0
+    with open(out_path, "wb") as dst:
+        while True:
+            buf = reader.read(PIECE)
+            if not buf:
+                break
+            dst.write(buf)
+            copied += len(buf)
+            now = time.time()
+            if now - last >= 0.3:
+                last = now
+                job["ext_progress"] = min(78, int(copied / size * 78)) if size else min(78, int(copied / (80 * PIECE) * 78))
+                job["ext_label"] = f"Extracting {label}: {copied / (1024 * 1024):.1f}" + (f" / {size / (1024 * 1024):.1f} MB" if size else " MB")
+                _speed(job, copied, t0)
+    return copied
+
+# ---------------- Android sparse + raw image expansion ---------------- #
+
+class ExpandedReader:
+    """
+    Yields (offset, data) pieces of the *expanded* image, in order, from either a raw
+    or an Android-sparse stream. If .need(off, len) says a piece is not wanted it is
+    skipped (seek on range-capable sources). .stop_at ends the scan early.
+    """
+    def __init__(self, stream, size_hint=None):
+        self.stream = stream
+        self.size_hint = size_hint
+        self.need = None
+        self.stop_at = None
+        self.tick = lambda off: None
+        self.total = None
+
+    def _wanted(self, off, n):
+        return self.need is None or self.need(off, n)
+
+    def pieces(self):
+        s = self.stream
+        magic = s.peek(4)
+        if len(magic) == 4 and struct.unpack("<I", magic)[0] == SPARSE_MAGIC:
+            hdr = s.read(28)
+            if len(hdr) < 28:
+                raise Exception("Sparse image truncated (file header).")
+            (_m, _maj, _min, fhs, chs, blk, tblks, tchunks, _crc) = struct.unpack("<IHHHHIIII", hdr)
+            if fhs > 28:
+                s.skip(fhs - 28)
+            self.total = tblks * blk
+            off = 0
+            for _ in range(tchunks):
+                if self.stop_at is not None and off >= self.stop_at:
+                    return
+                ch = s.read(chs)
+                if len(ch) < chs:
+                    raise Exception("Sparse image truncated (chunk header).")
+                ctype, _r, csz, tsz = struct.unpack("<HHII", ch[:12])
+                nbytes = csz * blk
+                if ctype == 0xCAC1:  # RAW
+                    done = 0
+                    while done < nbytes:
+                        if self.stop_at is not None and off + done >= self.stop_at:
+                            return
+                        n = min(PIECE, nbytes - done)
+                        if self._wanted(off + done, n):
+                            d = s.read(n)
+                            if len(d) < n:
+                                raise Exception("Sparse image truncated (raw data).")
+                            yield off + done, d
+                        else:
+                            s.skip(n)
+                        done += n
+                        self.tick(off + done)
+                elif ctype == 0xCAC2:  # FILL
+                    fill = s.read(4)
+                    if fill != b"\x00\x00\x00\x00":
+                        pat = fill * (PIECE // 4)
+                        done = 0
+                        while done < nbytes:
+                            n = min(PIECE, nbytes - done)
+                            if self._wanted(off + done, n):
+                                yield off + done, pat[:n]
+                            done += n
+                elif ctype == 0xCAC3:  # DONT_CARE
+                    pass
+                elif ctype == 0xCAC4:  # CRC32
+                    s.skip(tsz - chs)
+                else:
+                    raise Exception(f"Unknown sparse chunk type 0x{ctype:04X}")
+                off += nbytes
+                self.tick(off)
+            return
+
+        # Raw image
+        off = 0
+        size = self.size_hint
+        while True:
+            if self.stop_at is not None and off >= self.stop_at:
+                return
+            if size is not None:
+                if off >= size:
+                    return
+                n = min(PIECE, size - off)
+            else:
+                n = PIECE
+            if size is not None and not self._wanted(off, n):
+                s.skip(n)
+                off += n
+                self.tick(off)
+                continue
+            d = s.read(n)
+            if not d:
+                return
+            yield off, d
+            off += len(d)
+            self.tick(off)
+
+# ---------------- LP (dynamic partitions) metadata ---------------- #
+
+def parse_lp(head: bytes):
+    """
+    Parses liblp metadata of an expanded super image.
+      geometry @ 4096 | backup geometry @ 8192 | primary metadata slot 0 @ 12288
+    Returns {partition_name: [(target_type, num_sectors, physical_sector), ...]}.
+    """
+    if len(head) < 12288 + 256:
+        raise Fatal("Image is too small to be a super.img.")
+    gmagic = struct.unpack_from("<I", head, 4096)[0]
+    if gmagic != LP_GEOMETRY_MAGIC:
+        raise Fatal("No LP geometry found: this super.img is not a dynamic-partition image.")
+    m = 4096 + 8192
+    hmagic, _maj, _min, hsize = struct.unpack_from("<IHHI", head, m)
+    if hmagic != LP_HEADER_MAGIC:
+        raise Fatal("LP metadata header not found at slot 0.")
+    tables_size = struct.unpack_from("<I", head, m + 44)[0]
+    (p_off, p_n, p_sz, e_off, e_n, e_sz, _g_off, _g_n, _g_sz, _b_off, _b_n, _b_sz) = struct.unpack_from("<12I", head, m + 80)
+    tbl = m + hsize
+    if tbl + tables_size > len(head):
+        raise Fatal("LP metadata tables are larger than the scanned header area.")
+    parts = {}
+    for i in range(p_n):
+        b = tbl + p_off + i * p_sz
+        name = head[b:b + 36].split(b"\x00")[0].decode("utf-8", errors="ignore")
+        _attrs, first, cnt, _grp = struct.unpack_from("<IIII", head, b + 36)
+        exts = []
+        for j in range(first, first + cnt):
+            eb = tbl + e_off + j * e_sz
+            sectors, ttype, tdata, _tsrc = struct.unpack_from("<QIQI", head, eb)
+            exts.append((ttype, sectors, tdata))
+        parts[name] = exts
+    return parts
+
+def resolve_lp_partition(parts, req):
+    base = re.sub(r"\.(img|bin)$", "", req.strip(), flags=re.I)
+    lower = {k.lower(): k for k in parts}
+    for cand in (base, base + "_a", base + "_b"):
+        k = lower.get(cand.lower())
+        if k and sum(e[1] for e in parts[k]) > 0:
+            return k
+    return None
+
+def extract_from_super(job_id, stream, part_req, out_path, size_hint=None):
+    """Writes the logical partition `part_req` out of a raw or sparse super image."""
+    job = JOBS[job_id]
+    reader = ExpandedReader(stream, size_hint)
+    gen = reader.pieces()
+    head = bytearray(HEAD_BYTES)
+    pending = []
+    for off, data in gen:
+        if off < HEAD_BYTES:
+            n = min(len(data), HEAD_BYTES - off)
+            head[off:off + n] = data[:n]
+            if n < len(data):
+                pending.append((off + n, data[n:]))
+        else:
+            pending.append((off, data))
+        if off + len(data) >= HEAD_BYTES:
+            break
+
+    parts = parse_lp(bytes(head))
+    listing = ", ".join(f"{k} ({sum(e[1] for e in v) * 512 / (1024 * 1024):.0f} MB)" for k, v in parts.items() if sum(e[1] for e in v) > 0)
+    job_log(job_id, "META", f"super.img LP partitions: {listing[:600]}")
+
+    pname = resolve_lp_partition(parts, part_req)
+    if not pname:
+        raise NotInSource(f"'{part_req}' is not a partition inside this super.img.", available=[k for k, v in parts.items() if sum(e[1] for e in v) > 0])
+
+    ext, lo = [], 0
+    for ttype, sectors, tdata in parts[pname]:
+        ln = sectors * 512
+        if ttype == 0:
+            ext.append((tdata * 512, ln, lo))
+        lo += ln
+    total = lo
+    ext.sort()
+    starts = [e[0] for e in ext]
+    max_end = max((s + l) for s, l, _ in ext) if ext else 0
+    mb_total = total / (1024 * 1024)
+    job_log(job_id, "STREAM", f"MATCH: logical partition '{pname}' | {len(ext)} extents | {total:,} bytes ({mb_total:.2f} MB)")
+    job["rom_progress"] = 100
+    job["rom_label"] = f"Located '{pname}' inside super.img ({mb_total:.1f} MB)"
+
+    def need(off, ln):
+        i = bisect.bisect_right(starts, off + ln - 1) - 1
+        return i >= 0 and ext[i][0] + ext[i][1] > off
+
+    def write_piece(out, off, data):
+        end = off + len(data)
+        i = max(0, bisect.bisect_right(starts, off) - 1)
+        while i < len(ext) and ext[i][0] < end:
+            ps, ln, dst = ext[i]
+            a, b = max(ps, off), min(ps + ln, end)
+            if a < b:
+                out.seek(dst + (a - ps))
+                out.write(data[a - off:b - off])
+            i += 1
+
+    t0 = time.time()
+    last = [0.0]
+
+    def tick(off):
+        now = time.time()
+        if now - last[0] < 0.3:
+            return
+        last[0] = now
+        job["ext_progress"] = min(78, int(off / max(1, max_end) * 78))
+        job["ext_label"] = f"Reading super.img for '{pname}': {off / (1024 * 1024):.0f} / {max_end / (1024 * 1024):.0f} MB"
+        job["hex_offset"] = f"0x{off:08X}"
+        _speed(job, off, t0)
+
+    reader.need = need
+    reader.stop_at = max_end
+    reader.tick = tick
+
+    with open(out_path, "wb") as out:
+        out.truncate(total)
+        write_piece(out, 0, bytes(head))
+        for off, data in pending:
+            write_piece(out, off, data)
+        for off, data in gen:
+            if off >= max_end:
+                break
+            write_piece(out, off, data)
+            job["chunks_verified"] += 1
+        out.truncate(total)
+
+    return {"expected_size": total, "source": f"super.img → {pname}"}
+
+# ---------------- payload.bin (CrAU) protobuf ---------------- #
 
 def _read_varint(buf: bytes, pos: int):
     res, shift = 0, 0
@@ -572,6 +882,410 @@ def _iter_fields(buf: bytes):
             pos += 4
         else:
             raise ValueError("Unsupported wire type")
+
+PAYLOAD_OP_NAMES = {0: "RAW", 1: "BZIP2", 8: "XZ", 14: "ZSTD"}
+PAYLOAD_DELTA_OPS = {2, 3, 4, 5, 9, 10, 11, 12, 13}
+
+def extract_from_payload(job_id, stream, part_name, out_path):
+    """Extracts one partition from payload.bin (full OTA). Works on seekable and forward-only streams."""
+    job = JOBS[job_id]
+    if stream.read(4) != b"CrAU":
+        raise Fatal("Invalid payload.bin CrAU magic header.")
+    version = struct.unpack(">Q", stream.read(8))[0]
+    manifest_size = struct.unpack(">Q", stream.read(8))[0]
+    sig_size = struct.unpack(">I", stream.read(4))[0] if version >= 2 else 0
+    manifest = stream.read(manifest_size)
+    base_data_offset = (24 if version >= 2 else 20) + manifest_size + sig_size
+
+    block_size, parts = 4096, {}
+    for fnum, val in _iter_fields(manifest):
+        if fnum == 3:
+            block_size = val
+        elif fnum == 13:
+            nm = None
+            for pf, pv in _iter_fields(val):
+                if pf == 1:
+                    nm = pv.decode("utf-8", errors="ignore")
+                    break
+            if nm:
+                parts[nm] = val
+
+    key = next((k for k in parts if k.lower() == part_name.lower()), None)
+    if key is None:
+        raise NotInSource(f"'{part_name}' not found in payload.bin.", available=list(parts))
+
+    expected_size, expected_hash, ops = None, None, []
+    for pf, pv in _iter_fields(parts[key]):
+        if pf == 7:
+            for ifn, iv in _iter_fields(pv):
+                if ifn == 1:
+                    expected_size = iv
+                elif ifn == 2:
+                    expected_hash = iv
+        elif pf == 8:
+            otype, doff, dlen, dsha, dst = 0, 0, 0, None, []
+            for of, ov in _iter_fields(pv):
+                if of == 1: otype = ov
+                elif of == 2: doff = ov
+                elif of == 3: dlen = ov
+                elif of == 6:
+                    sb, nb = 0, 0
+                    for ef, ev in _iter_fields(ov):
+                        if ef == 1: sb = ev
+                        elif ef == 2: nb = ev
+                    dst.append((sb, nb))
+                elif of == 8:
+                    dsha = ov
+            ops.append((otype, doff, dlen, dst, dsha))
+
+    if any(o[0] in PAYLOAD_DELTA_OPS for o in ops):
+        raise Fatal("This payload.bin is an incremental/delta OTA; only full OTAs can be extracted.")
+
+    todo = sorted((o for o in ops if o[2] > 0 and o[0] not in (6, 7)), key=lambda o: o[1])
+    mb_total = (expected_size or 0) / (1024 * 1024)
+    job_log(job_id, "STREAM", f"payload.bin: '{key}' | {len(todo)} data chunks | {mb_total:.2f} MB")
+    job["rom_progress"] = 100
+    job["rom_label"] = f"Located '{key}' in payload.bin ({mb_total:.1f} MB)"
+
+    zdec = zstd.ZstdDecompressor()
+    t0, fetched = time.time(), 0
+    total_ops = len(todo)
+    with open(out_path, "wb") as out:
+        if expected_size:
+            out.truncate(expected_size)
+        for idx, (otype, doff, dlen, dst, dsha) in enumerate(todo, 1):
+            absoff = base_data_offset + doff
+            gap = absoff - stream.pos
+            if gap < 0:
+                raise Fatal("payload.bin operations are not in forward order; cannot stream this ROM.")
+            stream.skip(gap)
+            blob = stream.read(dlen)
+            if len(blob) != dlen:
+                raise Exception("payload.bin stream ended early (truncated download).")
+            fetched += dlen
+            if dsha and hashlib.sha256(blob).digest() != dsha:
+                raise Exception(f"Anti-Brick Guard: Chunk {idx}/{total_ops} failed SHA-256 verification!")
+
+            if otype == 0:
+                raw = blob
+            elif otype == 8 or blob.startswith(b"\xfd7zXZ\x00"):
+                raw = lzma.decompress(blob)
+            elif otype == 1 or blob.startswith(b"BZh"):
+                raw = bz2.decompress(blob)
+            elif otype == 14 or blob.startswith(b"\x28\xb5\x2f\xfd"):
+                raw = zdec.decompressobj().decompress(blob)
+            else:
+                raise Fatal(f"Unsupported payload operation type: {otype}")
+
+            pos = 0
+            for sb, nb in dst:
+                ln = nb * block_size
+                out.seek(sb * block_size)
+                out.write(raw[pos:pos + ln])
+                pos += ln
+
+            job["chunks_verified"] = idx
+            job["bytes_streamed_mb"] = f"{fetched / (1024 * 1024):.2f} MB"
+            job["hex_offset"] = f"0x{absoff:08X}"
+            job["current_scan"] = f"Chunk {idx}/{total_ops} [{PAYLOAD_OP_NAMES.get(otype, 'COMP')}]"
+            _speed(job, fetched, t0)
+            job["ext_progress"] = min(80, int(idx / max(1, total_ops) * 80))
+            job["ext_label"] = f"Decompressing & Hashing Chunk {idx}/{total_ops} ({mb_total:.1f} MB)"
+            if idx == 1 or idx == total_ops or idx % max(1, total_ops // 6) == 0:
+                job_log(job_id, "CHUNK", f"Chunk {idx}/{total_ops} [{PAYLOAD_OP_NAMES.get(otype, 'COMP')}] @ 0x{absoff:08X} ({dlen:,} B -> {len(raw):,} B) OK")
+        if expected_size:
+            out.truncate(expected_size)
+
+    return {"expected_size": expected_size, "expected_sha": expected_hash, "source": f"payload.bin → {key}"}
+
+# ================================================================================ #
+# ENGINE:END                                                                        #
+# ================================================================================ #
+
+# ---------------- TARGET MATCHING ---------------- #
+
+class Want:
+    def __init__(self, target: str):
+        self.name = os.path.basename(target.replace("\\", "/")).strip()
+        self.low = self.name.lower()
+        self.stem = re.sub(r"\.(img|bin)$", "", self.low)
+        self.is_super = self.stem == "super"
+
+def norm_name(n: str):
+    return re.sub(r"^(\./)+", "", n.replace("\\", "/"))
+
+def classify(low: str, want: Want):
+    """exact | exact_zst | super | super_zst | None — `low` is a lower-cased base file name."""
+    if low == want.low:
+        return "exact"
+    if low in (want.low + ".zst", want.stem + ".zst", want.stem + ".img.zst"):
+        return "exact_zst"
+    if not want.is_super and SUPER_RE.match(low):
+        return "super_zst" if low.endswith(".zst") else "super"
+    return None
+
+def not_found_error(want, searched):
+    where = "; ".join(searched) if searched else "no matching file, payload.bin or super.img was found"
+    return NotInSource(f"'{want.name}' was not found. Searched: {where}.")
+
+# ---------------- ARCHIVE WALKERS ---------------- #
+
+def extract_tgz(job_id, session, url, total_size, rom_filename, want, user_meta, out_path):
+    """Fastboot .tgz — one forward pass. Direct file, .zst file, or logical partition inside super.img."""
+    job = JOBS[job_id]
+    resolved, root_seen, searched = None, False, []
+    gen = net_chunks(session, url, job_id, total_size)
+    try:
+        with tarfile.open(fileobj=IterFile(gen), mode="r|*") as tar:
+            for member in tar:
+                norm = norm_name(member.name)
+                if not root_seen and "/" in norm:
+                    root_seen = True
+                    resolved = reconcile_metadata(user_meta, rom_filename, norm.split("/")[0], {}, job_id)
+                if not member.isfile():
+                    continue
+                base = os.path.basename(norm)
+                job["current_scan"] = norm
+                job["chunks_verified"] += 1
+                kind = classify(base.lower(), want)
+                if not kind:
+                    continue
+                fp = tar.extractfile(member)
+                if fp is None:
+                    continue
+                if not resolved:
+                    resolved = reconcile_metadata(user_meta, rom_filename, norm, {}, job_id)
+                stream = Stream(fp)
+
+                if kind in ("exact", "exact_zst"):
+                    job["rom_progress"] = 100
+                    job["rom_label"] = f"Located {norm} ({member.size / (1024 * 1024):.2f} MB)"
+                    job_log(job_id, "STREAM", f"MATCH FOUND: '{norm}' | {member.size:,} bytes")
+                    if kind == "exact":
+                        copy_to_file(job_id, stream, out_path, member.size, want.name)
+                        return {"expected_size": member.size, "source": f"file: {norm}", "resolved_meta": resolved}
+                    copy_to_file(job_id, zst_stream(stream), out_path, 0, want.name)
+                    return {"source": f"zstd file: {norm}", "resolved_meta": resolved}
+
+                job_log(job_id, "STREAM", f"Opening '{norm}' to look for logical partition '{want.stem}'...")
+                try:
+                    src = zst_stream(stream) if kind == "super_zst" else stream
+                    info = extract_from_super(job_id, src, want.stem, out_path, None if kind == "super_zst" else member.size)
+                    info["resolved_meta"] = resolved
+                    return info
+                except NotInSource as e:
+                    searched.append(f"{norm} (partitions: {', '.join(e.available[:30])})")
+    finally:
+        gen.close()
+    raise not_found_error(want, searched)
+
+def extract_zip_ranged(job_id, session, url, rom_filename, want, user_meta, out_path):
+    """Recovery/custom/port .zip over HTTP Range: jumps straight to the bytes it needs."""
+    job = JOBS[job_id]
+    searched = []
+    with RemoteZip(url, session=session) as zf:
+        namelist = zf.namelist()
+        internal_meta = inspect_zip_internal_metadata(zf, job_id)
+        resolved = reconcile_metadata(user_meta, rom_filename, "", internal_meta, job_id)
+        job["rom_progress"] = 100
+        job["rom_label"] = f"ZIP Mapped ({len(namelist)} files) — Device: {resolved['device_name']}"
+
+        exact = super_e = payload_e = None
+        for n in namelist:
+            if n.endswith("/"):
+                continue
+            low = os.path.basename(norm_name(n)).lower()
+            k = classify(low, want)
+            if k in ("exact", "exact_zst") and (exact is None or k == "exact"):
+                exact = (n, k)
+            elif k in ("super", "super_zst") and super_e is None:
+                super_e = (n, k)
+            if low == "payload.bin" and payload_e is None:
+                payload_e = n
+
+        if exact:
+            n, k = exact
+            info = zf.getinfo(n)
+            job_log(job_id, "STREAM", f"Direct ZIP Entry: '{n}' | Offset: 0x{info.header_offset:08X} | CRC32: {hex(info.CRC)}")
+            with zf.open(n) as fp:
+                if k == "exact":
+                    copy_to_file(job_id, Stream(fp), out_path, info.file_size, want.name)
+                    return {"expected_size": info.file_size, "expected_crc": info.CRC, "source": f"file: {n}", "resolved_meta": resolved}
+                copy_to_file(job_id, zst_stream(Stream(fp)), out_path, 0, want.name)
+                return {"source": f"zstd file: {n}", "resolved_meta": resolved}
+
+        if payload_e:
+            job_log(job_id, "STREAM", f"Opening payload.bin for '{want.stem}'...")
+            try:
+                with zf.open(payload_e) as fp:
+                    info = extract_from_payload(job_id, Stream(fp, seek_ok=True), want.stem, out_path)
+                info["resolved_meta"] = resolved
+                return info
+            except NotInSource as e:
+                searched.append(f"payload.bin (partitions: {', '.join(e.available[:40])})")
+
+        if super_e:
+            n, k = super_e
+            zi = zf.getinfo(n)
+            job_log(job_id, "STREAM", f"Opening '{n}' ({zi.file_size / (1024 * 1024):.0f} MB) for logical partition '{want.stem}'...")
+            try:
+                with zf.open(n) as fp:
+                    base = Stream(fp, seek_ok=True)
+                    info = extract_from_super(job_id, zst_stream(base) if k == "super_zst" else base, want.stem, out_path,
+                                              None if k == "super_zst" else zi.file_size)
+                info["resolved_meta"] = resolved
+                return info
+            except NotInSource as e:
+                searched.append(f"{n} (partitions: {', '.join(e.available[:30])})")
+    raise not_found_error(want, searched)
+
+def extract_zip_sequential(job_id, session, url, total_size, rom_filename, want, user_meta, out_path):
+    """Same logic for servers without Range support (Google Drive): one forward pass, no random access."""
+    try:
+        from stream_unzip import stream_unzip
+    except ImportError:
+        raise Fatal("Missing dependency: add 'stream-unzip' to requirements.txt")
+    job = JOBS[job_id]
+    meta = {"meta": "", "script": ""}
+    searched = []
+
+    def resolve():
+        return reconcile_metadata(user_meta, rom_filename, "", parse_meta_texts(meta["meta"], meta["script"], job_id), job_id)
+
+    gen = net_chunks(session, url, job_id, total_size)
+    try:
+        try:
+            entries = stream_unzip(gen, chunk_size=PIECE)
+        except TypeError:
+            entries = stream_unzip(gen)
+        for name_b, size, chunks in entries:
+            name = name_b.decode("utf-8", errors="ignore") if isinstance(name_b, (bytes, bytearray)) else str(name_b)
+            clean = norm_name(name)
+            if clean.endswith("/"):
+                for _ in chunks:
+                    pass
+                continue
+            low = os.path.basename(clean).lower()
+            job["current_scan"] = clean
+            job["chunks_verified"] += 1
+            stream = Stream(IterFile(chunks))
+            kind = classify(low, want)
+
+            if clean == "META-INF/com/android/metadata":
+                meta["meta"] = stream.read(65536).decode("utf-8", errors="ignore")
+            elif clean == "META-INF/com/google/android/updater-script":
+                meta["script"] = stream.read(65536).decode("utf-8", errors="ignore")
+            elif kind in ("exact", "exact_zst"):
+                job["rom_progress"] = 100
+                job["rom_label"] = f"Located {clean}"
+                job_log(job_id, "STREAM", f"MATCH FOUND (sequential): '{clean}' | size: {size}")
+                if kind == "exact":
+                    copy_to_file(job_id, stream, out_path, size or 0, want.name)
+                    return {"expected_size": size or None, "source": f"file: {clean}", "resolved_meta": resolve()}
+                copy_to_file(job_id, zst_stream(stream), out_path, 0, want.name)
+                return {"source": f"zstd file: {clean}", "resolved_meta": resolve()}
+            elif low == "payload.bin":
+                job_log(job_id, "STREAM", f"Opening payload.bin (sequential) for '{want.stem}'...")
+                try:
+                    info = extract_from_payload(job_id, stream, want.stem, out_path)
+                    info["resolved_meta"] = resolve()
+                    return info
+                except NotInSource as e:
+                    searched.append(f"payload.bin (partitions: {', '.join(e.available[:40])})")
+            elif kind in ("super", "super_zst"):
+                job_log(job_id, "STREAM", f"Opening '{clean}' (sequential) for logical partition '{want.stem}'...")
+                try:
+                    src = zst_stream(stream) if kind == "super_zst" else stream
+                    info = extract_from_super(job_id, src, want.stem, out_path, None if kind == "super_zst" else size)
+                    info["resolved_meta"] = resolve()
+                    return info
+                except NotInSource as e:
+                    searched.append(f"{clean} (partitions: {', '.join(e.available[:30])})")
+
+            for _ in chunks:  # every skipped entry must be drained before the next one
+                pass
+    finally:
+        gen.close()
+    raise not_found_error(want, searched)
+
+# ---------------- 4-LAYER ANTI-BRICK & HASH VERIFIER ---------------- #
+
+def verify_and_hash_file(
+    file_path: str,
+    expected_size: int = None,
+    expected_sha256_bytes: bytes = None,
+    expected_crc32: int = None
+):
+    if not os.path.exists(file_path):
+        raise Exception("Anti-Brick Guard: Output file was not created.")
+
+    actual_size = os.path.getsize(file_path)
+    if expected_size is not None and actual_size != expected_size:
+        raise Exception(
+            f"Anti-Brick Guard: Size mismatch! Wrote {actual_size} bytes, but the source requires {expected_size} bytes."
+        )
+    if actual_size < 64:
+        raise Exception(f"Anti-Brick Guard: File is abnormally small ({actual_size} bytes).")
+
+    sha256_hasher = hashlib.sha256()
+    crc_val = 0
+    header_sample = b""
+
+    with open(file_path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            if not header_sample:
+                header_sample = chunk[:65536]
+            sha256_hasher.update(chunk)
+            if expected_crc32 is not None:
+                crc_val = zlib.crc32(chunk, crc_val)
+
+    # A raw super.img legitimately starts with 4096 zero bytes, so test a larger window.
+    if len(header_sample) >= 16384 and header_sample[:16384] == b"\x00" * 16384:
+        raise Exception("Anti-Brick Guard: Extracted file header contains only null (0x00) bytes!")
+
+    if header_sample.lstrip().startswith((b"<!DOCTYPE", b"<html", b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error>")):
+        raise Exception("Anti-Brick Guard: Remote server returned an HTML/XML error page instead of binary data!")
+
+    if expected_crc32 is not None and (crc_val & 0xFFFFFFFF) != (expected_crc32 & 0xFFFFFFFF):
+        raise Exception(
+            f"Anti-Brick Guard: ZIP CRC-32 mismatch! Expected {hex(expected_crc32)}, got {hex(crc_val & 0xFFFFFFFF)}."
+        )
+
+    if expected_sha256_bytes is not None and sha256_hasher.digest() != expected_sha256_bytes:
+        raise Exception("Anti-Brick Guard: Payload SHA-256 cryptographic hash mismatch!")
+
+    def u32(off):
+        return struct.unpack_from("<I", header_sample, off)[0] if len(header_sample) >= off + 4 else None
+
+    def u16(off):
+        return struct.unpack_from("<H", header_sample, off)[0] if len(header_sample) >= off + 2 else None
+
+    sig = "Verified Raw Binary"
+    if header_sample.startswith(b"\x3a\xff\x26\xed"):
+        sig = "Android Sparse Image (0xED26FF3A)"
+    elif u32(4096) == LP_GEOMETRY_MAGIC:
+        sig = "Raw super.img (LP dynamic-partition metadata)"
+    elif u32(1024) == 0xE0F5E1E2:
+        sig = "EROFS filesystem image"
+    elif u16(1080) == 0xEF53:
+        sig = "ext4 filesystem image"
+    elif u32(1024) == 0xF2F52010:
+        sig = "F2FS filesystem image"
+    elif header_sample.startswith(b"ANDROID!"):
+        sig = "ANDROID! Boot Image (Magic: 0x414E4452)"
+    elif header_sample.startswith(b"VNDRBOOT"):
+        sig = "VNDRBOOT Vendor Boot (Magic: 0x564E4452)"
+    elif header_sample.startswith(b"AVB0"):
+        sig = "AVB0 Verified Boot (Magic: 0x41564230)"
+    elif b"LK" in header_sample[:128] or header_sample[:4] in (b"\x88\x16\x88\x58", b"BFBF"):
+        sig = "Little Kernel (LK) Bootloader Binary"
+    elif header_sample.startswith(b"\xd7\xb7\xab\x1e"):
+        sig = "DTBO Device Tree Overlay Table"
+
+    return sha256_hasher.hexdigest(), actual_size, sig
 
 # ---------------- VAULT INDEX HELPER ---------------- #
 
@@ -628,6 +1342,7 @@ def run_extraction_worker(job_id: str, raw_url: str, target: str, user_meta: dic
         ensure_dataset_exists()
         start_time = time.time()
         is_gdrive = "drive.google.com" in raw_url or "drive.usercontent.google.com" in raw_url
+        want = Want(target)
 
         job_add_code(
             job_id,
@@ -636,335 +1351,61 @@ def run_extraction_worker(job_id: str, raw_url: str, target: str, user_meta: dic
             f"stream_url, rom_filename, total_size = resolve_source(\"{raw_url[:60]}...\")"
         )
 
+        public_url = raw_url
         if is_gdrive:
             g_id = extract_gdrive_id(raw_url)
             if not g_id:
                 raise Exception("Invalid Google Drive link: Could not extract File ID.")
+            public_url = f"https://drive.google.com/file/d/{g_id}/view"
             stream_url, rom_filename, total_size, session = resolve_gdrive_stream(g_id, job_id)
         else:
             stream_url, rom_filename, total_size, session = resolve_direct_url(raw_url, job_id)
 
-        lower_name = rom_filename.lower()
-        file_sha256, file_size, file_sig = "", 0, ""
-        resolved_meta = None
+        fmt = sniff_format(session, stream_url, rom_filename)
+        job_log(job_id, "STREAM", f"Archive type: {fmt.upper()} | Target: {want.name} (matched case-insensitively)")
 
-        # =========================================================================
-        # PATH A: FASTBOOT ROM (.TGZ / .TAR.GZ) STREAM + INTERNAL METADATA PARSER
-        # =========================================================================
-        if lower_name.endswith((".tgz", ".tar.gz")):
-            job_add_code(
-                job_id,
-                "STAGE 2: FASTBOOT .TGZ STREAM & KHWANG9883 AUTO-MATCH",
-                f"with tarfile.open(fileobj=LiveStreamTracker(resp.raw), mode='r|*') as tar:\n"
-                f"    for member in tar:\n"
-                f"        # Match root folder codename against KHwang9883 xiaomi_en.md (else 'Unknown')\n"
-                f"        if member.name.endswith('/{target}'):\n"
-                f"            shutil.copyfileobj(tar.extractfile(member), out_f)\n"
-                f"            break"
-            )
-            job_log(job_id, "STREAM", f"Opening live Fastboot .tgz stream for '{rom_filename}'...")
+        job_add_code(
+            job_id,
+            "STAGE 2: SMART TARGET RESOLVER",
+            f"# 1) file named '{want.name}' (also .zst)\n"
+            f"# 2) partition '{want.stem}' inside payload.bin (CrAU manifest)\n"
+            f"# 3) logical partition '{want.stem}' inside super.img (raw or Android sparse, LP metadata)\n"
+            f"# range-capable server -> HTTP Range jumps | no ranges (Google Drive) -> single forward stream"
+        )
 
-            found = False
-            expected_size = None
-            archive_root_seen = False
-
-            with session.get(stream_url, stream=True, timeout=60) as resp:
-                resp.raise_for_status()
-                tracker = LiveStreamTracker(resp.raw, total_size, job_id)
-                with tarfile.open(fileobj=tracker, mode="r|*") as tar:
-                    for member in tar:
-                        norm = member.name.replace("\\", "/").lstrip("./")
-                        if not archive_root_seen and "/" in norm:
-                            archive_root = norm.split("/")[0]
-                            archive_root_seen = True
-                            resolved_meta = reconcile_metadata(user_meta, rom_filename, archive_root, {}, job_id)
-
-                        if not member.isfile():
-                            continue
-
-                        short = os.path.basename(norm)
-                        job["current_scan"] = norm
-                        job["chunks_verified"] += 1
-
-                        if norm.endswith(f"/{target}") or norm == target or short == target:
-                            if not resolved_meta:
-                                resolved_meta = reconcile_metadata(user_meta, rom_filename, norm, {}, job_id)
-                            expected_size = member.size
-                            mb_total = max(0.01, expected_size / (1024 * 1024))
-                            job["rom_progress"] = 100
-                            job["rom_label"] = f"Located {norm} ({mb_total:.2f} MB)"
-                            job_log(
-                                job_id,
-                                "STREAM",
-                                f"MATCH FOUND: '{norm}' | Exact Size: {expected_size:,} bytes ({mb_total:.2f} MB)"
-                            )
-
-                            src = tar.extractfile(member)
-                            if src is None:
-                                raise Exception(f"Unable to read {target} stream from archive.")
-
-                            copied = 0
-                            t_ext = time.time()
-                            with open(output_path, "wb") as dst:
-                                while True:
-                                    buf = src.read(256 * 1024)
-                                    if not buf:
-                                        break
-                                    dst.write(buf)
-                                    copied += len(buf)
-                                    pct = min(78, int((copied / max(1, expected_size)) * 78))
-                                    job["ext_progress"] = pct
-                                    job["ext_label"] = f"Extracting {target}: {copied/(1024*1024):.1f} / {mb_total:.1f} MB"
-                                    el = max(0.05, time.time() - t_ext)
-                                    mbps = (copied * 8) / (el * 1_000_000)
-                                    mbs = (copied / (1024 * 1024)) / el
-                                    job["speed"] = f"{mbps:.0f} Mbps ({mbs:.1f} MB/s)"
-
-                            found = True
-                            break
-
-            if not found:
-                raise Exception(f"'{target}' was not found anywhere inside this Fastboot ROM.")
-
-            job["ext_progress"] = 84
-            job["ext_label"] = "Running 4-Layer Anti-Brick & SHA-256 Verification..."
-            file_sha256, file_size, file_sig = verify_and_hash_file(output_path, expected_size=expected_size)
-
-        # =========================================================================
-        # PATH B: RECOVERY / CUSTOM ROM (.ZIP) HTTP RANGE + INTERNAL METADATA
-        # =========================================================================
-        elif lower_name.endswith(".zip"):
-            job["rom_progress"] = 35
-            job["rom_label"] = "Reading ZIP Central Directory & Custom/Stock Metadata..."
-            job_log(job_id, "STREAM", "Requesting ZIP Central Directory via HTTP Range...")
-
-            with RemoteZip(stream_url, session=session) as zf:
-                namelist = zf.namelist()
-                internal_meta = inspect_zip_internal_metadata(zf, job_id)
-                resolved_meta = reconcile_metadata(user_meta, rom_filename, "", internal_meta, job_id)
-
-                job["rom_progress"] = 100
-                job["rom_label"] = f"ZIP Mapped ({len(namelist)} files) — Device: {resolved_meta['device_name']}"
-
-                matching_entry = None
-                for name in namelist:
-                    clean = name.replace("\\", "/").lstrip("./")
-                    if clean == target or clean.endswith(f"/{target}") or os.path.basename(clean) == target:
-                        matching_entry = name
-                        break
-
-                if matching_entry:
-                    info = zf.getinfo(matching_entry)
-                    expected_size = info.file_size
-                    expected_crc = info.CRC
-                    mb_total = max(0.01, expected_size / (1024 * 1024))
-
-                    job_add_code(
-                        job_id,
-                        "STAGE 2: DIRECT ZIP HTTP BYTE-RANGE STREAM",
-                        f"info = zf.getinfo('{matching_entry}')\n"
-                        f"# Offset: 0x{info.header_offset:08X} | Size: {expected_size:,} B | CRC32: {hex(expected_crc)}\n"
-                        f"with zf.open('{matching_entry}') as src, open('{output_path}', 'wb') as dst:\n"
-                        f"    shutil.copyfileobj(src, dst)"
-                    )
-                    job_log(
-                        job_id,
-                        "STREAM",
-                        f"Direct ZIP Entry Found: '{matching_entry}' | Offset: 0x{info.header_offset:08X} | CRC32: {hex(expected_crc)}"
-                    )
-
-                    copied = 0
-                    t0 = time.time()
-                    with zf.open(matching_entry) as src, open(output_path, "wb") as dst:
-                        while True:
-                            buf = src.read(256 * 1024)
-                            if not buf:
-                                break
-                            dst.write(buf)
-                            copied += len(buf)
-                            job["bytes_streamed_mb"] = f"{copied / (1024*1024):.1f} MB"
-                            job["hex_offset"] = f"0x{(info.header_offset + copied):08X}"
-                            job["chunks_verified"] += 1
-                            job["ext_progress"] = min(78, int((copied / max(1, expected_size)) * 78))
-                            job["ext_label"] = f"Streaming {target}: {copied/(1024*1024):.1f} / {mb_total:.1f} MB"
-                            el = max(0.05, time.time() - t0)
-                            mbps = (copied * 8) / (el * 1_000_000)
-                            mbs = (copied / (1024 * 1024)) / el
-                            job["speed"] = f"{mbps:.0f} Mbps ({mbs:.1f} MB/s)"
-
-                    job["ext_progress"] = 84
-                    job["ext_label"] = "Verifying ZIP CRC-32 & SHA-256 Checksum..."
-                    file_sha256, file_size, file_sig = verify_and_hash_file(
-                        output_path,
-                        expected_size=expected_size,
-                        expected_crc32=expected_crc
-                    )
-
-                elif "payload.bin" in namelist:
-                    part_name = re.sub(r"\.(img|bin)$", "", target, flags=re.IGNORECASE)
-                    p_info = zf.getinfo("payload.bin")
-                    job_add_code(
-                        job_id,
-                        "STAGE 2: PAYLOAD.BIN CrAU PROTOBUF MANIFEST & RANGE EXTRACTOR",
-                        f"with zf.open('payload.bin') as payload:  # Offset: 0x{p_info.header_offset:08X}\n"
-                        f"    manifest = parse_crAU_manifest(payload, partition='{part_name}')\n"
-                        f"    for op in manifest.operations:\n"
-                        f"        payload.seek(base_offset + op.data_offset)\n"
-                        f"        chunk = payload.read(op.data_length)\n"
-                        f"        assert hashlib.sha256(chunk).digest() == op.data_sha256\n"
-                        f"        write_extents(decompress(chunk, op.type), op.dst_extents)"
-                    )
-                    job_log(
-                        job_id,
-                        "STREAM",
-                        f"Opening payload.bin at ZIP offset 0x{p_info.header_offset:08X} for '{part_name}'..."
-                    )
-
-                    with zf.open("payload.bin") as payload_stream:
-                        magic = payload_stream.read(4)
-                        if magic != b"CrAU":
-                            raise Exception("Invalid payload.bin CrAU magic header.")
-                        version = struct.unpack(">Q", payload_stream.read(8))[0]
-                        manifest_size = struct.unpack(">Q", payload_stream.read(8))[0]
-                        meta_sig_size = struct.unpack(">I", payload_stream.read(4))[0] if version >= 2 else 0
-                        manifest_bytes = payload_stream.read(manifest_size)
-                        base_data_offset = (24 if version >= 2 else 20) + manifest_size + meta_sig_size
-
-                        block_size = 4096
-                        target_part_bytes = None
-                        available_parts = []
-                        for f_num, val in _iter_fields(manifest_bytes):
-                            if f_num == 3:
-                                block_size = val
-                            elif f_num == 13:
-                                p_name = None
-                                for pf_num, p_val in _iter_fields(val):
-                                    if pf_num == 1:
-                                        p_name = p_val.decode("utf-8", errors="ignore")
-                                        break
-                                if p_name:
-                                    available_parts.append(p_name)
-                                if p_name == part_name:
-                                    target_part_bytes = val
-                                    break
-
-                        if not target_part_bytes:
-                            sample_list = ", ".join(available_parts[:15])
-                            raise Exception(f"'{part_name}' not found in payload.bin. Available: {sample_list}")
-
-                        expected_size, expected_hash = None, None
-                        operations = []
-                        for pf_num, p_val in _iter_fields(target_part_bytes):
-                            if pf_num == 7:
-                                for if_num, i_val in _iter_fields(p_val):
-                                    if if_num == 1:
-                                        expected_size = i_val
-                                    elif if_num == 2:
-                                        expected_hash = i_val
-                            elif pf_num == 8:
-                                op_type, data_offset, data_length = 0, 0, 0
-                                dst_extents, data_sha256 = [], None
-                                for of_num, o_val in _iter_fields(p_val):
-                                    if of_num == 1: op_type = o_val
-                                    elif of_num == 2: data_offset = o_val
-                                    elif of_num == 3: data_length = o_val
-                                    elif of_num == 6:
-                                        sb, nb = 0, 0
-                                        for ef_num, e_val in _iter_fields(o_val):
-                                            if ef_num == 1: sb = e_val
-                                            elif ef_num == 2: nb = e_val
-                                        dst_extents.append((sb, nb))
-                                    elif of_num == 8:
-                                        data_sha256 = o_val
-                                operations.append((op_type, data_offset, data_length, dst_extents, data_sha256))
-
-                        total_ops = len(operations)
-                        mb_total = (expected_size or 0) / (1024 * 1024)
-                        job_log(
-                            job_id,
-                            "STREAM",
-                            f"Found '{part_name}' in manifest | {total_ops} chunks | Size: {mb_total:.2f} MB"
-                        )
-
-                        zstd_dctx = zstd.ZstdDecompressor()
-                        t0 = time.time()
-                        bytes_fetched = 0
-                        op_names = {0: "RAW", 1: "BZIP2", 8: "XZ/LZMA", 14: "ZSTD"}
-
-                        with open(output_path, "wb") as out_f:
-                            if expected_size:
-                                out_f.truncate(expected_size)
-                            for idx, (op_type, data_offset, data_length, dst_extents, data_sha256) in enumerate(operations, 1):
-                                if data_length == 0 or op_type in (6, 7):
-                                    continue
-                                abs_offset = base_data_offset + data_offset
-                                payload_stream.seek(abs_offset)
-                                compressed = payload_stream.read(data_length)
-                                bytes_fetched += len(compressed)
-
-                                if data_sha256 and hashlib.sha256(compressed).digest() != data_sha256:
-                                    raise Exception(f"Anti-Brick Guard: Chunk {idx}/{total_ops} failed SHA-256 verification!")
-
-                                if op_type == 0:
-                                    raw_data = compressed
-                                elif op_type == 8 or compressed.startswith(b"\xfd7zXZ\x00"):
-                                    raw_data = lzma.decompress(compressed)
-                                elif op_type == 1 or compressed.startswith(b"BZh"):
-                                    raw_data = bz2.decompress(compressed)
-                                elif op_type == 14 or compressed.startswith(b"\x28\xb5\x2f\xfd"):
-                                    raw_data = zstd_dctx.decompress(compressed)
-                                else:
-                                    raise Exception(f"Unsupported payload compression type: {op_type}")
-
-                                in_pos = 0
-                                for start_block, num_blocks in dst_extents:
-                                    byte_len = num_blocks * block_size
-                                    out_f.seek(start_block * block_size)
-                                    out_f.write(raw_data[in_pos:in_pos + byte_len])
-                                    in_pos += byte_len
-
-                                job["chunks_verified"] = idx
-                                job["bytes_streamed_mb"] = f"{bytes_fetched / (1024*1024):.2f} MB"
-                                job["hex_offset"] = f"0x{abs_offset:08X}"
-                                job["current_scan"] = f"Chunk {idx}/{total_ops} [{op_names.get(op_type, 'COMP')}]"
-
-                                el = max(0.05, time.time() - t0)
-                                mbps = (bytes_fetched * 8) / (el * 1_000_000)
-                                mbs = (bytes_fetched / (1024 * 1024)) / el
-                                job["speed"] = f"{mbps:.0f} Mbps ({mbs:.1f} MB/s)"
-                                job["ext_progress"] = min(80, int((idx / max(1, total_ops)) * 80))
-                                job["ext_label"] = f"Decompressing & Hashing Chunk {idx}/{total_ops} ({mb_total:.1f} MB)"
-
-                                if idx == 1 or idx == total_ops or idx % max(1, total_ops // 6) == 0:
-                                    c_hash = data_sha256.hex()[:12] if data_sha256 else "raw"
-                                    job_log(
-                                        job_id,
-                                        "CHUNK",
-                                        f"Chunk {idx}/{total_ops} [{op_names.get(op_type, 'COMP')}] @ 0x{abs_offset:08X} ({data_length:,} B -> {len(raw_data):,} B) | SHA256:{c_hash}.. OK"
-                                    )
-
-                            if expected_size:
-                                out_f.truncate(expected_size)
-
-                        job["ext_progress"] = 85
-                        job["ext_label"] = "Verifying Full Partition SHA-256 Checksum..."
-                        file_sha256, file_size, file_sig = verify_and_hash_file(
-                            output_path,
-                            expected_size=expected_size,
-                            expected_sha256_bytes=expected_hash
-                        )
-                else:
-                    raise Exception(f"'{target}' not found in this ZIP archive.")
+        if fmt == "tgz":
+            info = extract_tgz(job_id, session, stream_url, total_size, rom_filename, want, user_meta, output_path)
         else:
-            raise Exception("Unsupported ROM archive format. Must be .tgz/.tar.gz or .zip.")
+            info = None
+            if supports_ranges(session, stream_url):
+                job_log(job_id, "STREAM", "Server supports HTTP Range → random-access mode.")
+                try:
+                    info = extract_zip_ranged(job_id, session, stream_url, rom_filename, want, user_meta, output_path)
+                except Fatal:
+                    raise
+                except Exception as e:
+                    job_log(job_id, "INFO", f"Range mode failed ({e}) → switching to sequential streaming.")
+                    job["rom_progress"], job["ext_progress"] = 2, 0
+            else:
+                job_log(job_id, "STREAM", "Server has no usable HTTP Range support → sequential streaming mode.")
+            if info is None:
+                info = extract_zip_sequential(job_id, session, stream_url, total_size, rom_filename, want, user_meta, output_path)
 
-        if not resolved_meta:
-            resolved_meta = reconcile_metadata(user_meta, rom_filename, "", {}, job_id)
+        resolved_meta = info.get("resolved_meta") or reconcile_metadata(user_meta, rom_filename, "", {}, job_id)
+        job_log(job_id, "STREAM", f"Source: {info.get('source', '?')}")
+
+        job["ext_progress"] = 84
+        job["ext_label"] = "Running 4-Layer Anti-Brick & SHA-256 Verification..."
+        file_sha256, file_size, file_sig = verify_and_hash_file(
+            output_path,
+            expected_size=info.get("expected_size"),
+            expected_sha256_bytes=info.get("expected_sha"),
+            expected_crc32=info.get("expected_crc"),
+        )
 
         job_log(job_id, "VERIFY", f"Binary Magic Signature: {file_sig}")
         job_log(job_id, "VERIFY", f"Full File SHA-256 Digest: {file_sha256}")
 
-        # Build Vault paths (Uses 'Unknown' if not in KHwang9883 xiaomi_en.md, plus file hash suffix to prevent collisions)
         clean_dev = re.sub(r"[^a-zA-Z0-9._-]", "_", resolved_meta["device_name"])[:45]
         clean_code = re.sub(r"[^a-zA-Z0-9._-]", "_", resolved_meta["codename"])
         clean_ver = re.sub(r"[^a-zA-Z0-9._-]", "_", resolved_meta["rom_version"])[:40]
@@ -1010,9 +1451,10 @@ def run_extraction_worker(job_id: str, raw_url: str, target: str, user_meta: dic
             "rom_category": resolved_meta["rom_category"],
             "rom_format": resolved_meta["rom_format"],
             "auto_status": resolved_meta["auto_status"],
-            "rom_url": raw_url,
+            "rom_url": public_url,
             "rom_filename": rom_filename,
             "target": target,
+            "source": info.get("source", ""),
             "sha256": file_sha256,
             "size": size_mb_str,
             "signature": file_sig,
@@ -1064,7 +1506,8 @@ def start_job(req: ExtractRequest):
     if not req.rom_url.strip():
         raise HTTPException(status_code=400, detail="Please paste a valid ROM download link.")
 
-    target = req.target.strip()
+    # basename() blocks path traversal like "../../x"; matching itself is case-insensitive
+    target = os.path.basename(req.target.strip().replace("\\", "/"))
     if not target:
         raise HTTPException(status_code=400, detail="Please select or type a target file.")
     if "." not in target:
@@ -1091,7 +1534,7 @@ def start_job(req: ExtractRequest):
         "chunks_verified": 0,
         "current_scan": "—",
         "resolved_meta": None,
-        "cmd": "# Initializing HYPER//FLUX v7 + KHwang9883 MobileModels Engine...",
+        "cmd": "# Initializing HYPER//FLUX v8 + KHwang9883 MobileModels Engine...",
         "cmd_history": [],
         "logs": [],
         "result": None,
@@ -1240,7 +1683,7 @@ HTML_PAGE = """<!DOCTYPE html>
           <hr class="border-white/10" />
 
           <div>
-            <label class="text-[10px] uppercase mono text-amber-300 block mb-1">02 // ROM Download Link (Fastboot, Recovery, Custom, G-Drive)</label>
+            <label class="text-[10px] uppercase mono text-amber-300 block mb-1">02 // ROM Download Link (Fastboot, Recovery, Custom, Port, G-Drive)</label>
             <input id="romUrl" type="url" placeholder="Paste .tgz, .zip, or Google Drive link..." class="cyber-input w-full px-3.5 py-3 rounded-xl text-xs mono text-white placeholder-slate-600" />
           </div>
 
@@ -1259,8 +1702,15 @@ HTML_PAGE = """<!DOCTYPE html>
               <button type="button" onclick="pickPart('vbmeta.img', this)" class="chip-btn py-2 px-2 rounded-xl mono text-[11px] text-slate-300">vbmeta.img</button>
               <button type="button" onclick="pickPart('preloader_raw.img', this)" class="chip-btn py-2 px-2 rounded-xl mono text-[11px] text-slate-300">preloader</button>
               <button type="button" onclick="pickPart('logo.bin', this)" class="chip-btn py-2 px-2 rounded-xl mono text-[11px] text-slate-300">logo.bin</button>
+              <button type="button" onclick="pickPart('super.img', this)" class="chip-btn py-2 px-2 rounded-xl mono text-[11px] text-slate-300">super.img</button>
+              <button type="button" onclick="pickPart('system.img', this)" class="chip-btn py-2 px-2 rounded-xl mono text-[11px] text-slate-300">system.img</button>
+              <button type="button" onclick="pickPart('vendor.img', this)" class="chip-btn py-2 px-2 rounded-xl mono text-[11px] text-slate-300">vendor.img</button>
+              <button type="button" onclick="pickPart('vendor_dlkm.img', this)" class="chip-btn py-2 px-2 rounded-xl mono text-[11px] text-slate-300">vendor_dlkm.img</button>
+              <button type="button" onclick="pickPart('product.img', this)" class="chip-btn py-2 px-2 rounded-xl mono text-[11px] text-slate-300">product.img</button>
+              <button type="button" onclick="pickPart('odm.img', this)" class="chip-btn py-2 px-2 rounded-xl mono text-[11px] text-slate-300">odm.img</button>
             </div>
-            <input id="customTarget" type="text" placeholder="Or type any file inside ROM (e.g. modem.img, tee.img, super.img)..." oninput="customInput(this.value)" class="cyber-input w-full px-3.5 py-2 rounded-xl text-xs mono text-white placeholder-slate-600" />
+            <input id="customTarget" type="text" placeholder="Or type any file / partition (modem.img, system_ext.img, mi_ext.img...)" oninput="customInput(this.value)" class="cyber-input w-full px-3.5 py-2 rounded-xl text-xs mono text-white placeholder-slate-600" />
+            <p class="text-[10px] text-slate-500 mono mt-1.5">Looks for the file, then payload.bin, then inside super.img. Case-insensitive.</p>
           </div>
         </div>
 
@@ -1324,6 +1774,7 @@ HTML_PAGE = """<!DOCTYPE html>
         <div class="bg-black/60 rounded-2xl p-3.5 border border-white/5 space-y-2 mono text-[11px]">
           <div class="flex justify-between"><span class="text-slate-400">KHwang9883 Codename:</span><span id="doneCode" class="text-violet-300 font-bold"></span></div>
           <div class="flex justify-between"><span class="text-slate-400">File & Size:</span><span id="doneFileSize" class="text-amber-300 font-bold"></span></div>
+          <div class="flex justify-between gap-3"><span class="text-slate-400 shrink-0">Found in:</span><span id="doneSource" class="text-sky-300 text-right break-all"></span></div>
           <div class="flex justify-between"><span class="text-slate-400">Binary Header:</span><span id="doneSig" class="text-emerald-300"></span></div>
           <div>
             <span class="text-slate-400 block mb-0.5">Verified SHA-256 Checksum:</span>
@@ -1426,7 +1877,7 @@ HTML_PAGE = """<!DOCTYPE html>
           <button onclick="document.getElementById('logBox').innerHTML=''" class="mono text-[10px] text-slate-400 hover:text-white">Clear</button>
         </div>
         <div id="logBox" class="mono text-[10.5px] bg-black/85 rounded-2xl p-3.5 h-64 overflow-y-auto space-y-1.5 border border-white/5">
-          <div class="text-slate-500">[System] HYPER//FLUX v7 + KHwang9883 xiaomi_en.md Database Ready.</div>
+          <div class="text-slate-500">[System] HYPER//FLUX v8 + KHwang9883 xiaomi_en.md Database Ready.</div>
         </div>
       </div>
     </div>
@@ -1618,6 +2069,7 @@ HTML_PAGE = """<!DOCTYPE html>
           document.getElementById("doneSub").textContent = `${r.rom_version} • ${r.rom_category} (${r.rom_format})`;
           document.getElementById("doneCode").textContent = r.codename;
           document.getElementById("doneFileSize").textContent = `${r.target} (${r.size})`;
+          document.getElementById("doneSource").textContent = r.source || "—";
           document.getElementById("doneSig").textContent = r.signature;
           document.getElementById("doneHash").textContent = r.sha256;
           document.getElementById("finalDownloadBtn").href = r.download_url;
@@ -1666,6 +2118,7 @@ HTML_PAGE = """<!DOCTYPE html>
                   <span class="mono text-[10px] text-slate-400 ml-1.5">(${img.size})</span>
                   <div class="text-xs font-semibold text-white mt-0.5">${img.device_name} <span class="mono text-violet-300">[${img.codename}]</span></div>
                   <div class="mono text-[10px] text-slate-400">${img.rom_version} • ${img.rom_category} (${img.rom_format})</div>
+                  <div class="mono text-[10px] text-sky-300">${img.source || ""}</div>
                 </div>
                 <a href="${img.download_url}" target="_blank" class="shrink-0 px-3.5 py-2 rounded-xl bg-emerald-500/20 text-emerald-300 border border-emerald-400/30 mono text-[11px] font-bold">
                   ⬇ 0s Get
