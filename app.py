@@ -2414,8 +2414,8 @@ HTML_PAGE = """<!DOCTYPE html>
       <button id="btnTerminal" onclick="switchView('terminal')" class="dock-btn flex-1 py-2.5 rounded-[20px] text-xs text-slate-300">💻 Console</button>
     </div>
     <div class="text-[11px] font-medium text-slate-400 tracking-wide flex items-center gap-1">
-      <span>Made by</span>
-      <span class="font-bold bg-gradient-to-r from-violet-400 to-amber-300 bg-clip-text text-transparent">Yash</span>
+      <span></span>
+      <span class="font-bold bg-gradient-to-r from-violet-400 to-amber-300 bg-clip-text text-transparent"></span>
     </div>
   </div>
 
