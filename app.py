@@ -2135,4 +2135,606 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
 
         <div>
-          <h3 class="mono text-xs uppercase text-violet-300 mb-2 font-semibold">1. Saved ROMs
+          <h3 class="mono text-xs uppercase text-violet-300 mb-2 font-semibold">1. Saved ROMs (Device, Codename & Version)</h3>
+          <div id="romVaultList" class="space-y-2 max-h-56 overflow-y-auto pr-1">
+            <div class="skeleton h-14"></div>
+          </div>
+        </div>
+
+        <hr class="border-white/10" />
+
+        <div>
+          <h3 class="mono text-xs uppercase text-emerald-300 mb-2 font-semibold">2. Verified Extracted Files (SHA-256 Matched)</h3>
+          <div id="imgVaultList" class="space-y-2.5 max-h-72 overflow-y-auto pr-1">
+            <div class="skeleton h-20"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ================= TAB 3: TELEMETRY & CONSOLE ================= -->
+    <div id="tabTerminal" class="hidden space-y-4">
+      <div class="grid grid-cols-2 gap-2.5">
+        <div class="glass rounded-2xl p-3.5 rise" style="--i:0">
+          <span class="mono text-[10px] uppercase text-slate-400 block">Live Bandwidth</span>
+          <span id="conSpeed" class="mono text-sm font-bold text-amber-300 mt-0.5 block">—</span>
+        </div>
+        <div class="glass rounded-2xl p-3.5 rise" style="--i:1">
+          <span class="mono text-[10px] uppercase text-slate-400 block">Streamed / Offset</span>
+          <span id="conOffset" class="mono text-sm font-bold text-violet-300 mt-0.5 block">0 MB (0x00)</span>
+        </div>
+        <div class="glass rounded-2xl p-3.5 rise" style="--i:2">
+          <span class="mono text-[10px] uppercase text-slate-400 block">Entries / Chunks Verified</span>
+          <span id="conChunks" class="mono text-sm font-bold text-emerald-400 mt-0.5 block">0</span>
+        </div>
+        <div class="glass rounded-2xl p-3.5 rise" style="--i:3">
+          <span class="mono text-[10px] uppercase text-slate-400 block">Current Stream Entry</span>
+          <span id="conScan" class="mono text-xs font-semibold text-sky-300 mt-0.5 block truncate">—</span>
+        </div>
+      </div>
+
+      <div class="glass rounded-3xl p-4 space-y-2 rise" style="--i:4">
+        <div class="flex items-center justify-between">
+          <span class="mono text-[11px] uppercase text-amber-300 font-bold">✨ KHwang9883 DB Auto-Metadata Inspector</span>
+          <span id="metaStatusBadge" class="mono text-[10px] px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300">Standby</span>
+        </div>
+        <div class="grid grid-cols-2 gap-2 mono text-[11px] bg-black/50 p-3 rounded-2xl border border-white/5">
+          <div>
+            <span class="text-[10px] text-slate-400 block">User Typed:</span>
+            <span id="metaUserTyped" class="text-slate-300 truncate block">—</span>
+          </div>
+          <div>
+            <span class="text-[10px] text-slate-400 block">Vault Truth (xiaomi_en.md):</span>
+            <span id="metaAutoTruth" class="text-emerald-300 font-bold truncate block">—</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="glass rounded-3xl p-4 space-y-2 rise" style="--i:5">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-1.5">
+            <span class="w-2.5 h-2.5 rounded-full bg-rose-500"></span>
+            <span class="w-2.5 h-2.5 rounded-full bg-amber-400"></span>
+            <span class="w-2.5 h-2.5 rounded-full bg-emerald-400"></span>
+            <span class="mono text-[11px] font-bold text-violet-300 ml-1">Live Executed Engine Code</span>
+          </div>
+          <span class="mono text-[10px] px-2 py-0.5 rounded bg-white/5 text-slate-400">Python 3.11 Pipeline</span>
+        </div>
+        <pre id="cmdViewer" class="mono text-[10.5px] leading-relaxed text-amber-200 bg-black/70 p-3.5 rounded-2xl border border-white/5 overflow-x-auto max-h-56 overflow-y-auto"># Launch an extraction to watch every Python stage execute in real time...</pre>
+      </div>
+
+      <div class="glass rounded-3xl p-4 space-y-2 rise" style="--i:6">
+        <div class="flex items-center justify-between">
+          <span class="mono text-[11px] font-bold text-emerald-300 uppercase">Full Telemetry Terminal Log</span>
+          <button onclick="document.getElementById('logBox').innerHTML=''" class="mono text-[10px] text-slate-400 hover:text-white transition">Clear</button>
+        </div>
+        <div id="logBox" class="mono text-[10.5px] bg-black/75 rounded-2xl p-3.5 h-64 overflow-y-auto space-y-1.5 border border-white/5">
+          <div class="text-slate-500">[System] HYPER//FLUX v9 + KHwang9883 xiaomi_en.md Database Ready.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- GLASS DOCK -->
+  <div class="fixed bottom-3 left-1/2 -translate-x-1/2 z-50 flex flex-col items-center gap-1.5 w-full max-w-sm px-4 rise" style="--i:3">
+    <div id="dock" class="ios-dock p-1.5 rounded-[26px] flex items-center justify-between w-full gap-1">
+      <span id="dockPill"></span>
+      <button id="btnStudio" onclick="switchView('studio')" class="dock-btn active flex-1 py-2.5 rounded-[20px] text-xs">⚡ Studio</button>
+      <button id="btnVault" onclick="switchView('vault')" class="dock-btn flex-1 py-2.5 rounded-[20px] text-xs text-slate-300">🗄️ Vault</button>
+      <button id="btnTerminal" onclick="switchView('terminal')" class="dock-btn flex-1 py-2.5 rounded-[20px] text-xs text-slate-300">💻 Console</button>
+    </div>
+    <div class="text-[11px] font-medium text-slate-400 tracking-wide flex items-center gap-1">
+      <span>Made by</span>
+      <span class="font-bold bg-gradient-to-r from-violet-400 to-amber-300 bg-clip-text text-transparent">Yash</span>
+    </div>
+  </div>
+
+  <script>
+    let currentPart = "init_boot.img";
+    let pollTimer = null;
+    let renderedLogs = 0;
+    let currentJob = null;
+    let cancelling = false;
+    let vaultBusy = false;
+
+    const STAGES = [
+      { k: "search", ico: "🔎", color: "c-violet" },
+      { k: "cont",   ico: "📦", color: "c-sky" },
+      { k: "ext",    ico: "🎯", color: "c-amber" },
+      { k: "fin",    ico: "🛡️", color: "c-emerald" }
+    ];
+
+    /* ---------- helpers ---------- */
+    function esc(s) {
+      return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    }
+
+    function toast(msg, kind) {
+      const box = document.getElementById("toasts");
+      const t = document.createElement("div");
+      t.className = "toast " + (kind || "");
+      t.textContent = msg;
+      box.appendChild(t);
+      setTimeout(() => { t.classList.add("out"); setTimeout(() => t.remove(), 450); }, 3200);
+    }
+
+    function tween(el, to) {
+      const from = el._v || 0;
+      el._v = to;
+      if (el._raf) cancelAnimationFrame(el._raf);
+      const t0 = performance.now(), d = 600;
+      function f(t) {
+        const p = Math.min(1, (t - t0) / d);
+        el.textContent = Math.round(from + (to - from) * (1 - Math.pow(1 - p, 3))) + "%";
+        if (p < 1) el._raf = requestAnimationFrame(f);
+      }
+      el._raf = requestAnimationFrame(f);
+    }
+
+    document.addEventListener("pointermove", (e) => {
+      const g = e.target.closest ? e.target.closest(".glass") : null;
+      if (!g) return;
+      const r = g.getBoundingClientRect();
+      g.style.setProperty("--mx", (e.clientX - r.left) + "px");
+      g.style.setProperty("--my", (e.clientY - r.top) + "px");
+    });
+
+    document.addEventListener("click", (e) => {
+      const b = e.target.closest ? e.target.closest(".rip") : null;
+      if (!b || b.disabled) return;
+      const r = b.getBoundingClientRect();
+      const s = document.createElement("span");
+      const size = Math.max(r.width, r.height);
+      s.className = "ripple";
+      s.style.width = s.style.height = size + "px";
+      s.style.left = (e.clientX - r.left - size / 2) + "px";
+      s.style.top = (e.clientY - r.top - size / 2) + "px";
+      b.appendChild(s);
+      setTimeout(() => s.remove(), 750);
+    });
+
+    function buildSparks() {
+      const box = document.getElementById("sparks");
+      for (let i = 0; i < 16; i++) {
+        const s = document.createElement("span");
+        s.className = "spark";
+        s.style.left = (Math.random() * 100) + "%";
+        s.style.bottom = (-Math.random() * 20) + "%";
+        s.style.animationDuration = (14 + Math.random() * 18) + "s";
+        s.style.animationDelay = (-Math.random() * 25) + "s";
+        box.appendChild(s);
+      }
+    }
+
+    /* ---------- stages ---------- */
+    function renderStages() {
+      const list = document.getElementById("stageList");
+      list.innerHTML = STAGES.map((s, i) => `
+        <div class="stage" id="st-${s.k}" data-state="waiting">
+          <div class="flex items-center gap-3 mb-2.5">
+            <span class="ico">${s.ico}</span>
+            <div class="min-w-0 flex-1">
+              <div class="flex items-center gap-2">
+                <span class="text-xs font-bold text-white truncate" id="st-${s.k}-title"></span>
+                <span class="chip-state mono" id="st-${s.k}-chip">WAITING</span>
+              </div>
+              <div class="mono text-[10px] text-slate-400 truncate mt-0.5" id="st-${s.k}-sub">—</div>
+            </div>
+            <span class="mono text-sm font-bold text-white" id="st-${s.k}-pct">0%</span>
+          </div>
+          <div class="bar" id="st-${s.k}-barwrap"><div class="bar-fill ${s.color}" id="st-${s.k}-bar"></div></div>
+        </div>
+        ${i < STAGES.length - 1 ? '<div class="stage-line"></div>' : ''}
+      `).join("");
+      setStageTitles("", "");
+    }
+
+    function setStageTitles(container, target) {
+      const t = {
+        search: "1 · Locating the file",
+        cont: container ? "2 · Downloading " + container : "2 · Downloading the container file",
+        ext: target ? "3 · Extracting " + target : "3 · Extracting your file",
+        fin: "4 · Verify & upload to Vault"
+      };
+      STAGES.forEach(s => {
+        const el = document.getElementById("st-" + s.k + "-title");
+        if (el && el.textContent !== t[s.k]) el.textContent = t[s.k];
+      });
+    }
+
+    const CHIP = { waiting: "WAITING", active: "WORKING", done: "DONE ✓", skipped: "SKIPPED", error: "FAILED", cancelled: "STOPPED" };
+
+    function paintStage(k, pct, label, state, indet) {
+      const card = document.getElementById("st-" + k);
+      if (!card) return;
+      if (card.dataset.state !== state) {
+        card.dataset.state = state;
+        document.getElementById("st-" + k + "-chip").textContent = CHIP[state];
+      }
+      const bar = document.getElementById("st-" + k + "-bar");
+      bar.style.width = pct + "%";
+      document.getElementById("st-" + k + "-barwrap").classList.toggle("indet", !!indet);
+      tween(document.getElementById("st-" + k + "-pct"), pct);
+      const sub = document.getElementById("st-" + k + "-sub");
+      if (sub.textContent !== label) sub.textContent = label;
+    }
+
+    function applyStages(job) {
+      setStageTitles(job.cont_name, job.target);
+      let prevDone = true;
+      STAGES.forEach(s => {
+        const pct = job[s.k + "_progress"] || 0;
+        const label = job[s.k + "_label"] || "";
+        let state = "waiting";
+        const skipped = s.k === "cont" && job.cont_skip;
+        if (skipped) state = "skipped";
+        else if (pct >= 100) state = "done";
+        else if (pct > 0 || prevDone || s.k === "search") state = "active";
+        if (job.state === "error" && state === "active") state = "error";
+        if (job.state === "cancelled" && state === "active") state = "cancelled";
+        if (job.state !== "running" && job.state !== "done" && state === "waiting") state = "waiting";
+        paintStage(s.k, skipped ? 100 : pct, label, state, s.k === "fin" && job.fin_busy && job.state === "running");
+        prevDone = skipped || pct >= 100;
+      });
+    }
+
+    /* ---------- form / views ---------- */
+    function setFormLocked(locked) {
+      const wrap = document.getElementById("lockableControls");
+      const badge = document.getElementById("lockStatusBadge");
+      const inputs = wrap.querySelectorAll("input, select, button");
+      inputs.forEach(el => el.disabled = locked);
+
+      if (locked) {
+        wrap.classList.add("form-locked");
+        badge.textContent = "🔒 Locked (Extracting)";
+        badge.className = "mono text-[10px] px-2.5 py-1 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 transition-all duration-500";
+      } else {
+        wrap.classList.remove("form-locked");
+        badge.textContent = "KHwang9883 DB + SHA-256";
+        badge.className = "mono text-[10px] px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 transition-all duration-500";
+      }
+    }
+
+    function movePill(view) {
+      const cap = view.charAt(0).toUpperCase() + view.slice(1);
+      const btn = document.getElementById("btn" + cap);
+      const pill = document.getElementById("dockPill");
+      pill.style.left = btn.offsetLeft + "px";
+      pill.style.width = btn.offsetWidth + "px";
+    }
+
+    function switchView(view) {
+      ["Studio", "Vault", "Terminal"].forEach(v => {
+        document.getElementById("tab" + v).classList.add("hidden");
+        const b = document.getElementById("btn" + v);
+        b.classList.remove("active"); b.classList.add("text-slate-300");
+      });
+      const cap = view.charAt(0).toUpperCase() + view.slice(1);
+      const tab = document.getElementById("tab" + cap);
+      tab.classList.remove("hidden");
+      tab.classList.remove("view-in");
+      void tab.offsetWidth;
+      tab.classList.add("view-in");
+      const activeBtn = document.getElementById("btn" + cap);
+      activeBtn.classList.add("active"); activeBtn.classList.remove("text-slate-300");
+      movePill(view);
+      window.scrollTo({ top: 0, behavior: "smooth" });
+      if (view === "vault") loadVault(false);
+    }
+
+    function toggleFormatOption(val) {
+      const box = document.getElementById("formatBox");
+      if (val === "custom") {
+        box.style.opacity = "0"; box.style.transform = "scale(0.95)";
+        setTimeout(() => { if (document.getElementById("romCat").value === "custom") box.style.display = "none"; }, 320);
+      } else {
+        box.style.display = "block";
+        void box.offsetWidth;
+        box.style.opacity = "1"; box.style.transform = "none";
+      }
+    }
+
+    function pickPart(part, el) {
+      currentPart = part;
+      document.getElementById("selectedLabel").textContent = part;
+      document.getElementById("customTarget").value = "";
+      document.querySelectorAll("#chipGrid .chip-btn").forEach(b => b.classList.remove("active"));
+      el.classList.add("active");
+    }
+
+    function customInput(val) {
+      if (val.trim()) {
+        currentPart = val.trim();
+        document.getElementById("selectedLabel").textContent = currentPart;
+        document.querySelectorAll("#chipGrid .chip-btn").forEach(b => b.classList.remove("active"));
+      }
+    }
+
+    function resetLaunchUI() {
+      const btn = document.getElementById("launchBtn");
+      setFormLocked(false);
+      btn.disabled = false;
+      btn.innerHTML = "🛡️ Auto-Verify ROM & Extract Partition";
+      const c = document.getElementById("cancelBtn");
+      c.disabled = false;
+      c.innerHTML = "✖ Cancel extraction";
+      cancelling = false;
+    }
+
+    function stopPolling() {
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    }
+
+    /* ---------- launch / cancel ---------- */
+    async function launchExtraction() {
+      const devName = document.getElementById("devName").value.trim();
+      const romVer = document.getElementById("romVer").value.trim();
+      const romCat = document.getElementById("romCat").value;
+      const romFmt = document.getElementById("romFmt").value;
+      const romUrl = document.getElementById("romUrl").value.trim();
+      const errBanner = document.getElementById("errBanner");
+      const btn = document.getElementById("launchBtn");
+
+      errBanner.classList.add("hidden");
+      if (!romUrl) {
+        errBanner.textContent = "Please paste a valid ROM download link.";
+        errBanner.classList.remove("hidden");
+        errBanner.classList.add("slide-open");
+        toast("Paste a ROM link first", "warn");
+        return;
+      }
+
+      setFormLocked(true);
+      btn.disabled = true;
+      btn.innerHTML = "<span class='spin'>⟳</span> Working — see the live bars below";
+
+      document.getElementById("doneCard").classList.add("hidden");
+      const hud = document.getElementById("liveProgressHud");
+      hud.classList.remove("hidden");
+      hud.classList.remove("slide-open");
+      void hud.offsetWidth;
+      hud.classList.add("slide-open");
+      renderStages();
+      document.getElementById("logBox").innerHTML = "";
+      renderedLogs = 0;
+      cancelling = false;
+
+      try {
+        const res = await fetch("/api/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            rom_url: romUrl, target: currentPart,
+            device_name: devName, rom_version: romVer,
+            rom_category: romCat, rom_format: romFmt
+          })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Failed to start extraction");
+
+        currentJob = data.job_id;
+        stopPolling();
+        pollTimer = setInterval(() => pollJobStatus(data.job_id), 400);
+        pollJobStatus(data.job_id);
+      } catch (e) {
+        errBanner.textContent = e.message;
+        errBanner.classList.remove("hidden");
+        errBanner.classList.add("slide-open");
+        toast(e.message, "bad");
+        hud.classList.add("hidden");
+        resetLaunchUI();
+      }
+    }
+
+    async function cancelExtraction() {
+      if (!currentJob || cancelling) return;
+      cancelling = true;
+      const b = document.getElementById("cancelBtn");
+      b.disabled = true;
+      b.innerHTML = "<span class='spin'>⟳</span> Cancelling…";
+      try {
+        const res = await fetch("/api/cancel/" + currentJob, { method: "POST" });
+        const data = await res.json();
+        if (data && data.ok === false && data.note) {
+          toast(data.note, "warn");
+          cancelling = false;
+          b.innerHTML = "Finalizing — cannot cancel now";
+        }
+      } catch (e) {
+        cancelling = false;
+        b.disabled = false;
+        b.innerHTML = "✖ Cancel extraction";
+        toast("Could not reach the server to cancel", "bad");
+      }
+    }
+
+    /* ---------- polling ---------- */
+    async function pollJobStatus(jobId) {
+      const errBanner = document.getElementById("errBanner");
+      try {
+        const res = await fetch("/api/status/" + jobId, { cache: "no-store" });
+        if (!res.ok) return;
+        const job = await res.json();
+
+        applyStages(job);
+        document.getElementById("scanEntryText").textContent = job.current_scan !== "—" ? "Scanning: " + job.current_scan : "Streaming in cloud RAM (0 MB client data used)";
+        document.getElementById("hudSpeed").textContent = job.speed;
+
+        document.getElementById("conSpeed").textContent = job.speed;
+        document.getElementById("conOffset").textContent = job.bytes_streamed_mb + " (" + job.hex_offset + ")";
+        document.getElementById("conChunks").textContent = job.chunks_verified;
+        document.getElementById("conScan").textContent = job.current_scan;
+        document.getElementById("cmdViewer").textContent = job.cmd;
+
+        const cb = document.getElementById("cancelBtn");
+        if (job.state === "running" && !cancelling) {
+          if (job.fin_busy) { cb.disabled = true; cb.innerHTML = "Finalizing upload — cannot cancel now"; }
+          else { cb.disabled = false; cb.innerHTML = "✖ Cancel extraction"; }
+        }
+
+        if (job.resolved_meta) {
+          const rm = job.resolved_meta;
+          document.getElementById("metaUserTyped").textContent = rm.user_input_summary;
+          document.getElementById("metaAutoTruth").textContent = rm.device_name + " [" + rm.codename + "] • " + rm.rom_version;
+          document.getElementById("metaStatusBadge").textContent = rm.device_name === "Unknown" ? "Marked Unknown ⚠️" : "KHwang9883 Match ✓";
+        }
+
+        const logBox = document.getElementById("logBox");
+        while (renderedLogs < job.logs.length) {
+          const item = job.logs[renderedLogs++];
+          const d = document.createElement("div");
+          const colorMap = {
+            ERROR: "text-rose-400 font-bold",
+            SUCCESS: "text-emerald-400 font-bold",
+            META: "text-amber-300 font-semibold",
+            VERIFY: "text-violet-300 font-semibold",
+            CHUNK: "text-sky-300",
+            HTTP: "text-cyan-300",
+            UPLOAD: "text-emerald-300"
+          };
+          d.className = (colorMap[item.level] || "text-slate-300") + " view-in";
+          d.textContent = "[" + item.ts + "] [" + item.level + "] " + item.message;
+          logBox.appendChild(d);
+          logBox.scrollTop = logBox.scrollHeight;
+        }
+
+        if (job.state === "done" && job.result) {
+          stopPolling();
+          resetLaunchUI();
+
+          const r = job.result;
+          document.getElementById("devName").value = r.device_name;
+          document.getElementById("romVer").value = r.rom_version;
+
+          const card = document.getElementById("doneCard");
+          card.classList.remove("hidden");
+          card.classList.remove("pop-in");
+          void card.offsetWidth;
+          card.classList.add("pop-in");
+          document.getElementById("doneAutoBadge").textContent = "✨ " + r.auto_status;
+          document.getElementById("doneDuration").textContent = r.duration;
+          document.getElementById("doneTitle").textContent = r.device_name + " — " + r.target;
+          document.getElementById("doneSub").textContent = r.rom_version + " • " + r.rom_category + " (" + r.rom_format + ")";
+          document.getElementById("doneCode").textContent = r.codename;
+          document.getElementById("doneFileSize").textContent = r.target + " (" + r.size + ")";
+          document.getElementById("doneSource").textContent = r.source || "—";
+          document.getElementById("doneSig").textContent = r.signature;
+          document.getElementById("doneHash").textContent = r.sha256;
+          document.getElementById("finalDownloadBtn").href = r.download_url;
+          toast("Verified & saved to the Vault ✓", "ok");
+          setTimeout(() => card.scrollIntoView({ behavior: "smooth", block: "center" }), 250);
+        } else if (job.state === "cancelled") {
+          stopPolling();
+          resetLaunchUI();
+          errBanner.textContent = "Cancelled. Temporary files were removed and nothing was added to the Vault.";
+          errBanner.classList.remove("hidden");
+          errBanner.classList.remove("slide-open");
+          void errBanner.offsetWidth;
+          errBanner.classList.add("slide-open");
+          toast("Extraction cancelled", "warn");
+        } else if (job.state === "error") {
+          stopPolling();
+          resetLaunchUI();
+          errBanner.textContent = job.error || "Extraction failed.";
+          errBanner.classList.remove("hidden");
+          errBanner.classList.remove("slide-open");
+          void errBanner.offsetWidth;
+          errBanner.classList.add("slide-open");
+          toast("Extraction failed", "bad");
+        }
+      } catch (ignore) {}
+    }
+
+    /* ---------- vault ---------- */
+    async function loadVault(manual) {
+      if (vaultBusy) return;
+      vaultBusy = true;
+      const ico = document.getElementById("refreshIco");
+      const txt = document.getElementById("refreshTxt");
+      const btn = document.getElementById("refreshBtn");
+      const romBox = document.getElementById("romVaultList");
+      const imgBox = document.getElementById("imgVaultList");
+      btn.disabled = true;
+      ico.classList.add("spin");
+      txt.textContent = "Syncing…";
+      if (manual) {
+        romBox.innerHTML = '<div class="skeleton h-14"></div>';
+        imgBox.innerHTML = '<div class="skeleton h-20"></div><div class="skeleton h-20"></div>';
+      }
+      try {
+        const res = await fetch("/api/vault?t=" + Date.now(), { cache: "no-store" });
+        const data = await res.json();
+
+        if (!data.roms || data.roms.length === 0) {
+          romBox.innerHTML = '<div class="text-xs text-slate-500 mono py-3 text-center">No ROMs saved in Vault yet.</div>';
+        } else {
+          romBox.innerHTML = data.roms.map((r, i) => `
+            <div class="vault-item flex items-center justify-between p-3 rounded-2xl bg-black/40 border border-white/5" style="--i:${i}">
+              <div class="pr-2 overflow-hidden">
+                <div class="text-xs font-bold text-white">${esc(r.device_name)} <span class="mono text-violet-300">[${esc(r.codename)}]</span></div>
+                <div class="mono text-[10px] text-amber-300">${esc(r.rom_version)} • ${esc(r.rom_category)} (${esc(r.rom_format)})</div>
+              </div>
+              <a href="${esc(r.rom_url)}" target="_blank" class="btn shrink-0 px-3 py-1.5 rounded-xl bg-violet-500/20 text-violet-300 border border-violet-400/30 mono text-[10px] font-semibold">
+                ⬇ Full ROM
+              </a>
+            </div>
+          `).join("");
+        }
+
+        if (!data.images || data.images.length === 0) {
+          imgBox.innerHTML = '<div class="text-xs text-slate-500 mono py-4 text-center">No extracted files in Vault yet.</div>';
+        } else {
+          imgBox.innerHTML = data.images.map((img, i) => `
+            <div class="vault-item p-3.5 rounded-2xl bg-black/45 border border-white/5 space-y-2" style="--i:${i}">
+              <div class="flex items-center justify-between gap-2">
+                <div class="min-w-0">
+                  <span class="mono text-xs font-bold text-amber-300">${esc(img.target)}</span>
+                  <span class="mono text-[10px] text-slate-400 ml-1.5">(${esc(img.size)})</span>
+                  <div class="text-xs font-semibold text-white mt-0.5">${esc(img.device_name)} <span class="mono text-violet-300">[${esc(img.codename)}]</span></div>
+                  <div class="mono text-[10px] text-slate-400">${esc(img.rom_version)} • ${esc(img.rom_category)} (${esc(img.rom_format)})</div>
+                  <div class="mono text-[10px] text-sky-300 truncate">${esc(img.source || "")}</div>
+                </div>
+                <a href="${esc(img.download_url)}" target="_blank" class="btn shrink-0 px-3.5 py-2 rounded-xl bg-emerald-500/20 text-emerald-300 border border-emerald-400/30 mono text-[11px] font-bold">
+                  ⬇ Get
+                </a>
+              </div>
+              <div class="mono text-[9px] text-slate-400 bg-white/5 px-2.5 py-1 rounded-lg truncate">
+                SHA256: <span class="text-emerald-300">${esc(img.sha256)}</span>
+              </div>
+            </div>
+          `).join("");
+        }
+
+        document.getElementById("vaultSub").textContent = "Synced " + (data.fetched_at || "just now") + " • " + (data.roms || []).length + " ROMs • " + (data.images || []).length + " files";
+        if (data.note) toast("Vault note: " + data.note, "warn");
+        else if (manual) toast("Vault refreshed ✓", "ok");
+      } catch (e) {
+        romBox.innerHTML = '<div class="text-xs text-rose-300 mono py-3 text-center">Could not load the Vault. Tap Refresh to retry.</div>';
+        imgBox.innerHTML = "";
+        toast("Vault refresh failed", "bad");
+      } finally {
+        vaultBusy = false;
+        btn.disabled = false;
+        ico.classList.remove("spin");
+        txt.textContent = "Refresh";
+      }
+    }
+
+    /* ---------- boot ---------- */
+    buildSparks();
+    renderStages();
+    window.addEventListener("load", () => movePill("studio"));
+    window.addEventListener("resize", () => {
+      const active = ["studio", "vault", "terminal"].find(v => document.getElementById("btn" + v.charAt(0).toUpperCase() + v.slice(1)).classList.contains("active"));
+      if (active) movePill(active);
+    });
+    setTimeout(() => movePill("studio"), 120);
+  </script>
+</body>
+</html>
+"""
+
+@app.get("/", response_class=HTMLResponse)
+def serve_ui():
+    return HTML_PAGE
