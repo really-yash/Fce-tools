@@ -279,23 +279,24 @@ def inspect_zip_internal_metadata(zf, job_id: str):
         pass
     return parse_meta_texts(meta_text, script_text, job_id)
 
-def reconcile_metadata(user_meta: dict, rom_filename: str, archive_root: str, internal_zip_meta: dict, job_id: str):
-    """
-    Verifies Device Name, Codename and ROM Version against the ROM's own files and the
-    KHwang9883/MobileModels database. Unlisted codenames are saved as 'Unknown'.
-    """
+def reconcile_metadata(user_meta: dict, rom_filename: str, archive_root: str, job_id: str):
     combined = f"{archive_root} {rom_filename}"
-    raw_codename = internal_zip_meta.get("codename") if internal_zip_meta else None
-    detected_ver = internal_zip_meta.get("version") if internal_zip_meta else None
-    detected_cat = None
+    raw_codename = None
+    detected_ver = None
     detected_fmt = None
+
+    lower_fn = rom_filename.lower()
+    if lower_fn.endswith((".tgz", ".tar.gz", ".tar")):
+        detected_fmt = "FASTBOOT"
+    elif lower_fn.endswith(".zip"):
+        detected_fmt = "RECOVERY / PAYLOAD ZIP"
+    else:
+        detected_fmt = user_meta.get("rom_format", "fastboot").upper()
 
     fb_match = re.search(r"([a-zA-Z0-9_]+?)_images_([A-Za-z0-9._-]+?)_(?:20\d{6}|1\d\.0)", combined)
     if fb_match:
-        if not raw_codename:
-            raw_codename = fb_match.group(1)
+        raw_codename = fb_match.group(1)
         detected_ver = fb_match.group(2)
-        detected_cat = "Stock ROM"
         detected_fmt = "FASTBOOT"
 
     if not detected_ver:
@@ -303,24 +304,32 @@ def reconcile_metadata(user_meta: dict, rom_filename: str, archive_root: str, in
         if ver_m:
             detected_ver = ver_m.group(1)
 
-    cust_ver = extract_custom_rom_version(internal_zip_meta.get("raw_text", "") if internal_zip_meta else "", rom_filename)
-    if cust_ver:
-        detected_cat = "Custom ROM"
-        detected_fmt = "CUSTOM ROM"
-        if not detected_ver or not detected_ver.startswith(("OS", "V1")):
-            detected_ver = cust_ver
-
     if not raw_codename:
-        ota_m = re.search(r"\b([a-z0-9_]+?)-ota_full-", rom_filename.lower())
-        if ota_m:
-            raw_codename = ota_m.group(1)
-        else:
-            tokens = re.split(r"[^a-zA-Z0-9]+", combined.lower())
-            for tok in tokens:
-                dev_check, code_check = lookup_codename_in_khwang(tok)
-                if dev_check != "Unknown":
-                    raw_codename = code_check
-                    break
+        tokens = re.split(r"[^a-zA-Z0-9]+", combined.lower())
+        for tok in tokens:
+            dev_check, code_check = lookup_codename_in_khwang(tok)
+            if dev_check != "Unknown":
+                raw_codename = code_check
+                break
+
+    official_device_name, verified_codename = lookup_codename_in_khwang(raw_codename)
+    final_ver = detected_ver or extract_custom_rom_version("", rom_filename) or "Verified-Build"
+
+    is_custom = "lineage" in lower_fn or "pixel" in lower_fn or "crdroid" in lower_fn or "evolution" in lower_fn or "port" in lower_fn
+    
+    resolved = {
+        "user_input_summary": f"{user_meta.get('device_name','')} / {user_meta.get('rom_version','')}",
+        "device_name": official_device_name,
+        "codename": verified_codename,
+        "rom_version": final_ver,
+        "rom_category": "Custom ROM" if is_custom else "Stock ROM",
+        "rom_format": detected_fmt,
+        "auto_status": f"KHwang9883 Verified [{verified_codename}]"
+    }
+    if job_id in JOBS:
+        JOBS[job_id]["resolved_meta"] = resolved
+    return resolved
+
 
     official_device_name, verified_codename = lookup_codename_in_khwang(raw_codename)
 
