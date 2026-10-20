@@ -279,7 +279,7 @@ def inspect_zip_internal_metadata(zf, job_id: str):
         pass
     return parse_meta_texts(meta_text, script_text, job_id)
 
-def reconcile_metadata(user_meta: dict, rom_filename: str, archive_root: str, job_id: str):
+def reconcile_metadata(user_meta: dict, rom_filename: str, archive_root: str, job_id: str = ""):
     combined = f"{archive_root} {rom_filename}"
     raw_codename = None
     detected_ver = None
@@ -311,6 +311,25 @@ def reconcile_metadata(user_meta: dict, rom_filename: str, archive_root: str, jo
             if dev_check != "Unknown":
                 raw_codename = code_check
                 break
+
+    official_device_name, verified_codename = lookup_codename_in_khwang(raw_codename)
+    final_ver = detected_ver or extract_custom_rom_version("", rom_filename) or "Verified-Build"
+
+    is_custom = "lineage" in lower_fn or "pixel" in lower_fn or "crdroid" in lower_fn or "evolution" in lower_fn or "port" in lower_fn
+    
+    resolved = {
+        "user_input_summary": f"{user_meta.get('device_name','')} / {user_meta.get('rom_version','')}",
+        "device_name": official_device_name,
+        "codename": verified_codename,
+        "rom_version": final_ver,
+        "rom_category": "Custom ROM" if is_custom else "Stock ROM",
+        "rom_format": detected_fmt,
+        "auto_status": f"KHwang9883 Verified [{verified_codename}]"
+    }
+    if job_id and job_id in JOBS:
+        JOBS[job_id]["resolved_meta"] = resolved
+    return resolved
+
 
     official_device_name, verified_codename = lookup_codename_in_khwang(raw_codename)
     final_ver = detected_ver or extract_custom_rom_version("", rom_filename) or "Verified-Build"
