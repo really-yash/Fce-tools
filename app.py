@@ -420,11 +420,16 @@ def supports_ranges(session, url: str):
         return False
 
 def sniff_format(session, url: str, filename: str):
-    """Decides 'zip' or 'tgz' from the first bytes (Drive often hides the real file name)."""
+    """Decides 'zip' or 'tgz'. A clear file extension wins, so no extra request is sent to the server."""
+    low = filename.lower()
+    if low.endswith((".tgz", ".tar.gz", ".tar")):
+        return "tgz"
+    if low.endswith(".zip"):
+        return "zip"
     head = b""
     try:
         with session.get(url, stream=True, timeout=30) as r:
-            for c in r.iter_content(chunk_size=16):
+            for c in r.iter_content(chunk_size=512):
                 head = c
                 break
     except Exception:
@@ -434,12 +439,8 @@ def sniff_format(session, url: str, filename: str):
     if head[:2] == b"\x1f\x8b":
         return "tgz"
     if head[:1] == b"<":
-        raise Fatal("The server returned a web page instead of the ROM (Drive quota exceeded or link is not public).")
-    low = filename.lower()
-    if low.endswith((".tgz", ".tar.gz", ".tar")):
-        return "tgz"
-    if low.endswith(".zip"):
-        return "zip"
+        snippet = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", head.decode("utf-8", errors="ignore"))).strip()[:120]
+        raise Fatal(f"The server returned a web page instead of the ROM ({snippet or 'HTML'}). Drive quota or link is not public.")
     raise Fatal("Unsupported ROM archive format. Must be .tgz/.tar.gz or .zip.")
 
 # ================================================================================ #
@@ -1377,7 +1378,7 @@ def run_extraction_worker(job_id: str, raw_url: str, target: str, user_meta: dic
             info = extract_tgz(job_id, session, stream_url, total_size, rom_filename, want, user_meta, output_path)
         else:
             info = None
-            if supports_ranges(session, stream_url):
+            if not is_gdrive and supports_ranges(session, stream_url):
                 job_log(job_id, "STREAM", "Server supports HTTP Range → random-access mode.")
                 try:
                     info = extract_zip_ranged(job_id, session, stream_url, rom_filename, want, user_meta, output_path)
@@ -1387,7 +1388,7 @@ def run_extraction_worker(job_id: str, raw_url: str, target: str, user_meta: dic
                     job_log(job_id, "INFO", f"Range mode failed ({e}) → switching to sequential streaming.")
                     job["rom_progress"], job["ext_progress"] = 2, 0
             else:
-                job_log(job_id, "STREAM", "Server has no usable HTTP Range support → sequential streaming mode.")
+                job_log(job_id, "STREAM", "Google Drive / no usable HTTP Range support → sequential streaming mode.")
             if info is None:
                 info = extract_zip_sequential(job_id, session, stream_url, total_size, rom_filename, want, user_meta, output_path)
 
