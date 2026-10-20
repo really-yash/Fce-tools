@@ -2173,7 +2173,7 @@ HTML_PAGE = """<!DOCTYPE html>
         </span>
       </div>
       <span id="lockStatusBadge" class="mono text-[10px] px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 transition-all duration-500">
-        KHwang9883 DB + SHA-256
+        MADE BY YASH 
       </span>
     </div>
 
