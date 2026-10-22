@@ -1203,7 +1203,8 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
 
 # ---------------- UI INJECTOR (SAME GLASS & AMBIENT DESIGN) ---------------- #
 
-DNA_TAB_HTML = """
+DNA_TAB_HTML = r"""
+  <div class="relative z-10 w-full max-w-lg mx-auto">
     <!-- ================= TAB 4: DNA & MANAGER (CLOUD ROM PORTING SUITE) ================= -->
     <div id="tabDna" class="hidden space-y-4">
       <!-- Top Mode Switcher: 🧬 DNA vs 🗂️ Manager -->
@@ -1213,16 +1214,16 @@ DNA_TAB_HTML = """
             <span class="mono text-[10px] uppercase text-amber-300 font-bold block">Cloud Root Kitchen • 0 MB Phone Storage Used</span>
             <span id="dnaProjPathLabel" class="mono text-xs font-bold text-white">Current project: /sdcard/DNA/Default_Project</span>
           </div>
-          <button onclick="openDnaModal('projectModal')" class="btn rip px-3 py-1.5 rounded-xl bg-violet-500/20 text-violet-300 border border-violet-400/30 mono text-[10px] font-bold">
+          <button type="button" onclick="openDnaModal('projectModal')" class="btn rip px-3 py-1.5 rounded-xl bg-violet-500/20 text-violet-300 border border-violet-400/30 mono text-[10px] font-bold">
             📁 Project Menu
           </button>
         </div>
 
         <div class="grid grid-cols-2 gap-2 bg-black/40 p-1.5 rounded-2xl border border-white/10">
-          <button id="subBtnDna" onclick="switchDnaSub('dna')" class="chip-btn active py-2.5 rounded-xl mono text-xs font-bold">
+          <button type="button" id="subBtnDna" onclick="switchDnaSub('dna')" class="chip-btn active py-2.5 rounded-xl mono text-xs font-bold">
             🧬 DNA (Unpack / Pack)
           </button>
-          <button id="subBtnManager" onclick="switchDnaSub('manager')" class="chip-btn py-2.5 rounded-xl mono text-xs font-bold text-slate-300">
+          <button type="button" id="subBtnManager" onclick="switchDnaSub('manager')" class="chip-btn py-2.5 rounded-xl mono text-xs font-bold text-slate-300">
             🗂️ Manager (Dual-Pane Root)
           </button>
         </div>
@@ -1234,15 +1235,21 @@ DNA_TAB_HTML = """
         <div class="glass rounded-3xl p-4 space-y-2.5">
           <div class="flex items-center justify-between">
             <span class="mono text-[10px] uppercase text-emerald-300 font-bold">⚡ Pull Partition / ROM Image from Vault into /sdcard/DNA</span>
-            <button onclick="loadVaultIntoDnaPicker()" class="mono text-[10px] text-amber-300 underline">Sync Vault</button>
+            <button type="button" onclick="loadVaultIntoDnaPicker()" class="mono text-[10px] text-amber-300 underline">Sync Vault</button>
           </div>
           <div class="flex gap-2">
             <select id="dnaVaultPicker" class="cyber-input flex-1 px-3 py-2 rounded-xl text-xs mono text-white">
               <option value="">Tap 'Sync Vault' to list your extracted .img files...</option>
             </select>
-            <button onclick="importSelectedVaultImg()" class="btn rip px-4 py-2 rounded-xl bg-emerald-500/25 border border-emerald-400/40 text-emerald-300 mono text-xs font-bold shrink-0">
+            <button type="button" onclick="importSelectedVaultImg()" class="btn rip px-4 py-2 rounded-xl bg-emerald-500/25 border border-emerald-400/40 text-emerald-300 mono text-xs font-bold shrink-0">
               📥 Import
             </button>
+          </div>
+          <div class="flex items-center justify-between pt-1">
+            <span class="mono text-[10px] text-slate-400">Or upload a local .img / .br / .dat / .zst file:</span>
+            <label class="btn rip px-3 py-1 rounded-xl bg-violet-500/20 border border-violet-400/30 text-violet-200 mono text-[10px] font-bold cursor-pointer">
+              ⬆ Upload File <input type="file" class="hidden" onchange="dnaDirectUpload(this)" />
+            </label>
           </div>
         </div>
 
@@ -1250,22 +1257,22 @@ DNA_TAB_HTML = """
         <div class="glass rounded-3xl p-5 space-y-3">
           <h3 class="text-sm font-bold text-violet-300 brand-font tracking-wide">Unpack Menu</h3>
           <div class="divide-y divide-white/10 mono text-xs">
-            <button onclick="openUnpackModal('payload')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
+            <button type="button" onclick="openUnpackModal('payload')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
               <span>Unpack payload.bin</span><span class="text-slate-500">&gt;</span>
             </button>
-            <button onclick="openUnpackModal('br')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
+            <button type="button" onclick="openUnpackModal('br')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
               <span>Unpack br</span><span class="text-slate-500">&gt;</span>
             </button>
-            <button onclick="openUnpackModal('dat')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
+            <button type="button" onclick="openUnpackModal('dat')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
               <span>Unpack dat</span><span class="text-slate-500">&gt;</span>
             </button>
-            <button onclick="openUnpackModal('img')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
+            <button type="button" onclick="openUnpackModal('img')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
               <span>Unpack img</span><span class="text-slate-500">&gt;</span>
             </button>
-            <button onclick="openUnpackModal('zstd')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
+            <button type="button" onclick="openUnpackModal('zstd')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
               <span>Unpack zstd</span><span class="text-slate-500">&gt;</span>
             </button>
-            <button onclick="openUnpackModal('super')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
+            <button type="button" onclick="openUnpackModal('super')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
               <span>Unpack super</span><span class="text-slate-500">&gt;</span>
             </button>
           </div>
@@ -1275,13 +1282,13 @@ DNA_TAB_HTML = """
         <div class="glass rounded-3xl p-5 space-y-3">
           <h3 class="text-sm font-bold text-amber-300 brand-font tracking-wide">Pack Menu</h3>
           <div class="divide-y divide-white/10 mono text-xs">
-            <button onclick="openPackSingleModal()" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
+            <button type="button" onclick="openPackSingleModal()" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
               <span>Pack a single partition</span><span class="text-slate-500">&gt;</span>
             </button>
-            <button onclick="openPackZstdModal()" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
+            <button type="button" onclick="openPackZstdModal()" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
               <span>Pack zstd</span><span class="text-slate-500">&gt;</span>
             </button>
-            <button onclick="openPackSuperModal()" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
+            <button type="button" onclick="openPackSuperModal()" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
               <span>Pack super.img</span><span class="text-slate-500">&gt;</span>
             </button>
           </div>
@@ -1291,10 +1298,10 @@ DNA_TAB_HTML = """
         <div class="glass rounded-3xl p-5 space-y-3">
           <h3 class="text-sm font-bold text-emerald-300 brand-font tracking-wide">Format Conversion</h3>
           <div class="divide-y divide-white/10 mono text-xs">
-            <button onclick="openConvertModal('img_to_simg')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
+            <button type="button" onclick="openConvertModal('img_to_simg')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
               <span>img to simg</span><span class="text-slate-500">&gt;</span>
             </button>
-            <button onclick="openConvertModal('img_to_dat_br')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
+            <button type="button" onclick="openConvertModal('img_to_dat_br')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
               <span>img to dat, br</span><span class="text-slate-500">&gt;</span>
             </button>
           </div>
@@ -1304,7 +1311,7 @@ DNA_TAB_HTML = """
         <div class="glass rounded-3xl p-4 space-y-2">
           <div class="flex justify-between items-center">
             <span class="mono text-[11px] font-bold text-violet-300 uppercase">🧬 DNA Kitchen Execution Log</span>
-            <button onclick="refreshDnaState()" class="mono text-[10px] text-amber-300">Refresh</button>
+            <button type="button" onclick="refreshDnaState()" class="mono text-[10px] text-amber-300">Refresh</button>
           </div>
           <div id="dnaLogConsole" class="mono text-[10.5px] bg-black/75 rounded-2xl p-3 h-40 overflow-y-auto space-y-1 border border-white/5">
             <div class="text-slate-500">[DNA] Ready. Unpacked partitions are automatically bridged to Manager without root.</div>
@@ -1317,18 +1324,18 @@ DNA_TAB_HTML = """
         <!-- Dual-Pane Action Toolbar -->
         <div class="glass rounded-3xl p-3.5 space-y-2.5">
           <div class="flex items-center justify-between gap-1.5 flex-wrap">
-            <button onclick="mgrCopyMove('copy')" class="btn rip px-2.5 py-1.5 rounded-xl bg-violet-500/20 border border-violet-400/30 text-violet-200 mono text-[10px] font-bold">⇄ Copy</button>
-            <button onclick="mgrCopyMove('move')" class="btn rip px-2.5 py-1.5 rounded-xl bg-amber-500/20 border border-amber-400/30 text-amber-200 mono text-[10px] font-bold">➡ Move</button>
-            <button onclick="mgrNewFolder()" class="btn rip px-2.5 py-1.5 rounded-xl bg-white/5 border border-white/10 text-slate-200 mono text-[10px]">+ Folder</button>
-            <button onclick="mgrNewFile()" class="btn rip px-2.5 py-1.5 rounded-xl bg-white/5 border border-white/10 text-slate-200 mono text-[10px]">+ File</button>
-            <button onclick="mgrSymlink()" class="btn rip px-2.5 py-1.5 rounded-xl bg-sky-500/20 border border-sky-400/30 text-sky-200 mono text-[10px]">🔗 Symlink</button>
+            <button type="button" onclick="mgrCopyMove('copy')" class="btn rip px-2.5 py-1.5 rounded-xl bg-violet-500/20 border border-violet-400/30 text-violet-200 mono text-[10px] font-bold">⇄ Copy</button>
+            <button type="button" onclick="mgrCopyMove('move')" class="btn rip px-2.5 py-1.5 rounded-xl bg-amber-500/20 border border-amber-400/30 text-amber-200 mono text-[10px] font-bold">➡ Move</button>
+            <button type="button" onclick="mgrNewFolder()" class="btn rip px-2.5 py-1.5 rounded-xl bg-white/5 border border-white/10 text-slate-200 mono text-[10px]">+ Folder</button>
+            <button type="button" onclick="mgrNewFile()" class="btn rip px-2.5 py-1.5 rounded-xl bg-white/5 border border-white/10 text-slate-200 mono text-[10px]">+ File</button>
+            <button type="button" onclick="mgrSymlink()" class="btn rip px-2.5 py-1.5 rounded-xl bg-sky-500/20 border border-sky-400/30 text-sky-200 mono text-[10px]">🔗 Symlink</button>
             <label class="btn rip px-2.5 py-1.5 rounded-xl bg-emerald-500/20 border border-emerald-400/30 text-emerald-200 mono text-[10px] font-bold cursor-pointer">
               ⬆ Upload <input type="file" class="hidden" onchange="mgrUploadFile(this)" />
             </label>
           </div>
           <div class="text-[10px] mono text-slate-400 flex justify-between">
             <span>Active Pane: <strong id="mgrActivePaneIndicator" class="text-amber-300">LEFT</strong></span>
-            <span>Tap file to edit build.prop / APEX / permissions</span>
+            <span>Tap ••• on any file to edit build.prop / APEX / perms</span>
           </div>
         </div>
 
@@ -1337,9 +1344,9 @@ DNA_TAB_HTML = """
           <!-- LEFT PANE -->
           <div id="mgrPaneWrapL" onclick="setActivePane('L')" class="glass rounded-3xl p-3.5 border-2 border-violet-500/50 space-y-2">
             <div class="flex items-center justify-between gap-2 bg-black/50 px-3 py-1.5 rounded-xl border border-white/5">
-              <button onclick="mgrUp('L')" class="mono text-xs text-amber-300 font-bold">⬅ ..</button>
+              <button type="button" onclick="mgrUp('L')" class="mono text-xs text-amber-300 font-bold">⬅ ..</button>
               <span id="mgrPathL" class="mono text-[10px] text-violet-200 truncate flex-1">/sdcard/DNA</span>
-              <button onclick="loadPane('L')" class="mono text-[10px] text-slate-400">⟳</button>
+              <button type="button" onclick="loadPane('L')" class="mono text-[10px] text-slate-400">⟳</button>
             </div>
             <div id="mgrListL" class="space-y-1 max-h-72 overflow-y-auto pr-1 mono text-[11px]"></div>
           </div>
@@ -1347,965 +1354,995 @@ DNA_TAB_HTML = """
           <!-- RIGHT PANE -->
           <div id="mgrPaneWrapR" onclick="setActivePane('R')" class="glass rounded-3xl p-3.5 border border-white/10 space-y-2">
             <div class="flex items-center justify-between gap-2 bg-black/50 px-3 py-1.5 rounded-xl border border-white/5">
-              <button onclick="mgrUp('R')" class="mono text-xs text-amber-300 font-bold">⬅ ..</button>
+              <button type="button" onclick="mgrUp('R')" class="mono text-xs text-amber-300 font-bold">⬅ ..</button>
               <span id="mgrPathR" class="mono text-[10px] text-emerald-200 truncate flex-1">/sdcard/DNA</span>
-              <button onclick="loadPane('R')" class="mono text-[10px] text-slate-400">⟳</button>
+              <button type="button" onclick="loadPane('R')" class="mono text-[10px] text-slate-400">⟳</button>
             </div>
             <div id="mgrListR" class="space-y-1 max-h-72 overflow-y-auto pr-1 mono text-[11px]"></div>
           </div>
         </div>
       </div>
     </div>
+  </div>
 
-    <!-- ================= MODALS FOR DNA & MANAGER ================= -->
+  <!-- ================= MODALS FOR DNA & MANAGER ================= -->
 
-    <!-- 1. PROJECT MENU MODAL -->
-    <div id="projectModal" class="hidden fixed inset-0 z-[80] bg-black/80 backdrop-filter backdrop-blur-md flex items-center justify-center p-4">
-      <div class="glass rounded-3xl p-5 w-full max-w-sm space-y-3 border border-white/15">
-        <h3 class="text-sm font-bold text-white">Project Menu</h3>
-        <p id="projModalCurrent" class="mono text-[11px] text-amber-300">Current project: /sdcard/DNA/Default_Project</p>
-        <div>
-          <label class="mono text-[10px] text-slate-400 block mb-1">Select Existing Project</label>
-          <select id="projSelectDropdown" onchange="dnaProjectOp('select', this.value)" class="cyber-input w-full px-3 py-2 rounded-xl text-xs mono text-white"></select>
-        </div>
-        <div class="flex gap-2">
-          <input id="newProjNameInput" type="text" placeholder="New project name (e.g. HyperOS_Port)" class="cyber-input flex-1 px-3 py-2 rounded-xl text-xs mono text-white" />
-          <button onclick="dnaProjectOp('create', document.getElementById('newProjNameInput').value)" class="btn rip px-3.5 py-2 rounded-xl bg-violet-500/30 border border-violet-400/40 text-violet-200 mono text-xs font-bold">Create</button>
-        </div>
-        <div class="grid grid-cols-2 gap-2 pt-1">
-          <button onclick="dnaProjectOp('clear', '')" class="btn rip py-2 rounded-xl bg-amber-500/20 border border-amber-400/30 text-amber-300 mono text-xs">Clear Project</button>
-          <button onclick="dnaProjectOp('delete', '')" class="btn rip py-2 rounded-xl bg-rose-500/20 border border-rose-400/30 text-rose-300 mono text-xs">Delete Project</button>
-        </div>
-        <button onclick="closeDnaModal('projectModal')" class="btn rip w-full py-2 rounded-xl bg-white/10 text-slate-300 mono text-xs">Close</button>
+  <!-- 1. PROJECT MENU MODAL -->
+  <div id="projectModal" class="hidden fixed inset-0 z-[80] bg-black/80 backdrop-filter backdrop-blur-md flex items-center justify-center p-4">
+    <div class="glass rounded-3xl p-5 w-full max-w-sm space-y-3 border border-white/15">
+      <h3 class="text-sm font-bold text-white">Project Menu</h3>
+      <p id="projModalCurrent" class="mono text-[11px] text-amber-300">Current project: /sdcard/DNA/Default_Project</p>
+      <div>
+        <label class="mono text-[10px] text-slate-400 block mb-1">Select Existing Project</label>
+        <select id="projSelectDropdown" onchange="dnaProjectOp('select', this.value)" class="cyber-input w-full px-3 py-2 rounded-xl text-xs mono text-white"></select>
+      </div>
+      <div class="flex gap-2">
+        <input id="newProjNameInput" type="text" placeholder="New project name (e.g. HyperOS_Port)" class="cyber-input flex-1 px-3 py-2 rounded-xl text-xs mono text-white" />
+        <button type="button" onclick="dnaProjectOp('create', document.getElementById('newProjNameInput').value)" class="btn rip px-3.5 py-2 rounded-xl bg-violet-500/30 border border-violet-400/40 text-violet-200 mono text-xs font-bold">Create</button>
+      </div>
+      <div class="grid grid-cols-2 gap-2 pt-1">
+        <button type="button" onclick="dnaProjectOp('clear', '')" class="btn rip py-2 rounded-xl bg-amber-500/20 border border-amber-400/30 text-amber-300 mono text-xs">Clear Project</button>
+        <button type="button" onclick="dnaProjectOp('delete', '')" class="btn rip py-2 rounded-xl bg-rose-500/20 border border-rose-400/30 text-rose-300 mono text-xs">Delete Project</button>
+      </div>
+      <button type="button" onclick="closeDnaModal('projectModal')" class="btn rip w-full py-2 rounded-xl bg-white/10 text-slate-300 mono text-xs">Close</button>
+    </div>
+  </div>
+
+  <!-- 2. UNPACK IMG / SUPER / PAYLOAD / BR / DAT / ZSTD MODAL -->
+  <div id="unpackModal" class="hidden fixed inset-0 z-[80] bg-black/80 backdrop-filter backdrop-blur-md flex items-center justify-center p-4">
+    <div class="glass rounded-3xl p-5 w-full max-w-sm space-y-3.5 border border-white/15">
+      <h3 id="unpackModalTitle" class="text-sm font-bold text-white">Unpack img</h3>
+      <label class="flex items-center justify-between text-xs text-slate-200 bg-black/40 p-2.5 rounded-xl border border-white/5">
+        <span>Delete source file after completion</span>
+        <input id="unpackDelSource" type="checkbox" class="w-4 h-4 accent-violet-500" />
+      </label>
+      <div>
+        <span class="mono text-[11px] text-amber-300 block mb-1.5">• Select file(s):</span>
+        <div id="unpackFileList" class="space-y-1.5 max-h-48 overflow-y-auto bg-black/50 p-3 rounded-2xl border border-white/5 mono text-xs"></div>
+      </div>
+      <p class="text-[10px] text-slate-400 leading-relaxed">
+        Place your file in the project path /sdcard/DNA. The tool will automatically detect the img format and unpack it (when unpacking super, only partition a files are extracted).
+      </p>
+      <div class="flex justify-end gap-3 pt-1">
+        <button type="button" onclick="closeDnaModal('unpackModal')" class="px-4 py-2 rounded-xl bg-white/5 text-slate-300 mono text-xs">CANCEL</button>
+        <button type="button" onclick="submitUnpackModal()" class="btn rip px-5 py-2 rounded-xl bg-violet-500 text-white mono text-xs font-bold">OK</button>
       </div>
     </div>
+  </div>
 
-    <!-- 2. UNPACK IMG / SUPER / PAYLOAD / BR / DAT / ZSTD MODAL -->
-    <div id="unpackModal" class="hidden fixed inset-0 z-[80] bg-black/80 backdrop-filter backdrop-blur-md flex items-center justify-center p-4">
-      <div class="glass rounded-3xl p-5 w-full max-w-sm space-y-3.5 border border-white/15">
-        <h3 id="unpackModalTitle" class="text-sm font-bold text-white">Unpack img</h3>
-        <label class="flex items-center justify-between text-xs text-slate-200 bg-black/40 p-2.5 rounded-xl border border-white/5">
-          <span>Delete source file after completion</span>
-          <input id="unpackDelSource" type="checkbox" class="w-4 h-4 accent-violet-500" />
-        </label>
-        <div>
-          <span class="mono text-[11px] text-amber-300 block mb-1.5">• Select file(s):</span>
-          <div id="unpackFileList" class="space-y-1.5 max-h-48 overflow-y-auto bg-black/50 p-3 rounded-2xl border border-white/5 mono text-xs"></div>
-        </div>
-        <p class="text-[10px] text-slate-400 leading-relaxed">
-          Place your file in the project path /sdcard/DNA. The tool will automatically detect the img format and unpack it (when unpacking super, only partition a files are extracted).
-        </p>
-        <div class="flex justify-end gap-3 pt-1">
-          <button onclick="closeDnaModal('unpackModal')" class="px-4 py-2 rounded-xl bg-white/5 text-slate-300 mono text-xs">CANCEL</button>
-          <button onclick="submitUnpackModal()" class="btn rip px-5 py-2 rounded-xl bg-violet-500 text-white mono text-xs font-bold">OK</button>
-        </div>
+  <!-- 3. PACK A SINGLE PARTITION MODAL (Exact DNA Controls) -->
+  <div id="packSingleModal" class="hidden fixed inset-0 z-[80] bg-black/80 backdrop-filter backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto">
+    <div class="glass rounded-3xl p-5 w-full max-w-sm space-y-3 border border-white/15 my-auto max-h-[90vh] overflow-y-auto">
+      <h3 class="text-sm font-bold text-white">Pack a single partition</h3>
+
+      <div>
+        <select id="psPartSelect" class="cyber-input w-full px-3 py-2 rounded-xl text-xs mono text-white"></select>
+        <span class="text-[10px] text-slate-400 block mt-0.5">IMG packing format will be automatically detected</span>
       </div>
-    </div>
 
-    <!-- 3. PACK A SINGLE PARTITION MODAL (Exact DNA Controls) -->
-    <div id="packSingleModal" class="hidden fixed inset-0 z-[80] bg-black/80 backdrop-filter backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto">
-      <div class="glass rounded-3xl p-5 w-full max-w-sm space-y-3 border border-white/15 my-auto max-h-[90vh] overflow-y-auto">
-        <h3 class="text-sm font-bold text-white">Pack a single partition</h3>
-
+      <div class="grid grid-cols-2 gap-2.5 items-center">
         <div>
-          <select id="psPartSelect" class="cyber-input w-full px-3 py-2 rounded-xl text-xs mono text-white"></select>
-          <span class="text-[10px] text-slate-400 block mt-0.5">IMG packing format will be automatically detected</span>
+          <label class="text-[11px] text-slate-300 block">Pack type</label>
         </div>
+        <select id="psPackType" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
+          <option value="erofs">erofs</option>
+          <option value="ext4">ext4</option>
+          <option value="f2fs">f2fs</option>
+        </select>
+      </div>
 
+      <div>
         <div class="grid grid-cols-2 gap-2.5 items-center">
-          <div>
-            <label class="text-[11px] text-slate-300 block">Pack type</label>
-          </div>
-          <select id="psPackType" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
-            <option value="erofs">erofs</option>
-            <option value="ext4">ext4</option>
-            <option value="f2fs">f2fs</option>
+          <label class="text-[11px] text-slate-300">Read/Write permission</label>
+          <select id="psRwMode" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
+            <option value="rw">Read/Write---rw</option>
+            <option value="ro">Read Only---ro</option>
           </select>
         </div>
-
-        <div>
-          <div class="grid grid-cols-2 gap-2.5 items-center">
-            <label class="text-[11px] text-slate-300">Read/Write permission</label>
-            <select id="psRwMode" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
-              <option value="rw">Read/Write---rw</option>
-              <option value="ro">Read Only---ro</option>
-            </select>
-          </div>
-          <span class="text-[10px] text-slate-500">Note: only used when packing to ext4</span>
-        </div>
-
-        <div>
-          <div class="grid grid-cols-2 gap-2.5 items-center">
-            <label class="text-[11px] text-slate-300">Size</label>
-            <select id="psSizeMode" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
-              <option value="auto">Auto</option>
-              <option value="orig">Original size</option>
-            </select>
-          </div>
-          <span class="text-[10px] text-slate-500">Note: only used when packing to ext4</span>
-        </div>
-
-        <div>
-          <div class="grid grid-cols-2 gap-2.5 items-center">
-            <label class="text-[11px] text-slate-300">img format</label>
-            <select id="psImgFormat" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
-              <option value="raw">Raw</option>
-              <option value="sparse">Sparse</option>
-            </select>
-          </div>
-          <span class="text-[10px] text-slate-500">Note: only used when packing to ext4 or erofs</span>
-        </div>
-
-        <div>
-          <div class="grid grid-cols-2 gap-2.5 items-center">
-            <label class="text-[11px] text-slate-300">File format</label>
-            <select id="psFileFormat" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
-              <option value="IMG">IMG</option>
-              <option value="DAT">DAT</option>
-              <option value="BR">BR</option>
-            </select>
-          </div>
-          <span class="text-[10px] text-slate-500">Note: only used when packing to ext4 or erofs</span>
-        </div>
-
-        <div>
-          <div class="flex items-center justify-between">
-            <span class="text-[11px] text-slate-300">br compression</span>
-            <div class="flex items-center gap-2">
-              <button type="button" onclick="stepVal('psBrLevel', -1, 0, 11)" class="chip-btn w-7 h-7 rounded-lg mono text-xs">-</button>
-              <input id="psBrLevel" type="number" value="3" min="0" max="11" class="cyber-input w-12 text-center py-1 rounded-lg mono text-xs text-white" />
-              <button type="button" onclick="stepVal('psBrLevel', 1, 0, 11)" class="chip-btn w-7 h-7 rounded-lg mono text-xs">+</button>
-            </div>
-          </div>
-          <span class="text-[10px] text-slate-500">Note: the higher the value, the slower the packing process may be</span>
-        </div>
-
-        <div>
-          <div class="flex items-center justify-between">
-            <span class="text-[11px] text-slate-300">Erofs(f2fs) compression</span>
-            <div class="flex items-center gap-2">
-              <button type="button" onclick="stepVal('psErofsLevel', -1, 0, 12)" class="chip-btn w-7 h-7 rounded-lg mono text-xs">-</button>
-              <input id="psErofsLevel" type="number" value="8" min="0" max="12" class="cyber-input w-12 text-center py-1 rounded-lg mono text-xs text-white" />
-              <button type="button" onclick="stepVal('psErofsLevel', 1, 0, 12)" class="chip-btn w-7 h-7 rounded-lg mono text-xs">+</button>
-            </div>
-          </div>
-          <span class="text-[10px] text-slate-500">Note: only used when packing to Erofs(f2fs)</span>
-        </div>
-
-        <div>
-          <div class="grid grid-cols-2 gap-2.5 items-center">
-            <label class="text-[11px] text-slate-300">Type</label>
-            <select id="psErofsAlgo" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
-              <option value="lz4hc">lz4hc</option>
-              <option value="lz4">lz4</option>
-              <option value="lzma">lzma</option>
-              <option value="deflate">deflate</option>
-            </select>
-          </div>
-          <span class="text-[10px] text-slate-500">Note: only used when packing to Erofs</span>
-        </div>
-
-        <label class="flex items-center justify-between text-xs text-slate-200 bg-black/40 p-2.5 rounded-xl border border-white/5">
-          <div>
-            <span class="block">Compress ext4 img space</span>
-            <span class="text-[10px] text-slate-500">Note: only used when packing to ext4</span>
-          </div>
-          <input id="psCompressExt4" type="checkbox" class="w-4 h-4 accent-violet-500" />
-        </label>
-
-        <label class="flex items-center justify-between text-xs text-slate-200 bg-black/40 p-2.5 rounded-xl border border-white/5">
-          <div class="pr-2">
-            <span class="block">Remove avb data encryption</span>
-            <span class="text-[10px] text-slate-500">Note: this switch will modify the fstab file, the operation is not universal and may cause a bootloop.</span>
-          </div>
-          <input id="psRemoveAvb" type="checkbox" class="w-4 h-4 accent-violet-500 shrink-0" />
-        </label>
-
-        <div class="flex justify-end gap-3 pt-2">
-          <button onclick="closeDnaModal('packSingleModal')" class="px-4 py-2 rounded-xl bg-white/5 text-slate-300 mono text-xs">CANCEL</button>
-          <button onclick="submitPackSingle()" class="btn rip px-5 py-2 rounded-xl bg-emerald-500 text-slate-950 mono text-xs font-bold">OK</button>
-        </div>
+        <span class="text-[10px] text-slate-500">Note: only used when packing to ext4</span>
       </div>
-    </div>
 
-    <!-- 4. PACK SUPER.IMG MODAL (Exact DNA Controls) -->
-    <div id="packSuperModal" class="hidden fixed inset-0 z-[80] bg-black/80 backdrop-filter backdrop-blur-md flex items-center justify-center p-4">
-      <div class="glass rounded-3xl p-5 w-full max-w-sm space-y-3 border border-white/15">
-        <h3 class="text-sm font-bold text-white">Pack super.img</h3>
-
-        <div class="grid grid-cols-2 gap-2 items-center">
-          <label class="text-xs text-slate-300">Type</label>
-          <select id="superType" class="cyber-input px-3 py-2 rounded-xl text-xs mono text-white">
-            <option value="a_only">a_only</option>
-            <option value="ab">ab</option>
-            <option value="virtual_ab">virtual_ab</option>
+      <div>
+        <div class="grid grid-cols-2 gap-2.5 items-center">
+          <label class="text-[11px] text-slate-300">Size</label>
+          <select id="psSizeMode" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
+            <option value="auto">Auto</option>
+            <option value="orig">Original size</option>
           </select>
         </div>
-
-        <div class="grid grid-cols-2 gap-2 items-center">
-          <label class="text-xs text-slate-300">Format</label>
-          <select id="superFormat" class="cyber-input px-3 py-2 rounded-xl text-xs mono text-white">
-            <option value="sparse">sparse</option>
-            <option value="raw">raw</option>
-          </select>
-        </div>
-
-        <div>
-          <div class="grid grid-cols-2 gap-2 items-center">
-            <label class="text-xs text-slate-300">Total super.img</label>
-            <input id="superTotalGb" type="number" step="0.1" value="8.5" class="cyber-input px-3 py-2 rounded-xl text-xs mono text-white" />
-          </div>
-          <span class="text-[10px] text-slate-400">Enter the size of your super img, default value 8.5G.</span>
-        </div>
-
-        <div>
-          <div class="grid grid-cols-2 gap-2 items-center">
-            <label class="text-xs text-slate-300">Partition group</label>
-            <select id="superGroup" class="cyber-input px-3 py-2 rounded-xl text-xs mono text-white">
-              <option value="qti_dynamic_partitions">qti_dynamic_partitions</option>
-              <option value="mtk_dynamic_partitions">mtk_dynamic_partitions</option>
-            </select>
-          </div>
-          <span class="text-[10px] text-slate-400">If you don't know, leave it as default.</span>
-        </div>
-
-        <div>
-          <span class="mono text-[11px] text-amber-300 block mb-1">• Select IMG files to pack:</span>
-          <div id="superImgChecklist" class="space-y-1.5 max-h-40 overflow-y-auto bg-black/50 p-3 rounded-2xl border border-white/5 mono text-xs"></div>
-          <span class="text-[10px] text-slate-400 block mt-1">Place your files in the project path /sdcard/DNA</span>
-        </div>
-
-        <div class="flex justify-end gap-3 pt-2">
-          <button onclick="closeDnaModal('packSuperModal')" class="px-4 py-2 rounded-xl bg-white/5 text-slate-300 mono text-xs">CANCEL</button>
-          <button onclick="submitPackSuper()" class="btn rip px-5 py-2 rounded-xl bg-amber-400 text-slate-950 mono text-xs font-bold">OK</button>
-        </div>
+        <span class="text-[10px] text-slate-500">Note: only used when packing to ext4</span>
       </div>
-    </div>
 
-    <!-- 5. PACK ZSTD MODAL -->
-    <div id="packZstdModal" class="hidden fixed inset-0 z-[80] bg-black/80 backdrop-filter backdrop-blur-md flex items-center justify-center p-4">
-      <div class="glass rounded-3xl p-5 w-full max-w-sm space-y-3 border border-white/15">
-        <h3 class="text-sm font-bold text-white">Pack zstd</h3>
-        <div>
-          <label class="mono text-[10px] text-slate-400 block mb-1">Select .img file in /sdcard/DNA</label>
-          <select id="zstdImgSelect" class="cyber-input w-full px-3 py-2 rounded-xl text-xs mono text-white"></select>
+      <div>
+        <div class="grid grid-cols-2 gap-2.5 items-center">
+          <label class="text-[11px] text-slate-300">img format</label>
+          <select id="psImgFormat" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
+            <option value="raw">Raw</option>
+            <option value="sparse">Sparse</option>
+          </select>
         </div>
+        <span class="text-[10px] text-slate-500">Note: only used when packing to ext4 or erofs</span>
+      </div>
+
+      <div>
+        <div class="grid grid-cols-2 gap-2.5 items-center">
+          <label class="text-[11px] text-slate-300">File format</label>
+          <select id="psFileFormat" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
+            <option value="IMG">IMG</option>
+            <option value="DAT">DAT</option>
+            <option value="BR">BR</option>
+          </select>
+        </div>
+        <span class="text-[10px] text-slate-500">Note: only used when packing to ext4 or erofs</span>
+      </div>
+
+      <div>
         <div class="flex items-center justify-between">
-          <span class="text-xs text-slate-300">Zstd compression level (1-19)</span>
-          <input id="zstdLevelInput" type="number" value="6" min="1" max="19" class="cyber-input w-16 text-center py-1 rounded-lg mono text-xs text-white" />
-        </div>
-        <div class="flex justify-end gap-3 pt-2">
-          <button onclick="closeDnaModal('packZstdModal')" class="px-4 py-2 rounded-xl bg-white/5 text-slate-300 mono text-xs">CANCEL</button>
-          <button onclick="submitPackZstd()" class="btn rip px-5 py-2 rounded-xl bg-violet-500 text-white mono text-xs font-bold">OK</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- 6. FORMAT CONVERSION MODAL (img to simg / img to dat, br) -->
-    <div id="convertModal" class="hidden fixed inset-0 z-[80] bg-black/80 backdrop-filter backdrop-blur-md flex items-center justify-center p-4">
-      <div class="glass rounded-3xl p-5 w-full max-w-sm space-y-3 border border-white/15">
-        <h3 id="convertModalTitle" class="text-sm font-bold text-white">Format Conversion</h3>
-        <div>
-          <label class="mono text-[10px] text-slate-400 block mb-1">Select .img file in /sdcard/DNA</label>
-          <select id="convImgSelect" class="cyber-input w-full px-3 py-2 rounded-xl text-xs mono text-white"></select>
-        </div>
-        <div id="convBrWrap" class="hidden flex items-center justify-between">
-          <span class="text-xs text-slate-300">br compression (0-11)</span>
-          <input id="convBrLevel" type="number" value="3" min="0" max="11" class="cyber-input w-16 text-center py-1 rounded-lg mono text-xs text-white" />
-        </div>
-        <div class="flex justify-end gap-3 pt-2">
-          <button onclick="closeDnaModal('convertModal')" class="px-4 py-2 rounded-xl bg-white/5 text-slate-300 mono text-xs">CANCEL</button>
-          <button onclick="submitConvertModal()" class="btn rip px-5 py-2 rounded-xl bg-emerald-500 text-slate-950 mono text-xs font-bold">OK</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- 7. MANAGER ITEM INSPECTOR, TEXT EDITOR & PERMISSIONS/SELINUX MODAL -->
-    <div id="mgrItemModal" class="hidden fixed inset-0 z-[85] bg-black/85 backdrop-filter backdrop-blur-md flex items-center justify-center p-3 overflow-y-auto">
-      <div class="glass rounded-3xl p-4 w-full max-w-md space-y-3 border border-white/15 my-auto max-h-[92vh] overflow-y-auto">
-        <div class="flex items-center justify-between border-b border-white/10 pb-2">
-          <div class="min-w-0 pr-2">
-            <h3 id="mgrModalName" class="mono text-xs font-bold text-amber-300 truncate">file</h3>
-            <p id="mgrModalPath" class="mono text-[10px] text-slate-400 truncate">/sdcard/DNA</p>
+          <span class="text-[11px] text-slate-300">br compression</span>
+          <div class="flex items-center gap-2">
+            <button type="button" onclick="stepVal('psBrLevel', -1, 0, 11)" class="chip-btn w-7 h-7 rounded-lg mono text-xs">-</button>
+            <input id="psBrLevel" type="number" value="3" min="0" max="11" class="cyber-input w-12 text-center py-1 rounded-lg mono text-xs text-white" />
+            <button type="button" onclick="stepVal('psBrLevel', 1, 0, 11)" class="chip-btn w-7 h-7 rounded-lg mono text-xs">+</button>
           </div>
-          <button onclick="closeDnaModal('mgrItemModal')" class="px-2.5 py-1 rounded-lg bg-white/10 text-xs mono">✕</button>
         </div>
+        <span class="text-[10px] text-slate-500">Note: the higher the value, the slower the packing process may be</span>
+      </div>
 
-        <!-- Quick Actions Row -->
-        <div class="flex flex-wrap gap-1.5">
-          <button onclick="mgrRenameItem()" class="btn rip px-2.5 py-1.5 rounded-xl bg-white/10 text-slate-200 mono text-[10px]">✏️ Rename</button>
-          <button onclick="mgrDeleteItem()" class="btn rip px-2.5 py-1.5 rounded-xl bg-rose-500/20 border border-rose-400/30 text-rose-300 mono text-[10px]">🗑️ Delete</button>
-          <button id="mgrBtnMount" onclick="mgrMountArchive()" class="hidden btn rip px-2.5 py-1.5 rounded-xl bg-violet-500/25 border border-violet-400/40 text-violet-200 mono text-[10px] font-bold">📦 Unpack APEX/APK/ZIP</button>
-          <button id="mgrBtnRepack" onclick="mgrRepackArchive()" class="hidden btn rip px-2.5 py-1.5 rounded-xl bg-amber-500/25 border border-amber-400/40 text-amber-200 mono text-[10px] font-bold">🛠️ Repack to APEX/APK/ZIP</button>
-          <a id="mgrBtnDownload" href="#" target="_blank" class="btn rip px-2.5 py-1.5 rounded-xl bg-emerald-500/20 border border-emerald-400/30 text-emerald-300 mono text-[10px] font-bold">⬇ Download</a>
-          <button id="mgrBtnVault" onclick="mgrPushVault()" class="btn rip px-2.5 py-1.5 rounded-xl bg-sky-500/20 border border-sky-400/30 text-sky-200 mono text-[10px] font-bold">☁️ Push to Vault</button>
+      <div>
+        <div class="flex items-center justify-between">
+          <span class="text-[11px] text-slate-300">Erofs(f2fs) compression</span>
+          <div class="flex items-center gap-2">
+            <button type="button" onclick="stepVal('psErofsLevel', -1, 0, 12)" class="chip-btn w-7 h-7 rounded-lg mono text-xs">-</button>
+            <input id="psErofsLevel" type="number" value="8" min="0" max="12" class="cyber-input w-12 text-center py-1 rounded-lg mono text-xs text-white" />
+            <button type="button" onclick="stepVal('psErofsLevel', 1, 0, 12)" class="chip-btn w-7 h-7 rounded-lg mono text-xs">+</button>
+          </div>
         </div>
+        <span class="text-[10px] text-slate-500">Note: only used when packing to Erofs(f2fs)</span>
+      </div>
 
-        <!-- Permissions (chmod) & SELinux (chcon) Box -->
-        <div class="bg-black/50 p-3 rounded-2xl border border-white/5 space-y-2">
-          <span class="mono text-[10px] uppercase text-violet-300 font-bold block">Permissions (fs_config) &amp; SELinux (file_contexts)</span>
-          <div class="grid grid-cols-3 gap-2">
-            <div>
-              <label class="mono text-[9px] text-slate-400 block">Mode (Octal)</label>
-              <input id="mgrPermMode" type="text" value="0644" class="cyber-input w-full px-2.5 py-1.5 rounded-lg mono text-xs text-white" />
-            </div>
-            <div>
-              <label class="mono text-[9px] text-slate-400 block">UID</label>
-              <input id="mgrPermUid" type="text" value="0" class="cyber-input w-full px-2.5 py-1.5 rounded-lg mono text-xs text-white" />
-            </div>
-            <div>
-              <label class="mono text-[9px] text-slate-400 block">GID</label>
-              <input id="mgrPermGid" type="text" value="0" class="cyber-input w-full px-2.5 py-1.5 rounded-lg mono text-xs text-white" />
-            </div>
+      <div>
+        <div class="grid grid-cols-2 gap-2.5 items-center">
+          <label class="text-[11px] text-slate-300">Type</label>
+          <select id="psErofsAlgo" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
+            <option value="lz4hc">lz4hc</option>
+            <option value="lz4">lz4</option>
+            <option value="lzma">lzma</option>
+            <option value="deflate">deflate</option>
+          </select>
+        </div>
+        <span class="text-[10px] text-slate-500">Note: only used when packing to Erofs</span>
+      </div>
+
+      <label class="flex items-center justify-between text-xs text-slate-200 bg-black/40 p-2.5 rounded-xl border border-white/5">
+        <div>
+          <span class="block">Compress ext4 img space</span>
+          <span class="text-[10px] text-slate-500">Note: only used when packing to ext4</span>
+        </div>
+        <input id="psCompressExt4" type="checkbox" class="w-4 h-4 accent-violet-500" />
+      </label>
+
+      <label class="flex items-center justify-between text-xs text-slate-200 bg-black/40 p-2.5 rounded-xl border border-white/5">
+        <div class="pr-2">
+          <span class="block">Remove avb data encryption</span>
+          <span class="text-[10px] text-slate-500">Note: this switch will modify the fstab file, the operation is not universal and may cause a bootloop.</span>
+        </div>
+        <input id="psRemoveAvb" type="checkbox" class="w-4 h-4 accent-violet-500 shrink-0" />
+      </label>
+
+      <div class="flex justify-end gap-3 pt-2">
+        <button type="button" onclick="closeDnaModal('packSingleModal')" class="px-4 py-2 rounded-xl bg-white/5 text-slate-300 mono text-xs">CANCEL</button>
+        <button type="button" onclick="submitPackSingle()" class="btn rip px-5 py-2 rounded-xl bg-emerald-500 text-slate-950 mono text-xs font-bold">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 4. PACK SUPER.IMG MODAL (Exact DNA Controls) -->
+  <div id="packSuperModal" class="hidden fixed inset-0 z-[80] bg-black/80 backdrop-filter backdrop-blur-md flex items-center justify-center p-4">
+    <div class="glass rounded-3xl p-5 w-full max-w-sm space-y-3 border border-white/15">
+      <h3 class="text-sm font-bold text-white">Pack super.img</h3>
+
+      <div class="grid grid-cols-2 gap-2 items-center">
+        <label class="text-xs text-slate-300">Type</label>
+        <select id="superType" class="cyber-input px-3 py-2 rounded-xl text-xs mono text-white">
+          <option value="a_only">a_only</option>
+          <option value="ab">ab</option>
+          <option value="virtual_ab">virtual_ab</option>
+        </select>
+      </div>
+
+      <div class="grid grid-cols-2 gap-2 items-center">
+        <label class="text-xs text-slate-300">Format</label>
+        <select id="superFormat" class="cyber-input px-3 py-2 rounded-xl text-xs mono text-white">
+          <option value="sparse">sparse</option>
+          <option value="raw">raw</option>
+        </select>
+      </div>
+
+      <div>
+        <div class="grid grid-cols-2 gap-2 items-center">
+          <label class="text-xs text-slate-300">Total super.img</label>
+          <input id="superTotalGb" type="number" step="0.1" value="8.5" class="cyber-input px-3 py-2 rounded-xl text-xs mono text-white" />
+        </div>
+        <span class="text-[10px] text-slate-400">Enter the size of your super img, default value 8.5G.</span>
+      </div>
+
+      <div>
+        <div class="grid grid-cols-2 gap-2 items-center">
+          <label class="text-xs text-slate-300">Partition group</label>
+          <select id="superGroup" class="cyber-input px-3 py-2 rounded-xl text-xs mono text-white">
+            <option value="qti_dynamic_partitions">qti_dynamic_partitions</option>
+            <option value="mtk_dynamic_partitions">mtk_dynamic_partitions</option>
+          </select>
+        </div>
+        <span class="text-[10px] text-slate-400">If you don't know, leave it as default.</span>
+      </div>
+
+      <div>
+        <span class="mono text-[11px] text-amber-300 block mb-1">• Select IMG files to pack:</span>
+        <div id="superImgChecklist" class="space-y-1.5 max-h-40 overflow-y-auto bg-black/50 p-3 rounded-2xl border border-white/5 mono text-xs"></div>
+        <span class="text-[10px] text-slate-400 block mt-1">Place your files in the project path /sdcard/DNA</span>
+      </div>
+
+      <div class="flex justify-end gap-3 pt-2">
+        <button type="button" onclick="closeDnaModal('packSuperModal')" class="px-4 py-2 rounded-xl bg-white/5 text-slate-300 mono text-xs">CANCEL</button>
+        <button type="button" onclick="submitPackSuper()" class="btn rip px-5 py-2 rounded-xl bg-amber-400 text-slate-950 mono text-xs font-bold">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 5. PACK ZSTD MODAL -->
+  <div id="packZstdModal" class="hidden fixed inset-0 z-[80] bg-black/80 backdrop-filter backdrop-blur-md flex items-center justify-center p-4">
+    <div class="glass rounded-3xl p-5 w-full max-w-sm space-y-3 border border-white/15">
+      <h3 class="text-sm font-bold text-white">Pack zstd</h3>
+      <div>
+        <label class="mono text-[10px] text-slate-400 block mb-1">Select .img file in /sdcard/DNA</label>
+        <select id="zstdImgSelect" class="cyber-input w-full px-3 py-2 rounded-xl text-xs mono text-white"></select>
+      </div>
+      <div class="flex items-center justify-between">
+        <span class="text-xs text-slate-300">Zstd compression level (1-19)</span>
+        <input id="zstdLevelInput" type="number" value="6" min="1" max="19" class="cyber-input w-16 text-center py-1 rounded-lg mono text-xs text-white" />
+      </div>
+      <div class="flex justify-end gap-3 pt-2">
+        <button type="button" onclick="closeDnaModal('packZstdModal')" class="px-4 py-2 rounded-xl bg-white/5 text-slate-300 mono text-xs">CANCEL</button>
+        <button type="button" onclick="submitPackZstd()" class="btn rip px-5 py-2 rounded-xl bg-violet-500 text-white mono text-xs font-bold">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 6. FORMAT CONVERSION MODAL (img to simg / img to dat, br) -->
+  <div id="convertModal" class="hidden fixed inset-0 z-[80] bg-black/80 backdrop-filter backdrop-blur-md flex items-center justify-center p-4">
+    <div class="glass rounded-3xl p-5 w-full max-w-sm space-y-3 border border-white/15">
+      <h3 id="convertModalTitle" class="text-sm font-bold text-white">Format Conversion</h3>
+      <div>
+        <label class="mono text-[10px] text-slate-400 block mb-1">Select .img file in /sdcard/DNA</label>
+        <select id="convImgSelect" class="cyber-input w-full px-3 py-2 rounded-xl text-xs mono text-white"></select>
+      </div>
+      <div id="convBrWrap" class="hidden flex items-center justify-between">
+        <span class="text-xs text-slate-300">br compression (0-11)</span>
+        <input id="convBrLevel" type="number" value="3" min="0" max="11" class="cyber-input w-16 text-center py-1 rounded-lg mono text-xs text-white" />
+      </div>
+      <div class="flex justify-end gap-3 pt-2">
+        <button type="button" onclick="closeDnaModal('convertModal')" class="px-4 py-2 rounded-xl bg-white/5 text-slate-300 mono text-xs">CANCEL</button>
+        <button type="button" onclick="submitConvertModal()" class="btn rip px-5 py-2 rounded-xl bg-emerald-500 text-slate-950 mono text-xs font-bold">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 7. MANAGER ITEM INSPECTOR, TEXT EDITOR & PERMISSIONS/SELINUX MODAL -->
+  <div id="mgrItemModal" class="hidden fixed inset-0 z-[85] bg-black/85 backdrop-filter backdrop-blur-md flex items-center justify-center p-3 overflow-y-auto">
+    <div class="glass rounded-3xl p-4 w-full max-w-md space-y-3 border border-white/15 my-auto max-h-[92vh] overflow-y-auto">
+      <div class="flex items-center justify-between border-b border-white/10 pb-2">
+        <div class="min-w-0 pr-2">
+          <h3 id="mgrModalName" class="mono text-xs font-bold text-amber-300 truncate">file</h3>
+          <p id="mgrModalPath" class="mono text-[10px] text-slate-400 truncate">/sdcard/DNA</p>
+        </div>
+        <button type="button" onclick="closeDnaModal('mgrItemModal')" class="px-2.5 py-1 rounded-lg bg-white/10 text-xs mono">✕</button>
+      </div>
+
+      <!-- Quick Actions Row -->
+      <div class="flex flex-wrap gap-1.5">
+        <button type="button" onclick="mgrRenameItem()" class="btn rip px-2.5 py-1.5 rounded-xl bg-white/10 text-slate-200 mono text-[10px]">✏️ Rename</button>
+        <button type="button" onclick="mgrDeleteItem()" class="btn rip px-2.5 py-1.5 rounded-xl bg-rose-500/20 border border-rose-400/30 text-rose-300 mono text-[10px]">🗑️ Delete</button>
+        <button type="button" id="mgrBtnMount" onclick="mgrMountArchive()" class="hidden btn rip px-2.5 py-1.5 rounded-xl bg-violet-500/25 border border-violet-400/40 text-violet-200 mono text-[10px] font-bold">📦 Unpack APEX/APK/ZIP</button>
+        <button type="button" id="mgrBtnRepack" onclick="mgrRepackArchive()" class="hidden btn rip px-2.5 py-1.5 rounded-xl bg-amber-500/25 border border-amber-400/40 text-amber-200 mono text-[10px] font-bold">🛠️ Repack to APEX/APK/ZIP</button>
+        <a id="mgrBtnDownload" href="#" target="_blank" class="btn rip px-2.5 py-1.5 rounded-xl bg-emerald-500/20 border border-emerald-400/30 text-emerald-300 mono text-[10px] font-bold">⬇ Download</a>
+        <button type="button" id="mgrBtnVault" onclick="mgrPushVault()" class="btn rip px-2.5 py-1.5 rounded-xl bg-sky-500/20 border border-sky-400/30 text-sky-200 mono text-[10px] font-bold">☁️ Push to Vault</button>
+      </div>
+
+      <!-- Permissions (chmod) & SELinux (chcon) Box -->
+      <div class="bg-black/50 p-3 rounded-2xl border border-white/5 space-y-2">
+        <span class="mono text-[10px] uppercase text-violet-300 font-bold block">Permissions (fs_config) &amp; SELinux (file_contexts)</span>
+        <div class="grid grid-cols-3 gap-2">
+          <div>
+            <label class="mono text-[9px] text-slate-400 block">Mode (Octal)</label>
+            <input id="mgrPermMode" type="text" value="0644" class="cyber-input w-full px-2.5 py-1.5 rounded-lg mono text-xs text-white" />
           </div>
           <div>
-            <label class="mono text-[9px] text-slate-400 block">SELinux Context</label>
-            <input id="mgrPermSelinux" type="text" value="u:object_r:system_file:s0" class="cyber-input w-full px-2.5 py-1.5 rounded-lg mono text-[11px] text-emerald-300" />
+            <label class="mono text-[9px] text-slate-400 block">UID</label>
+            <input id="mgrPermUid" type="text" value="0" class="cyber-input w-full px-2.5 py-1.5 rounded-lg mono text-xs text-white" />
           </div>
-          <div class="flex items-center justify-between pt-1">
-            <label class="flex items-center gap-1.5 text-[10px] text-slate-300 mono">
-              <input id="mgrPermRecurse" type="checkbox" class="accent-violet-500" /> Apply recursively
-            </label>
-            <button onclick="mgrApplyPerms()" class="btn rip px-3 py-1 rounded-lg bg-violet-500 text-white mono text-[10px] font-bold">Save Perms &amp; SELinux</button>
+          <div>
+            <label class="mono text-[9px] text-slate-400 block">GID</label>
+            <input id="mgrPermGid" type="text" value="0" class="cyber-input w-full px-2.5 py-1.5 rounded-lg mono text-xs text-white" />
           </div>
         </div>
-
-        <!-- Built-in Text / build.prop / fstab / XML Editor -->
-        <div id="mgrEditorWrap" class="space-y-2">
-          <div class="flex items-center justify-between">
-            <span class="mono text-[10px] uppercase text-amber-300 font-bold">📝 Root Text &amp; Prop Editor</span>
-            <button onclick="mgrSaveTextFile()" class="btn rip px-3.5 py-1 rounded-lg bg-emerald-500 text-slate-950 mono text-[10px] font-bold">💾 Save File</button>
-          </div>
-          <textarea id="mgrTextEditor" rows="11" class="cyber-input w-full p-3 rounded-2xl mono text-[11px] text-slate-100 leading-relaxed" placeholder="Loading file contents..."></textarea>
+        <div>
+          <label class="mono text-[9px] text-slate-400 block">SELinux Context</label>
+          <input id="mgrPermSelinux" type="text" value="u:object_r:system_file:s0" class="cyber-input w-full px-2.5 py-1.5 rounded-lg mono text-[11px] text-emerald-300" />
+        </div>
+        <div class="flex items-center justify-between pt-1">
+          <label class="flex items-center gap-1.5 text-[10px] text-slate-300 mono">
+            <input id="mgrPermRecurse" type="checkbox" class="accent-violet-500" /> Apply recursively
+          </label>
+          <button type="button" onclick="mgrApplyPerms()" class="btn rip px-3 py-1 rounded-lg bg-violet-500 text-white mono text-[10px] font-bold">Save Perms &amp; SELinux</button>
         </div>
       </div>
+
+      <!-- Built-in Text / build.prop / fstab / XML Editor -->
+      <div id="mgrEditorWrap" class="space-y-2">
+        <div class="flex items-center justify-between">
+          <span class="mono text-[10px] uppercase text-amber-300 font-bold">📝 Root Text &amp; Prop Editor</span>
+          <button type="button" onclick="mgrSaveTextFile()" class="btn rip px-3.5 py-1 rounded-lg bg-emerald-500 text-slate-950 mono text-[10px] font-bold">💾 Save File</button>
+        </div>
+        <textarea id="mgrTextEditor" rows="11" class="cyber-input w-full p-3 rounded-2xl mono text-[11px] text-slate-100 leading-relaxed" placeholder="Loading file contents..."></textarea>
+      </div>
     </div>
+  </div>
 
-    <script>
-      let dnaState = { current_project: "Default_Project", img_files: [], unpacked_parts: [], zst_files: [], dat_br_files: [], projects: [], logs: [] };
-      let currentUnpackMode = "img";
-      let currentConvertMode = "img_to_simg";
-      let mgrActivePane = "L";
-      let mgrPaths = { L: "", R: "" };
-      let mgrItems = { L: [], R: [] };
-      let mgrSelected = { L: null, R: null };
-      let mgrModalTarget = null;
+  <script>
+    let dnaState = { current_project: "Default_Project", img_files: [], unpacked_parts: [], zst_files: [], dat_br_files: [], projects: [], logs: [] };
+    let currentUnpackMode = "img";
+    let currentConvertMode = "img_to_simg";
+    let mgrActivePane = "L";
+    let mgrPaths = { L: "", R: "" };
+    let mgrItems = { L: [], R: [] };
+    let mgrSelected = { L: null, R: null };
+    let mgrModalTarget = null;
+    let dnaVaultLoaded = false;
 
-      function switchDnaSub(mode) {
-        const isDna = mode === "dna";
-        document.getElementById("dnaSubSection").classList.toggle("hidden", !isDna);
-        document.getElementById("managerSubSection").classList.toggle("hidden", isDna);
-        document.getElementById("subBtnDna").classList.toggle("active", isDna);
-        document.getElementById("subBtnManager").classList.toggle("active", !isDna);
-        if (!isDna) {
-          loadPane("L");
-          loadPane("R");
-        } else {
-          refreshDnaState();
-        }
-      }
+    function hasFileExt(name, extList) {
+      const low = String(name || "").toLowerCase();
+      return extList.some(ext => low.endsWith("." + ext));
+    }
 
-      function openDnaModal(id) {
-        document.getElementById(id).classList.remove("hidden");
-      }
-
-      function closeDnaModal(id) {
-        document.getElementById(id).classList.add("hidden");
-      }
-
-      function stepVal(id, delta, min, max) {
-        const el = document.getElementById(id);
-        let v = parseInt(el.value || "0", 10) + delta;
-        v = Math.max(min, Math.min(max, v));
-        el.value = v;
-      }
-
-      async function refreshDnaState() {
-        try {
-          const res = await fetch("/api/dna/state", { cache: "no-store" });
-          const data = await res.json();
-          dnaState = data;
-          document.getElementById("dnaProjPathLabel").textContent = "Current project: " + data.project_path;
-          document.getElementById("projModalCurrent").textContent = "Current project: " + data.project_path;
-
-          const sel = document.getElementById("projSelectDropdown");
-          sel.innerHTML = (data.projects || []).map(p => `<option value="${esc(p)}" ${p === data.current_project ? "selected" : ""}>${esc(p)}</option>`).join("");
-
-          const logBox = document.getElementById("dnaLogConsole");
-          if (data.logs && data.logs.length) {
-            logBox.innerHTML = data.logs.map(l => `<div class="${l.level === 'SUCCESS' ? 'text-emerald-400 font-bold' : l.level === 'PACK' ? 'text-amber-300' : 'text-slate-300'}">[${esc(l.ts)}] [${esc(l.level)}] ${esc(l.msg)}</div>`).join("");
-            logBox.scrollTop = logBox.scrollHeight;
-          }
-        } catch (e) {}
-      }
-
-      async function dnaProjectOp(action, name) {
-        const fd = new FormData();
-        fd.append("action", action);
-        fd.append("name", name || "");
-        try {
-          const res = await fetch("/api/dna/project", { method: "POST", body: fd });
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.detail || "Project operation failed");
-          toast("Project updated ✓", "ok");
-          closeDnaModal("projectModal");
-          refreshDnaState();
-          loadPane("L");
-          loadPane("R");
-        } catch (e) {
-          toast(e.message, "bad");
-        }
-      }
-
-      async function loadVaultIntoDnaPicker() {
-        try {
-          const res = await fetch("/api/vault?t=" + Date.now(), { cache: "no-store" });
-          const data = await res.json();
-          const sel = document.getElementById("dnaVaultPicker");
-          const imgs = data.images || [];
-          if (!imgs.length) {
-            sel.innerHTML = `<option value="">No extracted .img files in Vault yet</option>`;
-            return;
-          }
-          sel.innerHTML = imgs.map(img => `<option value="${esc(img.download_url)}||${esc(img.target)}">${esc(img.target)} — ${esc(img.device_name)} (${esc(img.size)})</option>`).join("");
-          toast("Synced " + imgs.length + " Vault image(s) ✓", "ok");
-        } catch (e) {
-          toast("Failed to load Vault list", "bad");
-        }
-      }
-
-      async function importSelectedVaultImg() {
-        const val = document.getElementById("dnaVaultPicker").value;
-        if (!val || !val.includes("||")) {
-          toast("Tap 'Sync Vault' and select an image first", "warn");
-          return;
-        }
-        const [dlUrl, targetName] = val.split("||");
-        toast("Importing " + targetName + " into /sdcard/DNA...", "ok");
-        const fd = new FormData();
-        fd.append("download_url", dlUrl);
-        fd.append("target_name", targetName);
-        try {
-          const res = await fetch("/api/dna/import_vault", { method: "POST", body: fd });
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.detail || "Import failed");
-          toast("Imported " + targetName + " ✓", "ok");
-          refreshDnaState();
-        } catch (e) {
-          toast(e.message, "bad");
-        }
-      }
-
-      /* ---------- UNPACK MODALS ---------- */
-      async function openUnpackModal(mode) {
-        currentUnpackMode = mode;
-        await refreshDnaState();
-        const titleMap = {
-          payload: "Unpack payload.bin",
-          br: "Unpack br",
-          dat: "Unpack dat",
-          img: "Unpack img",
-          zstd: "Unpack zstd",
-          super: "Unpack super"
-        };
-        document.getElementById("unpackModalTitle").textContent = titleMap[mode] || "Unpack img";
-        const box = document.getElementById("unpackFileList");
-        let list = [];
-        if (mode === "zstd") list = dnaState.zst_files.map(x => ({ name: x.name, badge: "zstd • " + x.size }));
-        else if (mode === "br") list = dnaState.dat_br_files.filter(x => x.name.endsWith(".br")).map(x => ({ name: x.name, badge: "br • " + x.size }));
-        else if (mode === "dat") list = dnaState.dat_br_files.filter(x => x.name.endsWith(".new.dat")).map(x => ({ name: x.name, badge: "dat • " + x.size }));
-        else if (mode === "super") list = dnaState.img_files.filter(x => x.name.toLowerCase().includes("super") || x.format.startsWith("super")).map(x => ({ name: x.name, badge: x.format + " • " + x.size }));
-        else if (mode === "payload") list = dnaState.img_files.filter(x => x.name.toLowerCase().includes("payload")).map(x => ({ name: x.name, badge: "CrAU • " + x.size }));
-        else list = dnaState.img_files.map(x => ({ name: x.name, badge: x.format }));
-
-        if (!list.length) {
-          box.innerHTML = `<div class="text-slate-500 py-3 text-center">No matching files in /sdcard/DNA/${esc(dnaState.current_project)}. Import from Vault or upload via Manager!</div>`;
-        } else {
-          box.innerHTML = list.map(item => `
-            <label class="flex items-center justify-between p-2 rounded-xl bg-white/5 hover:bg-white/10 cursor-pointer">
-              <span class="text-slate-200 truncate pr-2">${esc(item.name)} <span class="text-violet-300">(${esc(item.badge)})</span></span>
-              <input type="checkbox" name="unpackChk" value="${esc(item.name)}" checked class="w-4 h-4 accent-violet-500 shrink-0" />
-            </label>
-          `).join("");
-        }
-        openDnaModal("unpackModal");
-      }
-
-      async function submitUnpackModal() {
-        const chks = Array.from(document.querySelectorAll("input[name='unpackChk']:checked")).map(c => c.value);
-        if (!chks.length) {
-          toast("Select at least one file to unpack", "warn");
-          return;
-        }
-        const del = document.getElementById("unpackDelSource").checked;
-        closeDnaModal("unpackModal");
-        toast("Unpacking " + chks.join(", ") + " in cloud root...", "ok");
-        const fd = new FormData();
-        fd.append("mode", currentUnpackMode);
-        fd.append("files", chks.join(","));
-        fd.append("delete_source", del ? "true" : "false");
-        try {
-          const res = await fetch("/api/dna/unpack", { method: "POST", body: fd });
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.detail || "Unpack failed");
-          toast("Unpacked to /sdcard/DNA/" + dnaState.current_project + " ✓", "ok");
-          refreshDnaState();
-        } catch (e) {
-          toast(e.message, "bad");
-        }
-      }
-
-      /* ---------- PACK SINGLE MODAL ---------- */
-      async function openPackSingleModal() {
-        await refreshDnaState();
-        const sel = document.getElementById("psPartSelect");
-        const parts = dnaState.unpacked_parts || [];
-        if (!parts.length) {
-          sel.innerHTML = `<option value="">Please select (Unpack an img first)</option>`;
-        } else {
-          sel.innerHTML = parts.map(p => `<option value="${esc(p.name)}" data-fmt="${esc(p.format)}">${esc(p.name)} (${esc(p.format)})</option>`).join("");
-          document.getElementById("psPackType").value = parts[0].format in { erofs: 1, ext4: 1, f2fs: 1 } ? parts[0].format : "erofs";
-        }
-        sel.onchange = () => {
-          const opt = sel.options[sel.selectedIndex];
-          const fmt = opt ? opt.getAttribute("data-fmt") : "erofs";
-          if (fmt === "erofs" || fmt === "ext4" || fmt === "f2fs") {
-            document.getElementById("psPackType").value = fmt;
-          }
-        };
-        openDnaModal("packSingleModal");
-      }
-
-      async function submitPackSingle() {
-        const part = document.getElementById("psPartSelect").value;
-        if (!part) {
-          toast("Unpack a partition first so you can pack it", "warn");
-          return;
-        }
-        closeDnaModal("packSingleModal");
-        toast("Packing " + part + "...", "ok");
-        const payload = {
-          project: dnaState.current_project,
-          partition: part,
-          pack_type: document.getElementById("psPackType").value,
-          rw_mode: document.getElementById("psRwMode").value,
-          size_mode: document.getElementById("psSizeMode").value,
-          img_format: document.getElementById("psImgFormat").value,
-          file_format: document.getElementById("psFileFormat").value,
-          br_level: parseInt(document.getElementById("psBrLevel").value || "3", 10),
-          erofs_level: parseInt(document.getElementById("psErofsLevel").value || "8", 10),
-          erofs_algo: document.getElementById("psErofsAlgo").value,
-          compress_ext4: document.getElementById("psCompressExt4").checked,
-          remove_avb: document.getElementById("psRemoveAvb").checked
-        };
-        try {
-          const res = await fetch("/api/dna/pack_single", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
-          });
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.detail || "Pack failed");
-          toast("Packed " + data.result.output_file + " (" + data.result.size_mb + ") ✓", "ok");
-          refreshDnaState();
-        } catch (e) {
-          toast(e.message, "bad");
-        }
-      }
-
-      /* ---------- PACK SUPER.IMG MODAL ---------- */
-      async function openPackSuperModal() {
-        await refreshDnaState();
-        const box = document.getElementById("superImgChecklist");
-        const imgs = (dnaState.img_files || []).filter(x => x.name.toLowerCase() !== "super.img");
-        if (!imgs.length) {
-          box.innerHTML = `<div class="text-slate-500 py-2 text-center">Please select (No partition .img files in /sdcard/DNA)</div>`;
-        } else {
-          box.innerHTML = imgs.map(x => `
-            <label class="flex items-center justify-between p-2 rounded-xl bg-white/5 hover:bg-white/10 cursor-pointer">
-              <span class="text-slate-200 truncate pr-2">${esc(x.name)} <span class="text-amber-300">(${esc(x.format)})</span></span>
-              <input type="checkbox" name="superPackChk" value="${esc(x.name)}" checked class="w-4 h-4 accent-amber-400 shrink-0" />
-            </label>
-          `).join("");
-        }
-        openDnaModal("packSuperModal");
-      }
-
-      async function submitPackSuper() {
-        const chks = Array.from(document.querySelectorAll("input[name='superPackChk']:checked")).map(c => c.value);
-        if (!chks.length) {
-          toast("Select at least one .img file to pack into super.img", "warn");
-          return;
-        }
-        closeDnaModal("packSuperModal");
-        toast("Building super.img (" + chks.length + " partitions)...", "ok");
-        const payload = {
-          project: dnaState.current_project,
-          super_type: document.getElementById("superType").value,
-          super_format: document.getElementById("superFormat").value,
-          total_size_gb: parseFloat(document.getElementById("superTotalGb").value || "8.5"),
-          group_name: document.getElementById("superGroup").value,
-          selected_imgs: chks
-        };
-        try {
-          const res = await fetch("/api/dna/pack_super", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
-          });
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.detail || "super.img build failed");
-          toast("Built super.img (" + data.result.size_mb + ") ✓", "ok");
-          refreshDnaState();
-        } catch (e) {
-          toast(e.message, "bad");
-        }
-      }
-
-      /* ---------- PACK ZSTD & FORMAT CONVERSION MODALS ---------- */
-      async function openPackZstdModal() {
-        await refreshDnaState();
-        const sel = document.getElementById("zstdImgSelect");
-        sel.innerHTML = (dnaState.img_files || []).map(x => `<option value="${esc(x.name)}">${esc(x.name)} (${esc(x.size)})</option>`).join("");
-        openDnaModal("packZstdModal");
-      }
-
-      async function submitPackZstd() {
-        const fn = document.getElementById("zstdImgSelect").value;
-        if (!fn) return toast("No image selected", "warn");
-        closeDnaModal("packZstdModal");
-        const fd = new FormData();
-        fd.append("filename", fn);
-        fd.append("level", document.getElementById("zstdLevelInput").value || "6");
-        const res = await fetch("/api/dna/pack_zstd", { method: "POST", body: fd });
-        const data = await res.json();
-        if (res.ok) { toast("Compressed to " + fn + ".zst ✓", "ok"); refreshDnaState(); }
-        else toast(data.detail || "Zstd pack failed", "bad");
-      }
-
-      async function openConvertModal(mode) {
-        currentConvertMode = mode;
-        await refreshDnaState();
-        document.getElementById("convertModalTitle").textContent = mode === "img_to_simg" ? "img to simg (Raw ⇄ Sparse)" : "img to dat, br";
-        document.getElementById("convBrWrap").classList.toggle("hidden", mode !== "img_to_dat_br");
-        const sel = document.getElementById("convImgSelect");
-        sel.innerHTML = (dnaState.img_files || []).map(x => `<option value="${esc(x.name)}">${esc(x.name)} (${esc(x.format)} • ${esc(x.size)})</option>`).join("");
-        openDnaModal("convertModal");
-      }
-
-      async function submitConvertModal() {
-        const fn = document.getElementById("convImgSelect").value;
-        if (!fn) return toast("Select an .img file first", "warn");
-        closeDnaModal("convertModal");
-        toast("Converting " + fn + "...", "ok");
-        const fd = new FormData();
-        fd.append("mode", currentConvertMode);
-        fd.append("filename", fn);
-        fd.append("br_level", document.getElementById("convBrLevel").value || "3");
-        const res = await fetch("/api/dna/convert", { method: "POST", body: fd });
-        const data = await res.json();
-        if (res.ok) { toast("Conversion complete ✓", "ok"); refreshDnaState(); }
-        else toast(data.detail || "Conversion failed", "bad");
-      }
-
-      /* ---------- DUAL-PANE ROOT MANAGER ---------- */
-      function setActivePane(p) {
-        mgrActivePane = p;
-        document.getElementById("mgrActivePaneIndicator").textContent = p === "L" ? "LEFT" : "RIGHT";
-        document.getElementById("mgrPaneWrapL").className = "glass rounded-3xl p-3.5 space-y-2 " + (p === "L" ? "border-2 border-violet-500/60" : "border border-white/10");
-        document.getElementById("mgrPaneWrapR").className = "glass rounded-3xl p-3.5 space-y-2 " + (p === "R" ? "border-2 border-emerald-500/60" : "border border-white/10");
-      }
-
-      async function loadPane(p, customRel) {
-        if (typeof customRel === "string") mgrPaths[p] = customRel;
-        try {
-          const res = await fetch("/api/dna/fs/list?path=" + encodeURIComponent(mgrPaths[p] || ""), { cache: "no-store" });
-          const data = await res.json();
-          mgrPaths[p] = data.current_rel || "";
-          mgrItems[p] = data.items || [];
-          document.getElementById("mgrPath" + p).textContent = data.display_path;
-          renderPaneList(p);
-        } catch (e) {}
-      }
-
-      function renderPaneList(p) {
-        const box = document.getElementById("mgrList" + p);
-        const items = mgrItems[p] || [];
-        if (!items.length) {
-          box.innerHTML = `<div class="text-slate-500 py-6 text-center text-[10px]">Empty directory</div>`;
-          return;
-        }
-        box.innerHTML = items.map((it, idx) => {
-          const isSel = mgrSelected[p] && mgrSelected[p].rel_path === it.rel_path;
-          const icon = it.is_dir ? "📁" : it.is_link ? "🔗" : it.name.endsWith(".img") ? "💿" : it.name.endsWith(".apex") || it.name.endsWith(".apk") || it.name.endsWith(".zip") ? "📦" : "📄";
-          return `
-            <div onclick="mgrSelectRow('${p}', ${idx}, event)" ondblclick="mgrOpenRow('${p}', ${idx})" class="flex items-center justify-between p-2 rounded-xl cursor-pointer transition ${isSel ? 'bg-violet-500/25 border border-violet-400/40' : 'bg-black/35 hover:bg-white/5 border border-transparent'}">
-              <div class="min-w-0 flex-1 pr-2">
-                <div class="flex items-center gap-1.5">
-                  <span>${icon}</span>
-                  <span class="${it.is_dir ? 'text-amber-300 font-bold' : 'text-slate-100'} truncate">${esc(it.name)}</span>
-                  ${it.is_link ? `<span class="text-[9px] text-sky-300">→ ${esc(it.link_target)}</span>` : ''}
-                </div>
-                <div class="text-[9px] text-slate-400 mt-0.5">${esc(it.size_str)} • ${esc(it.mode)} (${esc(it.owner)}) • ${esc(it.mtime)}</div>
-              </div>
-              <button onclick="mgrInspectItem('${p}', ${idx}, event)" class="px-2 py-1 rounded-lg bg-white/5 hover:bg-white/15 text-[10px] text-violet-300 shrink-0">•••</button>
-            </div>
-          `;
-        }).join("");
-      }
-
-      function mgrSelectRow(p, idx, ev) {
-        if (ev) ev.stopPropagation();
-        setActivePane(p);
-        const it = mgrItems[p][idx];
-        if (mgrSelected[p] && mgrSelected[p].rel_path === it.rel_path) {
-          mgrOpenRow(p, idx);
-          return;
-        }
-        mgrSelected[p] = it;
-        renderPaneList(p);
-      }
-
-      function mgrOpenRow(p, idx) {
-        const it = mgrItems[p][idx];
-        if (!it) return;
-        if (it.is_dir) {
-          loadPane(p, it.rel_path);
-        } else {
-          mgrInspectItem(p, idx);
-        }
-      }
-
-      function mgrUp(p) {
-        const cur = mgrPaths[p] || "";
-        if (!cur) return;
-        const parts = cur.split("/");
-        parts.pop();
-        loadPane(p, parts.join("/"));
-      }
-
-      async function mgrInspectItem(p, idx, ev) {
-        if (ev) ev.stopPropagation();
-        setActivePane(p);
-        const it = mgrItems[p][idx];
-        if (!it) return;
-        mgrSelected[p] = it;
-        mgrModalTarget = it;
-        renderPaneList(p);
-
-        document.getElementById("mgrModalName").textContent = it.name;
-        document.getElementById("mgrModalPath").textContent = "/sdcard/DNA/" + dnaState.current_project + "/" + it.rel_path;
-        document.getElementById("mgrPermMode").value = it.mode || (it.is_dir ? "0755" : "0644");
-        const [u, g] = (it.owner || "0:0").split(":");
-        document.getElementById("mgrPermUid").value = u || "0";
-        document.getElementById("mgrPermGid").value = g || "0";
-        document.getElementById("mgrPermSelinux").value = it.selinux || "u:object_r:system_file:s0";
-
-        const isArc = !it.is_dir && /\.(apex|apk|zip|jar)$/i.test(it.name);
-        const isUnpackedArc = it.is_dir && it.name.endsWith("_unpacked");
-        document.getElementById("mgrBtnMount").classList.toggle("hidden", !isArc);
-        document.getElementById("mgrBtnRepack").classList.toggle("hidden", !isUnpackedArc);
-        document.getElementById("mgrBtnDownload").classList.toggle("hidden", it.is_dir);
-        document.getElementById("mgrBtnVault").classList.toggle("hidden", it.is_dir);
-        if (!it.is_dir) {
-          document.getElementById("mgrBtnDownload").href = "/api/dna/fs/download?path=" + encodeURIComponent(it.rel_path);
-        }
-
-        const edWrap = document.getElementById("mgrEditorWrap");
-        if (!it.is_dir && it.size < 2 * 1024 * 1024 && !/\.(img|bin|simg|br|zst|so|odex|vdex|art)$/i.test(it.name)) {
-          edWrap.classList.remove("hidden");
-          document.getElementById("mgrTextEditor").value = "Loading...";
-          try {
-            const res = await fetch("/api/dna/fs/read?path=" + encodeURIComponent(it.rel_path));
-            const data = await res.json();
-            document.getElementById("mgrTextEditor").value = res.ok ? data.content : ("Cannot edit binary file: " + (data.detail || ""));
-          } catch (e) {
-            document.getElementById("mgrTextEditor").value = "";
-          }
-        } else {
-          edWrap.classList.add("hidden");
-        }
-        openDnaModal("mgrItemModal");
-      }
-
-      async function mgrSaveTextFile() {
-        if (!mgrModalTarget) return;
-        const fd = new FormData();
-        fd.append("path", mgrModalTarget.rel_path);
-        fd.append("content", document.getElementById("mgrTextEditor").value);
-        const res = await fetch("/api/dna/fs/write", { method: "POST", body: fd });
-        if (res.ok) {
-          toast("Saved " + mgrModalTarget.name + " ✓", "ok");
-          loadPane("L"); loadPane("R");
-        } else {
-          toast("Failed to save file", "bad");
-        }
-      }
-
-      async function mgrApplyPerms() {
-        if (!mgrModalTarget) return;
-        const fd = new FormData();
-        fd.append("op", "chmod_chcon");
-        fd.append("src", mgrModalTarget.rel_path);
-        fd.append("mode", document.getElementById("mgrPermMode").value.trim());
-        fd.append("uid", document.getElementById("mgrPermUid").value.trim());
-        fd.append("gid", document.getElementById("mgrPermGid").value.trim());
-        fd.append("selinux", document.getElementById("mgrPermSelinux").value.trim());
-        fd.append("recursive", document.getElementById("mgrPermRecurse").checked ? "true" : "false");
-        const res = await fetch("/api/dna/fs/op", { method: "POST", body: fd });
-        if (res.ok) {
-          toast("Permissions & SELinux updated ✓", "ok");
-          loadPane("L"); loadPane("R");
-        } else {
-          toast("Failed to update permissions", "bad");
-        }
-      }
-
-      async function mgrCopyMove(op) {
-        const srcPane = mgrActivePane;
-        const dstPane = srcPane === "L" ? "R" : "L";
-        const item = mgrSelected[srcPane];
-        if (!item) return toast("Tap a file or folder in the " + (srcPane === "L" ? "LEFT" : "RIGHT") + " pane first", "warn");
-        const fd = new FormData();
-        fd.append("op", op);
-        fd.append("src", item.rel_path);
-        fd.append("dst", mgrPaths[dstPane] || "");
-        const res = await fetch("/api/dna/fs/op", { method: "POST", body: fd });
-        if (res.ok) {
-          toast((op === "copy" ? "Copied " : "Moved ") + item.name + " → other pane ✓", "ok");
-          loadPane("L"); loadPane("R");
-        } else {
-          toast("Operation failed", "bad");
-        }
-      }
-
-      async function mgrNewFolder() {
-        const name = prompt("Enter new folder name:");
-        if (!name) return;
-        const base = mgrPaths[mgrActivePane];
-        const rel = base ? (base + "/" + name) : name;
-        const fd = new FormData();
-        fd.append("op", "mkdir");
-        fd.append("src", rel);
-        await fetch("/api/dna/fs/op", { method: "POST", body: fd });
-        loadPane(mgrActivePane);
-      }
-
-      async function mgrNewFile() {
-        const name = prompt("Enter new file name (e.g. build.prop, custom.rc):");
-        if (!name) return;
-        const base = mgrPaths[mgrActivePane];
-        const rel = base ? (base + "/" + name) : name;
-        const fd = new FormData();
-        fd.append("path", rel);
-        fd.append("content", "# Created in Cloud Manager\n");
-        await fetch("/api/dna/fs/write", { method: "POST", body: fd });
-        loadPane(mgrActivePane);
-      }
-
-      async function mgrSymlink() {
-        const linkName = prompt("Symlink name in current directory:");
-        if (!linkName) return;
-        const target = prompt("Symlink target path (e.g. /system/product/priv-app):");
-        if (!target) return;
-        const base = mgrPaths[mgrActivePane];
-        const rel = base ? (base + "/" + linkName) : linkName;
-        const fd = new FormData();
-        fd.append("op", "symlink");
-        fd.append("src", rel);
-        fd.append("dst", target);
-        await fetch("/api/dna/fs/op", { method: "POST", body: fd });
-        toast("Symlink created ✓", "ok");
-        loadPane(mgrActivePane);
-      }
-
-      async function mgrRenameItem() {
-        if (!mgrModalTarget) return;
-        const newName = prompt("Rename to:", mgrModalTarget.name);
-        if (!newName || newName === mgrModalTarget.name) return;
-        const parts = mgrModalTarget.rel_path.split("/");
-        parts.pop();
-        parts.push(newName);
-        const fd = new FormData();
-        fd.append("op", "rename");
-        fd.append("src", mgrModalTarget.rel_path);
-        fd.append("dst", parts.join("/"));
-        await fetch("/api/dna/fs/op", { method: "POST", body: fd });
-        closeDnaModal("mgrItemModal");
-        loadPane("L"); loadPane("R");
-      }
-
-      async function mgrDeleteItem() {
-        if (!mgrModalTarget) return;
-        if (!confirm("Delete '" + mgrModalTarget.name + "'?")) return;
-        const fd = new FormData();
-        fd.append("op", "delete");
-        fd.append("src", mgrModalTarget.rel_path);
-        await fetch("/api/dna/fs/op", { method: "POST", body: fd });
-        closeDnaModal("mgrItemModal");
-        toast("Deleted ✓", "ok");
-        loadPane("L"); loadPane("R");
+    function switchDnaSub(mode) {
+      const isDna = mode === "dna";
+      document.getElementById("dnaSubSection").classList.toggle("hidden", !isDna);
+      document.getElementById("managerSubSection").classList.toggle("hidden", isDna);
+      document.getElementById("subBtnDna").classList.toggle("active", isDna);
+      document.getElementById("subBtnManager").classList.toggle("active", !isDna);
+      if (!isDna) {
+        loadPane("L");
+        loadPane("R");
+      } else {
         refreshDnaState();
       }
+    }
 
-      async function mgrMountArchive() {
-        if (!mgrModalTarget) return;
-        const fd = new FormData();
-        fd.append("op", "mount_archive");
-        fd.append("src", mgrModalTarget.rel_path);
-        const res = await fetch("/api/dna/fs/op", { method: "POST", body: fd });
-        if (res.ok) {
-          closeDnaModal("mgrItemModal");
-          toast("Unpacked " + mgrModalTarget.name + " for editing ✓", "ok");
-          loadPane("L"); loadPane("R");
-        }
+    function openDnaModal(id) {
+      document.getElementById(id).classList.remove("hidden");
+    }
+
+    function closeDnaModal(id) {
+      document.getElementById(id).classList.add("hidden");
+    }
+
+    function stepVal(id, delta, min, max) {
+      const el = document.getElementById(id);
+      let v = parseInt(el.value || "0", 10) + delta;
+      v = Math.max(min, Math.min(max, v));
+      el.value = v;
+    }
+
+    async function refreshDnaState() {
+      if (!dnaVaultLoaded) {
+        dnaVaultLoaded = true;
+        loadVaultIntoDnaPicker();
       }
-
-      async function mgrRepackArchive() {
-        if (!mgrModalTarget) return;
-        const fd = new FormData();
-        fd.append("op", "repack_archive");
-        fd.append("src", mgrModalTarget.rel_path);
-        const res = await fetch("/api/dna/fs/op", { method: "POST", body: fd });
-        if (res.ok) {
-          closeDnaModal("mgrItemModal");
-          toast("Repacked archive ✓", "ok");
-          loadPane("L"); loadPane("R");
-        }
-      }
-
-      async function mgrUploadFile(input) {
-        if (!input.files || !input.files[0]) return;
-        const file = input.files[0];
-        toast("Uploading " + file.name + "...", "ok");
-        const fd = new FormData();
-        fd.append("path", mgrPaths[mgrActivePane] || "");
-        fd.append("file", file);
-        const res = await fetch("/api/dna/fs/upload", { method: "POST", body: fd });
-        input.value = "";
-        if (res.ok) {
-          toast("Uploaded " + file.name + " ✓", "ok");
-          loadPane(mgrActivePane);
-          refreshDnaState();
-        } else {
-          toast("Upload failed", "bad");
-        }
-      }
-
-      async function mgrPushVault() {
-        if (!mgrModalTarget) return;
-        toast("Uploading " + mgrModalTarget.name + " to Permanent Vault...", "ok");
-        const fd = new FormData();
-        fd.append("filename", mgrModalTarget.rel_path);
-        const res = await fetch("/api/dna/push_vault", { method: "POST", body: fd });
+      try {
+        const res = await fetch("/api/dna/state", { cache: "no-store" });
         const data = await res.json();
-        if (res.ok) {
-          toast("Saved to Vault ✓", "ok");
-        } else {
-          toast(data.detail || "Vault upload failed", "bad");
+        dnaState = data;
+        document.getElementById("dnaProjPathLabel").textContent = "Current project: " + data.project_path;
+        document.getElementById("projModalCurrent").textContent = "Current project: " + data.project_path;
+
+        const sel = document.getElementById("projSelectDropdown");
+        sel.innerHTML = (data.projects || []).map(p => `<option value="${esc(p)}" ${p === data.current_project ? "selected" : ""}>${esc(p)}</option>`).join("");
+
+        const logBox = document.getElementById("dnaLogConsole");
+        if (data.logs && data.logs.length) {
+          logBox.innerHTML = data.logs.map(l => `<div class="${l.level === 'SUCCESS' ? 'text-emerald-400 font-bold' : l.level === 'PACK' ? 'text-amber-300' : 'text-slate-300'}">[${esc(l.ts)}] [${esc(l.level)}] ${esc(l.msg)}</div>`).join("");
+          logBox.scrollTop = logBox.scrollHeight;
         }
+      } catch (e) {}
+    }
+
+    async function dnaProjectOp(action, name) {
+      const fd = new FormData();
+      fd.append("action", action);
+      fd.append("name", name || "");
+      try {
+        const res = await fetch("/api/dna/project", { method: "POST", body: fd });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Project operation failed");
+        toast("Project updated ✓", "ok");
+        closeDnaModal("projectModal");
+        refreshDnaState();
+        loadPane("L");
+        loadPane("R");
+      } catch (e) {
+        toast(e.message, "bad");
       }
-    </script>
+    }
+
+    async function loadVaultIntoDnaPicker() {
+      try {
+        const res = await fetch("/api/vault?t=" + Date.now(), { cache: "no-store" });
+        const data = await res.json();
+        const sel = document.getElementById("dnaVaultPicker");
+        const imgs = data.images || [];
+        if (!imgs.length) {
+          sel.innerHTML = `<option value="">No extracted .img files in Vault yet</option>`;
+          return;
+        }
+        sel.innerHTML = imgs.map(img => `<option value="${esc(img.download_url)}||${esc(img.target)}">${esc(img.target)} — ${esc(img.device_name)} (${esc(img.size)})</option>`).join("");
+      } catch (e) {
+        toast("Failed to load Vault list", "bad");
+      }
+    }
+
+    async function importSelectedVaultImg() {
+      const val = document.getElementById("dnaVaultPicker").value;
+      if (!val || !val.includes("||")) {
+        toast("Select an image from the Vault dropdown first", "warn");
+        return;
+      }
+      const [dlUrl, targetName] = val.split("||");
+      toast("Importing " + targetName + " into /sdcard/DNA...", "ok");
+      const fd = new FormData();
+      fd.append("download_url", dlUrl);
+      fd.append("target_name", targetName);
+      try {
+        const res = await fetch("/api/dna/import_vault", { method: "POST", body: fd });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Import failed");
+        toast("Imported " + targetName + " to /sdcard/DNA ✓", "ok");
+        refreshDnaState();
+      } catch (e) {
+        toast(e.message, "bad");
+      }
+    }
+
+    async function dnaDirectUpload(input) {
+      if (!input.files || !input.files[0]) return;
+      const file = input.files[0];
+      toast("Uploading " + file.name + " to /sdcard/DNA...", "ok");
+      const fd = new FormData();
+      fd.append("path", "");
+      fd.append("file", file);
+      const res = await fetch("/api/dna/fs/upload", { method: "POST", body: fd });
+      input.value = "";
+      if (res.ok) {
+        toast("Uploaded " + file.name + " ✓", "ok");
+        refreshDnaState();
+      } else {
+        toast("Upload failed", "bad");
+      }
+    }
+
+    /* ---------- UNPACK MODALS ---------- */
+    async function openUnpackModal(mode) {
+      currentUnpackMode = mode;
+      await refreshDnaState();
+      const titleMap = {
+        payload: "Unpack payload.bin",
+        br: "Unpack br",
+        dat: "Unpack dat",
+        img: "Unpack img",
+        zstd: "Unpack zstd",
+        super: "Unpack super"
+      };
+      document.getElementById("unpackModalTitle").textContent = titleMap[mode] || "Unpack img";
+      const box = document.getElementById("unpackFileList");
+      let list = [];
+      if (mode === "zstd") list = (dnaState.zst_files || []).map(x => ({ name: x.name, badge: "zstd • " + x.size }));
+      else if (mode === "br") list = (dnaState.dat_br_files || []).filter(x => x.name.endsWith(".br")).map(x => ({ name: x.name, badge: "br • " + x.size }));
+      else if (mode === "dat") list = (dnaState.dat_br_files || []).filter(x => x.name.endsWith(".new.dat")).map(x => ({ name: x.name, badge: "dat • " + x.size }));
+      else if (mode === "super") list = (dnaState.img_files || []).filter(x => x.name.toLowerCase().includes("super") || x.format.startsWith("super")).map(x => ({ name: x.name, badge: x.format + " • " + x.size }));
+      else if (mode === "payload") list = (dnaState.img_files || []).filter(x => x.name.toLowerCase().includes("payload")).map(x => ({ name: x.name, badge: "CrAU • " + x.size }));
+      else list = (dnaState.img_files || []).map(x => ({ name: x.name, badge: x.format + " • " + x.size }));
+
+      if (!list.length) {
+        box.innerHTML = `<div class="text-slate-400 py-3 text-center">No matching files in /sdcard/DNA/${esc(dnaState.current_project)} yet. Use the green '📥 Import' button at the top of DNA to pull an .img from your Vault!</div>`;
+      } else {
+        box.innerHTML = list.map(item => `
+          <label class="flex items-center justify-between p-2 rounded-xl bg-white/5 hover:bg-white/10 cursor-pointer">
+            <span class="text-slate-200 truncate pr-2">${esc(item.name)} <span class="text-violet-300">(${esc(item.badge)})</span></span>
+            <input type="checkbox" name="unpackChk" value="${esc(item.name)}" checked class="w-4 h-4 accent-violet-500 shrink-0" />
+          </label>
+        `).join("");
+      }
+      openDnaModal("unpackModal");
+    }
+
+    async function submitUnpackModal() {
+      const chks = Array.from(document.querySelectorAll("input[name='unpackChk']:checked")).map(c => c.value);
+      if (!chks.length) {
+        toast("Import or select at least one file to unpack", "warn");
+        return;
+      }
+      const del = document.getElementById("unpackDelSource").checked;
+      closeDnaModal("unpackModal");
+      toast("Unpacking " + chks.join(", ") + " in cloud root...", "ok");
+      const fd = new FormData();
+      fd.append("mode", currentUnpackMode);
+      fd.append("files", chks.join(","));
+      fd.append("delete_source", del ? "true" : "false");
+      try {
+        const res = await fetch("/api/dna/unpack", { method: "POST", body: fd });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Unpack failed");
+        toast("Unpacked to /sdcard/DNA/" + dnaState.current_project + " ✓", "ok");
+        refreshDnaState();
+      } catch (e) {
+        toast(e.message, "bad");
+      }
+    }
+
+    /* ---------- PACK SINGLE MODAL ---------- */
+    async function openPackSingleModal() {
+      await refreshDnaState();
+      const sel = document.getElementById("psPartSelect");
+      const parts = dnaState.unpacked_parts || [];
+      if (!parts.length) {
+        sel.innerHTML = `<option value="">Please select (Unpack an img first)</option>`;
+      } else {
+        sel.innerHTML = parts.map(p => `<option value="${esc(p.name)}" data-fmt="${esc(p.format)}">${esc(p.name)} (${esc(p.format)})</option>`).join("");
+        document.getElementById("psPackType").value = (parts[0].format === "erofs" || parts[0].format === "ext4" || parts[0].format === "f2fs") ? parts[0].format : "erofs";
+      }
+      sel.onchange = () => {
+        const opt = sel.options[sel.selectedIndex];
+        const fmt = opt ? opt.getAttribute("data-fmt") : "erofs";
+        if (fmt === "erofs" || fmt === "ext4" || fmt === "f2fs") {
+          document.getElementById("psPackType").value = fmt;
+        }
+      };
+      openDnaModal("packSingleModal");
+    }
+
+    async function submitPackSingle() {
+      const part = document.getElementById("psPartSelect").value;
+      if (!part) {
+        toast("Unpack a partition first so you can pack it", "warn");
+        return;
+      }
+      closeDnaModal("packSingleModal");
+      toast("Packing " + part + "...", "ok");
+      const payload = {
+        project: dnaState.current_project,
+        partition: part,
+        pack_type: document.getElementById("psPackType").value,
+        rw_mode: document.getElementById("psRwMode").value,
+        size_mode: document.getElementById("psSizeMode").value,
+        img_format: document.getElementById("psImgFormat").value,
+        file_format: document.getElementById("psFileFormat").value,
+        br_level: parseInt(document.getElementById("psBrLevel").value || "3", 10),
+        erofs_level: parseInt(document.getElementById("psErofsLevel").value || "8", 10),
+        erofs_algo: document.getElementById("psErofsAlgo").value,
+        compress_ext4: document.getElementById("psCompressExt4").checked,
+        remove_avb: document.getElementById("psRemoveAvb").checked
+      };
+      try {
+        const res = await fetch("/api/dna/pack_single", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Pack failed");
+        toast("Packed " + data.result.output_file + " (" + data.result.size_mb + ") ✓", "ok");
+        refreshDnaState();
+      } catch (e) {
+        toast(e.message, "bad");
+      }
+    }
+
+    /* ---------- PACK SUPER.IMG MODAL ---------- */
+    async function openPackSuperModal() {
+      await refreshDnaState();
+      const box = document.getElementById("superImgChecklist");
+      const imgs = (dnaState.img_files || []).filter(x => x.name.toLowerCase() !== "super.img");
+      if (!imgs.length) {
+        box.innerHTML = `<div class="text-slate-400 py-2 text-center">Please select (Import partition .img files into /sdcard/DNA first)</div>`;
+      } else {
+        box.innerHTML = imgs.map(x => `
+          <label class="flex items-center justify-between p-2 rounded-xl bg-white/5 hover:bg-white/10 cursor-pointer">
+            <span class="text-slate-200 truncate pr-2">${esc(x.name)} <span class="text-amber-300">(${esc(x.format)})</span></span>
+            <input type="checkbox" name="superPackChk" value="${esc(x.name)}" checked class="w-4 h-4 accent-amber-400 shrink-0" />
+          </label>
+        `).join("");
+      }
+      openDnaModal("packSuperModal");
+    }
+
+    async function submitPackSuper() {
+      const chks = Array.from(document.querySelectorAll("input[name='superPackChk']:checked")).map(c => c.value);
+      if (!chks.length) {
+        toast("Select at least one .img file to pack into super.img", "warn");
+        return;
+      }
+      closeDnaModal("packSuperModal");
+      toast("Building super.img (" + chks.length + " partitions)...", "ok");
+      const payload = {
+        project: dnaState.current_project,
+        super_type: document.getElementById("superType").value,
+        super_format: document.getElementById("superFormat").value,
+        total_size_gb: parseFloat(document.getElementById("superTotalGb").value || "8.5"),
+        group_name: document.getElementById("superGroup").value,
+        selected_imgs: chks
+      };
+      try {
+        const res = await fetch("/api/dna/pack_super", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "super.img build failed");
+        toast("Built super.img (" + data.result.size_mb + ") ✓", "ok");
+        refreshDnaState();
+      } catch (e) {
+        toast(e.message, "bad");
+      }
+    }
+
+    /* ---------- PACK ZSTD & FORMAT CONVERSION MODALS ---------- */
+    async function openPackZstdModal() {
+      await refreshDnaState();
+      const sel = document.getElementById("zstdImgSelect");
+      const imgs = dnaState.img_files || [];
+      sel.innerHTML = imgs.length ? imgs.map(x => `<option value="${esc(x.name)}">${esc(x.name)} (${esc(x.size)})</option>`).join("") : `<option value="">No .img files in /sdcard/DNA yet</option>`;
+      openDnaModal("packZstdModal");
+    }
+
+    async function submitPackZstd() {
+      const fn = document.getElementById("zstdImgSelect").value;
+      if (!fn) return toast("Import an .img file first", "warn");
+      closeDnaModal("packZstdModal");
+      const fd = new FormData();
+      fd.append("filename", fn);
+      fd.append("level", document.getElementById("zstdLevelInput").value || "6");
+      const res = await fetch("/api/dna/pack_zstd", { method: "POST", body: fd });
+      const data = await res.json();
+      if (res.ok) { toast("Compressed to " + fn + ".zst ✓", "ok"); refreshDnaState(); }
+      else toast(data.detail || "Zstd pack failed", "bad");
+    }
+
+    async function openConvertModal(mode) {
+      currentConvertMode = mode;
+      await refreshDnaState();
+      document.getElementById("convertModalTitle").textContent = mode === "img_to_simg" ? "img to simg (Raw ⇄ Sparse)" : "img to dat, br";
+      document.getElementById("convBrWrap").classList.toggle("hidden", mode !== "img_to_dat_br");
+      const sel = document.getElementById("convImgSelect");
+      const imgs = dnaState.img_files || [];
+      sel.innerHTML = imgs.length ? imgs.map(x => `<option value="${esc(x.name)}">${esc(x.name)} (${esc(x.format)} • ${esc(x.size)})</option>`).join("") : `<option value="">No .img files in /sdcard/DNA yet</option>`;
+      openDnaModal("convertModal");
+    }
+
+    async function submitConvertModal() {
+      const fn = document.getElementById("convImgSelect").value;
+      if (!fn) return toast("Import an .img file first", "warn");
+      closeDnaModal("convertModal");
+      toast("Converting " + fn + "...", "ok");
+      const fd = new FormData();
+      fd.append("mode", currentConvertMode);
+      fd.append("filename", fn);
+      fd.append("br_level", document.getElementById("convBrLevel").value || "3");
+      const res = await fetch("/api/dna/convert", { method: "POST", body: fd });
+      const data = await res.json();
+      if (res.ok) { toast("Conversion complete ✓", "ok"); refreshDnaState(); }
+      else toast(data.detail || "Conversion failed", "bad");
+    }
+
+    /* ---------- DUAL-PANE ROOT MANAGER ---------- */
+    function setActivePane(p) {
+      mgrActivePane = p;
+      document.getElementById("mgrActivePaneIndicator").textContent = p === "L" ? "LEFT" : "RIGHT";
+      document.getElementById("mgrPaneWrapL").className = "glass rounded-3xl p-3.5 space-y-2 " + (p === "L" ? "border-2 border-violet-500/60" : "border border-white/10");
+      document.getElementById("mgrPaneWrapR").className = "glass rounded-3xl p-3.5 space-y-2 " + (p === "R" ? "border-2 border-emerald-500/60" : "border border-white/10");
+    }
+
+    async function loadPane(p, customRel) {
+      if (typeof customRel === "string") mgrPaths[p] = customRel;
+      try {
+        const res = await fetch("/api/dna/fs/list?path=" + encodeURIComponent(mgrPaths[p] || ""), { cache: "no-store" });
+        const data = await res.json();
+        mgrPaths[p] = data.current_rel || "";
+        mgrItems[p] = data.items || [];
+        document.getElementById("mgrPath" + p).textContent = data.display_path;
+        renderPaneList(p);
+      } catch (e) {}
+    }
+
+    function renderPaneList(p) {
+      const box = document.getElementById("mgrList" + p);
+      const items = mgrItems[p] || [];
+      if (!items.length) {
+        box.innerHTML = `<div class="text-slate-500 py-6 text-center text-[10px]">Empty directory</div>`;
+        return;
+      }
+      box.innerHTML = items.map((it, idx) => {
+        const isSel = mgrSelected[p] && mgrSelected[p].rel_path === it.rel_path;
+        const icon = it.is_dir ? "📁" : it.is_link ? "🔗" : it.name.endsWith(".img") ? "💿" : hasFileExt(it.name, ["apex", "apk", "zip"]) ? "📦" : "📄";
+        return `
+          <div onclick="mgrSelectRow('${p}', ${idx}, event)" ondblclick="mgrOpenRow('${p}', ${idx})" class="flex items-center justify-between p-2 rounded-xl cursor-pointer transition ${isSel ? 'bg-violet-500/25 border border-violet-400/40' : 'bg-black/35 hover:bg-white/5 border border-transparent'}">
+            <div class="min-w-0 flex-1 pr-2">
+              <div class="flex items-center gap-1.5">
+                <span>${icon}</span>
+                <span class="${it.is_dir ? 'text-amber-300 font-bold' : 'text-slate-100'} truncate">${esc(it.name)}</span>
+                ${it.is_link ? `<span class="text-[9px] text-sky-300">→ ${esc(it.link_target)}</span>` : ''}
+              </div>
+              <div class="text-[9px] text-slate-400 mt-0.5">${esc(it.size_str)} • ${esc(it.mode)} (${esc(it.owner)}) • ${esc(it.mtime)}</div>
+            </div>
+            <button type="button" onclick="mgrInspectItem('${p}', ${idx}, event)" class="px-2 py-1 rounded-lg bg-white/5 hover:bg-white/15 text-[10px] text-violet-300 shrink-0">•••</button>
+          </div>
+        `;
+      }).join("");
+    }
+
+    function mgrSelectRow(p, idx, ev) {
+      if (ev) ev.stopPropagation();
+      setActivePane(p);
+      const it = mgrItems[p][idx];
+      if (mgrSelected[p] && mgrSelected[p].rel_path === it.rel_path) {
+        mgrOpenRow(p, idx);
+        return;
+      }
+      mgrSelected[p] = it;
+      renderPaneList(p);
+    }
+
+    function mgrOpenRow(p, idx) {
+      const it = mgrItems[p][idx];
+      if (!it) return;
+      if (it.is_dir) {
+        loadPane(p, it.rel_path);
+      } else {
+        mgrInspectItem(p, idx);
+      }
+    }
+
+    function mgrUp(p) {
+      const cur = mgrPaths[p] || "";
+      if (!cur) return;
+      const parts = cur.split("/");
+      parts.pop();
+      loadPane(p, parts.join("/"));
+    }
+
+    async function mgrInspectItem(p, idx, ev) {
+      if (ev) ev.stopPropagation();
+      setActivePane(p);
+      const it = mgrItems[p][idx];
+      if (!it) return;
+      mgrSelected[p] = it;
+      mgrModalTarget = it;
+      renderPaneList(p);
+
+      document.getElementById("mgrModalName").textContent = it.name;
+      document.getElementById("mgrModalPath").textContent = "/sdcard/DNA/" + dnaState.current_project + "/" + it.rel_path;
+      document.getElementById("mgrPermMode").value = it.mode || (it.is_dir ? "0755" : "0644");
+      const [u, g] = (it.owner || "0:0").split(":");
+      document.getElementById("mgrPermUid").value = u || "0";
+      document.getElementById("mgrPermGid").value = g || "0";
+      document.getElementById("mgrPermSelinux").value = it.selinux || "u:object_r:system_file:s0";
+
+      const isArc = !it.is_dir && hasFileExt(it.name, ["apex", "apk", "zip", "jar"]);
+      const isUnpackedArc = it.is_dir && it.name.endsWith("_unpacked");
+      document.getElementById("mgrBtnMount").classList.toggle("hidden", !isArc);
+      document.getElementById("mgrBtnRepack").classList.toggle("hidden", !isUnpackedArc);
+      document.getElementById("mgrBtnDownload").classList.toggle("hidden", it.is_dir);
+      document.getElementById("mgrBtnVault").classList.toggle("hidden", it.is_dir);
+      if (!it.is_dir) {
+        document.getElementById("mgrBtnDownload").href = "/api/dna/fs/download?path=" + encodeURIComponent(it.rel_path);
+      }
+
+      const edWrap = document.getElementById("mgrEditorWrap");
+      const isBinaryExt = hasFileExt(it.name, ["img", "bin", "simg", "br", "zst", "so", "odex", "vdex", "art"]);
+      if (!it.is_dir && it.size < 2 * 1024 * 1024 && !isBinaryExt) {
+        edWrap.classList.remove("hidden");
+        document.getElementById("mgrTextEditor").value = "Loading...";
+        try {
+          const res = await fetch("/api/dna/fs/read?path=" + encodeURIComponent(it.rel_path));
+          const data = await res.json();
+          document.getElementById("mgrTextEditor").value = res.ok ? data.content : ("Cannot edit binary file: " + (data.detail || ""));
+        } catch (e) {
+          document.getElementById("mgrTextEditor").value = "";
+        }
+      } else {
+        edWrap.classList.add("hidden");
+      }
+      openDnaModal("mgrItemModal");
+    }
+
+    async function mgrSaveTextFile() {
+      if (!mgrModalTarget) return;
+      const fd = new FormData();
+      fd.append("path", mgrModalTarget.rel_path);
+      fd.append("content", document.getElementById("mgrTextEditor").value);
+      const res = await fetch("/api/dna/fs/write", { method: "POST", body: fd });
+      if (res.ok) {
+        toast("Saved " + mgrModalTarget.name + " ✓", "ok");
+        loadPane("L"); loadPane("R");
+      } else {
+        toast("Failed to save file", "bad");
+      }
+    }
+
+    async function mgrApplyPerms() {
+      if (!mgrModalTarget) return;
+      const fd = new FormData();
+      fd.append("op", "chmod_chcon");
+      fd.append("src", mgrModalTarget.rel_path);
+      fd.append("mode", document.getElementById("mgrPermMode").value.trim());
+      fd.append("uid", document.getElementById("mgrPermUid").value.trim());
+      fd.append("gid", document.getElementById("mgrPermGid").value.trim());
+      fd.append("selinux", document.getElementById("mgrPermSelinux").value.trim());
+      fd.append("recursive", document.getElementById("mgrPermRecurse").checked ? "true" : "false");
+      const res = await fetch("/api/dna/fs/op", { method: "POST", body: fd });
+      if (res.ok) {
+        toast("Permissions & SELinux updated ✓", "ok");
+        loadPane("L"); loadPane("R");
+      } else {
+        toast("Failed to update permissions", "bad");
+      }
+    }
+
+    async function mgrCopyMove(op) {
+      const srcPane = mgrActivePane;
+      const dstPane = srcPane === "L" ? "R" : "L";
+      const item = mgrSelected[srcPane];
+      if (!item) return toast("Tap a file or folder in the " + (srcPane === "L" ? "LEFT" : "RIGHT") + " pane first", "warn");
+      const fd = new FormData();
+      fd.append("op", op);
+      fd.append("src", item.rel_path);
+      fd.append("dst", mgrPaths[dstPane] || "");
+      const res = await fetch("/api/dna/fs/op", { method: "POST", body: fd });
+      if (res.ok) {
+        toast((op === "copy" ? "Copied " : "Moved ") + item.name + " → other pane ✓", "ok");
+        loadPane("L"); loadPane("R");
+      } else {
+        toast("Operation failed", "bad");
+      }
+    }
+
+    async function mgrNewFolder() {
+      const name = prompt("Enter new folder name:");
+      if (!name) return;
+      const base = mgrPaths[mgrActivePane];
+      const rel = base ? (base + "/" + name) : name;
+      const fd = new FormData();
+      fd.append("op", "mkdir");
+      fd.append("src", rel);
+      await fetch("/api/dna/fs/op", { method: "POST", body: fd });
+      loadPane(mgrActivePane);
+    }
+
+    async function mgrNewFile() {
+      const name = prompt("Enter new file name (e.g. build.prop, custom.rc):");
+      if (!name) return;
+      const base = mgrPaths[mgrActivePane];
+      const rel = base ? (base + "/" + name) : name;
+      const fd = new FormData();
+      fd.append("path", rel);
+      fd.append("content", "# Created in Cloud Manager");
+      await fetch("/api/dna/fs/write", { method: "POST", body: fd });
+      loadPane(mgrActivePane);
+    }
+
+    async function mgrSymlink() {
+      const linkName = prompt("Symlink name in current directory:");
+      if (!linkName) return;
+      const target = prompt("Symlink target path (e.g. /system/product/priv-app):");
+      if (!target) return;
+      const base = mgrPaths[mgrActivePane];
+      const rel = base ? (base + "/" + linkName) : linkName;
+      const fd = new FormData();
+      fd.append("op", "symlink");
+      fd.append("src", rel);
+      fd.append("dst", target);
+      await fetch("/api/dna/fs/op", { method: "POST", body: fd });
+      toast("Symlink created ✓", "ok");
+      loadPane(mgrActivePane);
+    }
+
+    async function mgrRenameItem() {
+      if (!mgrModalTarget) return;
+      const newName = prompt("Rename to:", mgrModalTarget.name);
+      if (!newName || newName === mgrModalTarget.name) return;
+      const parts = mgrModalTarget.rel_path.split("/");
+      parts.pop();
+      parts.push(newName);
+      const fd = new FormData();
+      fd.append("op", "rename");
+      fd.append("src", mgrModalTarget.rel_path);
+      fd.append("dst", parts.join("/"));
+      await fetch("/api/dna/fs/op", { method: "POST", body: fd });
+      closeDnaModal("mgrItemModal");
+      loadPane("L"); loadPane("R");
+    }
+
+    async function mgrDeleteItem() {
+      if (!mgrModalTarget) return;
+      if (!confirm("Delete '" + mgrModalTarget.name + "'?")) return;
+      const fd = new FormData();
+      fd.append("op", "delete");
+      fd.append("src", mgrModalTarget.rel_path);
+      await fetch("/api/dna/fs/op", { method: "POST", body: fd });
+      closeDnaModal("mgrItemModal");
+      toast("Deleted ✓", "ok");
+      loadPane("L"); loadPane("R");
+      refreshDnaState();
+    }
+
+    async function mgrMountArchive() {
+      if (!mgrModalTarget) return;
+      const fd = new FormData();
+      fd.append("op", "mount_archive");
+      fd.append("src", mgrModalTarget.rel_path);
+      const res = await fetch("/api/dna/fs/op", { method: "POST", body: fd });
+      if (res.ok) {
+        closeDnaModal("mgrItemModal");
+        toast("Unpacked " + mgrModalTarget.name + " for editing ✓", "ok");
+        loadPane("L"); loadPane("R");
+      }
+    }
+
+    async function mgrRepackArchive() {
+      if (!mgrModalTarget) return;
+      const fd = new FormData();
+      fd.append("op", "repack_archive");
+      fd.append("src", mgrModalTarget.rel_path);
+      const res = await fetch("/api/dna/fs/op", { method: "POST", body: fd });
+      if (res.ok) {
+        closeDnaModal("mgrItemModal");
+        toast("Repacked archive ✓", "ok");
+        loadPane("L"); loadPane("R");
+      }
+    }
+
+    async function mgrUploadFile(input) {
+      if (!input.files || !input.files[0]) return;
+      const file = input.files[0];
+      toast("Uploading " + file.name + "...", "ok");
+      const fd = new FormData();
+      fd.append("path", mgrPaths[mgrActivePane] || "");
+      fd.append("file", file);
+      const res = await fetch("/api/dna/fs/upload", { method: "POST", body: fd });
+      input.value = "";
+      if (res.ok) {
+        toast("Uploaded " + file.name + " ✓", "ok");
+        loadPane(mgrActivePane);
+        refreshDnaState();
+      } else {
+        toast("Upload failed", "bad");
+      }
+    }
+
+    async function mgrPushVault() {
+      if (!mgrModalTarget) return;
+      toast("Uploading " + mgrModalTarget.name + " to Permanent Vault...", "ok");
+      const fd = new FormData();
+      fd.append("filename", mgrModalTarget.rel_path);
+      const res = await fetch("/api/dna/push_vault", { method: "POST", body: fd });
+      const data = await res.json();
+      if (res.ok) {
+        toast("Saved to Vault ✓", "ok");
+      } else {
+        toast(data.detail || "Vault upload failed", "bad");
+      }
+    }
+  </script>
 """
 
 def inject_dna_ui(html_page: str) -> str:
@@ -2331,3 +2368,7 @@ def inject_dna_ui(html_page: str) -> str:
         'if (view === "vault") loadVault(false);\n      if (view === "dna") { refreshDnaState(); loadPane("L"); loadPane("R"); }'
     )
     return html_page
+
+             
+
+
