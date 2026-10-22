@@ -1,21 +1,20 @@
 import os
 import re
-import io
-import stat
 import time
+import uuid
 import json
 import zlib
 import shutil
 import struct
 import zipfile
-import tarfile
 import hashlib
-import gc
-import tempfile
+import threading
 import subprocess
+import requests
 import zstandard as zstd
 from datetime import datetime
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Header, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional
 
@@ -27,152 +26,212 @@ except ImportError:
 
 router = APIRouter(prefix="/api/dna")
 
-# Local working storage is deliberately treated as a cache on Render. Set DNA_BASE_DIR
-# to a persistent mounted path if one is available. Completed project data is synced to HF.
-DNA_BASE_DIR = os.environ.get("DNA_BASE_DIR", "/tmp/sdcard_DNA")
-os.makedirs(DNA_BASE_DIR, exist_ok=True)
-_DNA_HF = {"api": None, "repo": None, "token": None, "download": None}
-_DNA_RESTORED_PROJECTS = set()
-_DNA_SYNCING = set()
+DNA_BASE_DIR = "/tmp/sdcard_DNA"
+USERS_ROOT_DIR = os.path.join(DNA_BASE_DIR, "users")
+TASKS_TMP_DIR = os.path.join(DNA_BASE_DIR, "_tasks")
+USERS_DB_FILE = os.path.join(DNA_BASE_DIR, "users_db.json")
+os.makedirs(USERS_ROOT_DIR, exist_ok=True)
+os.makedirs(TASKS_TMP_DIR, exist_ok=True)
 
 SPARSE_MAGIC = 0xED26FF3A
 LP_GEOMETRY_MAGIC = 0x616C4467
 LP_HEADER_MAGIC = 0x414C5030
+HEAD_BYTES = 1 << 20
 MB = 1024 * 1024
+ADMIN_PASS = "7352676143"
 
-DNA_STATE = {"current_project": "Default_Project", "logs": []}
+AUTH_LOCK = threading.Lock()
+USERS_DB = {}          # u_low -> {"username", "pw_hash", "plain_pw", "ip", "banned", "created_at"}
+BANNED_IPS = set()
+SESSIONS = {}          # token -> u_low
+USER_STATES = {}       # u_low -> {"current_project": str, "logs": list}
+BG_TASKS = {}          # task_id -> {"state", "pct", "label", "error"}
 
-def release_working_memory() -> None:
-    """Collect unreachable Python objects and ask glibc to return free arenas when possible."""
-    gc.collect()
+HF_API_REF = None
+DATASET_REPO_REF = ""
+HF_TOKEN_REF = ""
+
+# ---------------- USER AUTH & ADMIN BAN SYSTEM ---------------- #
+
+def _client_ip(req: Request) -> str:
+    xff = req.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return req.client.host if req.client else "0.0.0.0"
+
+def _hash_pw(username: str, password: str) -> str:
+    salt = f"hyperflux_dna_salt::{username.strip().lower()}"
+    return hashlib.sha256(f"{salt}::{password}".encode("utf-8")).hexdigest()
+
+def _rebuild_ban_set():
+    BANNED_IPS.clear()
+    for u_obj in USERS_DB.values():
+        if isinstance(u_obj, dict) and u_obj.get("banned") and u_obj.get("ip"):
+            BANNED_IPS.add(u_obj["ip"])
+
+def _load_users_db():
+    global USERS_DB
+    if os.path.exists(USERS_DB_FILE):
+        try:
+            with open(USERS_DB_FILE, "r", encoding="utf-8") as f:
+                USERS_DB = json.load(f)
+        except Exception:
+            USERS_DB = {}
+    if HF_API_REF and DATASET_REPO_REF:
+        try:
+            if HF_API_REF.file_exists(repo_id=DATASET_REPO_REF, filename="users_db.json", repo_type="dataset"):
+                from huggingface_hub import hf_hub_download
+                local_p = hf_hub_download(
+                    repo_id=DATASET_REPO_REF,
+                    filename="users_db.json",
+                    repo_type="dataset",
+                    token=HF_TOKEN_REF if HF_TOKEN_REF else None,
+                    force_download=True
+                )
+                with open(local_p, "r", encoding="utf-8") as f:
+                    remote_db = json.load(f)
+                if isinstance(remote_db, dict):
+                    USERS_DB.update(remote_db)
+                    with open(USERS_DB_FILE, "w", encoding="utf-8") as fw:
+                        json.dump(USERS_DB, fw, indent=2)
+        except Exception:
+            pass
+    _rebuild_ban_set()
+
+def _save_users_db():
+    _rebuild_ban_set()
     try:
-        import ctypes
-        libc = ctypes.CDLL("libc.so.6")
-        trim = getattr(libc, "malloc_trim", None)
-        if trim is not None:
-            trim(0)
+        with open(USERS_DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(USERS_DB, f, indent=2)
+        if HF_API_REF and DATASET_REPO_REF and HF_TOKEN_REF:
+            threading.Thread(
+                target=lambda: HF_API_REF.upload_file(
+                    path_or_fileobj=USERS_DB_FILE,
+                    path_in_repo="users_db.json",
+                    repo_id=DATASET_REPO_REF,
+                    repo_type="dataset",
+                    commit_message="Sync DNA users & bans DB"
+                ),
+                daemon=True
+            ).start()
     except Exception:
-        # Non-glibc platforms simply skip the optional trim.
         pass
 
-def _clean_project_name(proj: Optional[str] = None) -> str:
-    return re.sub(r"[^a-zA-Z0-9._-]", "_", (proj or DNA_STATE["current_project"]).strip()) or "Default_Project"
+def get_user_state(username: str) -> dict:
+    u = re.sub(r"[^a-zA-Z0-9_-]", "_", username.strip().lower()) or "guest"
+    if u not in USER_STATES:
+        USER_STATES[u] = {"current_project": "Default_Project", "logs": []}
+    return USER_STATES[u]
 
-def _hf_project_prefix(name: str) -> str:
-    return f"dna_projects/{_clean_project_name(name)}"
+def resolve_user_from_token(token: Optional[str]) -> str:
+    if not token:
+        raise HTTPException(status_code=401, detail="Please Sign In first.")
+    t = token.replace("Bearer ", "").strip()
+    u_low = SESSIONS.get(t)
+    if not u_low and t.startswith("u:"):
+        parts = t.split(":")
+        if len(parts) == 3:
+            cand, sig = parts[1], parts[2]
+            u_obj = USERS_DB.get(cand)
+            if u_obj:
+                expected = hashlib.sha256(f"{cand}::{u_obj['pw_hash']}::flux".encode()).hexdigest()[:24]
+                if sig == expected:
+                    SESSIONS[t] = cand
+                    u_low = cand
+    if not u_low:
+        raise HTTPException(status_code=401, detail="Session expired. Please Sign In again.")
+    if USERS_DB.get(u_low, {}).get("banned"):
+        raise HTTPException(status_code=403, detail="BANNED: Your account has been banned by Admin.")
+    return u_low
 
-def restore_project_from_hf(project_name: str, project_dir: str) -> None:
-    """Restore a project's files from the configured HF dataset once per process."""
-    name = _clean_project_name(project_name)
-    if name in _DNA_RESTORED_PROJECTS or not _DNA_HF.get("api") or not _DNA_HF.get("repo"):
-        return
-    # Mark before doing network I/O to avoid recursive/repeated restore attempts.
-    _DNA_RESTORED_PROJECTS.add(name)
-    api = _DNA_HF["api"]
-    prefix = _hf_project_prefix(name).rstrip("/") + "/"
-    try:
-        files = api.list_repo_files(repo_id=_DNA_HF["repo"], repo_type="dataset", token=_DNA_HF.get("token"))
-        remote_files = [f for f in files if f.startswith(prefix) and not f.endswith("/")]
-        if not remote_files:
-            return
-        from huggingface_hub import hf_hub_download
-        for remote in remote_files:
-            rel = remote[len(prefix):]
-            # Reject paths that could escape the project directory.
-            if not rel or os.path.isabs(rel) or ".." in rel.replace("\\", "/").split("/"):
-                continue
-            dest = os.path.abspath(os.path.join(project_dir, rel))
-            if os.path.commonpath([os.path.abspath(project_dir), dest]) != os.path.abspath(project_dir):
-                continue
-            if os.path.isfile(dest):
-                continue
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            cached = hf_hub_download(repo_id=_DNA_HF["repo"], filename=remote, repo_type="dataset", token=_DNA_HF.get("token"))
-            partial = dest + ".hfrestore.partial"
-            try:
-                shutil.copyfile(cached, partial)
-                os.replace(partial, dest)
-            finally:
-                if os.path.exists(partial):
-                    os.remove(partial)
-        dna_log("VAULT", f"Restored project '{name}' from Hugging Face Vault ({len(remote_files)} files).")
-    except Exception as exc:
-        _DNA_RESTORED_PROJECTS.discard(name)
-        dna_log("ERROR", f"HF restore for project '{name}' failed: {type(exc).__name__}: {exc}")
+def make_user_token(u_low: str, pw_hash: str) -> str:
+    sig = hashlib.sha256(f"{u_low}::{pw_hash}::flux".encode()).hexdigest()[:24]
+    tok = f"u:{u_low}:{sig}"
+    SESSIONS[tok] = u_low
+    return tok
 
-def sync_project_to_hf(project_dir: str, project_name: Optional[str] = None) -> bool:
-    """Upload a completed project snapshot to the HF dataset; never upload transient work files."""
-    api = _DNA_HF.get("api")
-    repo = _DNA_HF.get("repo")
-    if not api or not repo:
-        return False
-    name = _clean_project_name(project_name or os.path.basename(project_dir))
-    if name in _DNA_SYNCING:
-        return False
-    _DNA_SYNCING.add(name)
-    try:
-        prefix = _hf_project_prefix(name)
-        api.upload_folder(
-            folder_path=project_dir,
-            path_in_repo=prefix,
-            repo_id=repo,
-            repo_type="dataset",
-            token=_DNA_HF.get("token"),
-            ignore_patterns=["*.raw_unpack", ".dna_unpack_*", "*.partial", "*.tmp", "__pycache__/**"]
-        )
-        # Mirror deletions too; otherwise removed local files would return on the next restore.
-        local_rel = set()
-        for root, dirs, files in os.walk(project_dir, followlinks=False):
-            dirs[:] = [d for d in dirs if not d.startswith(".dna_unpack_") and d != "__pycache__"]
-            for fn in files:
-                if fn.endswith((".raw_unpack", ".partial", ".tmp")):
-                    continue
-                full = os.path.join(root, fn)
-                local_rel.add(os.path.relpath(full, project_dir).replace(os.sep, "/"))
-        remote_prefix = prefix.rstrip("/") + "/"
-        remote_files = api.list_repo_files(repo_id=repo, repo_type="dataset", token=_DNA_HF.get("token"))
-        stale = [f for f in remote_files if f.startswith(remote_prefix) and f[len(remote_prefix):] not in local_rel]
-        if stale:
-            from huggingface_hub import CommitOperationDelete
-            api.create_commit(
-                repo_id=repo,
-                repo_type="dataset",
-                token=_DNA_HF.get("token"),
-                commit_message=f"Sync deletions for DNA project {name}",
-                operations=[CommitOperationDelete(path_in_repo=f) for f in stale]
-            )
-        dna_log("VAULT", f"Persisted project '{name}' to HF dataset at '{prefix}'.")
-        return True
-    except Exception as exc:
-        dna_log("ERROR", f"HF persistence failed for '{name}': {type(exc).__name__}: {exc}")
-        return False
-    finally:
-        _DNA_SYNCING.discard(name)
-        release_working_memory()
+def get_user_root(username: str) -> str:
+    u_clean = re.sub(r"[^a-zA-Z0-9_-]", "_", username.strip().lower())
+    root = os.path.join(USERS_ROOT_DIR, u_clean)
+    os.makedirs(root, exist_ok=True)
+    if not os.listdir(root):
+        dp = os.path.join(root, "Default_Project")
+        os.makedirs(os.path.join(dp, "config"), exist_ok=True)
+    return root
 
-def get_proj_dir(proj: Optional[str] = None) -> str:
-    name = _clean_project_name(proj)
-    DNA_STATE["current_project"] = name
-    p = os.path.join(DNA_BASE_DIR, name)
-    os.makedirs(p, exist_ok=True)
+def get_proj_dir(username: str, proj: Optional[str] = None) -> str:
+    ustate = get_user_state(username)
+    u_root = get_user_root(username)
+    raw_name = (proj if proj is not None else ustate["current_project"]).strip()
+    name = re.sub(r"[^a-zA-Z0-9._-]", "_", raw_name) or "Default_Project"
+    ustate["current_project"] = name
+    p = os.path.join(u_root, name)
     os.makedirs(os.path.join(p, "config"), exist_ok=True)
-    restore_project_from_hf(name, p)
     return p
 
-def dna_log(level: str, msg: str):
+def dna_log(username: str, level: str, msg: str):
+    ustate = get_user_state(username)
     ts = datetime.now().strftime("%H:%M:%S")
-    DNA_STATE["logs"].append({"ts": ts, "level": level, "msg": msg})
-    if len(DNA_STATE["logs"]) > 250:
-        DNA_STATE["logs"] = DNA_STATE["logs"][-250:]
+    ustate["logs"].append({"ts": ts, "level": level, "msg": msg})
+    if len(ustate["logs"]) > 200:
+        ustate["logs"] = ustate["logs"][-200:]
 
 def safe_join(base: str, rel: str) -> str:
     rel_clean = (rel or "").lstrip("/\\")
     full = os.path.abspath(os.path.join(base, rel_clean))
-    if not full.startswith(os.path.abspath(base)):
+    base_abs = os.path.abspath(base)
+    if full != base_abs and not full.startswith(base_abs + os.sep):
         raise HTTPException(status_code=400, detail="Path traversal blocked.")
     return full
 
+def create_bg_task(initial_label: str) -> str:
+    tid = uuid.uuid4().hex[:10]
+    BG_TASKS[tid] = {"state": "running", "pct": 2, "label": initial_label, "error": None}
+    return tid
+
+def set_bg_task(tid: str, pct: int, label: str = None):
+    if tid in BG_TASKS:
+        BG_TASKS[tid]["pct"] = max(1, min(99, int(pct)))
+        if label:
+            BG_TASKS[tid]["label"] = label
+
+# ---------------- PERMISSIONS OCTAL <-> SYMBOLIC HELPERS ---------------- #
+
+def mode_octal_to_symbolic(oct_str: str, is_dir: bool = False, is_link: bool = False) -> str:
+    prefix = "d" if is_dir else ("l" if is_link else "-")
+    try:
+        val = int(str(oct_str).strip(), 8)
+    except Exception:
+        val = 0o755 if is_dir else 0o644
+    c = [
+        "r" if (val & 0o400) else "-",
+        "w" if (val & 0o200) else "-",
+        ("s" if (val & 0o100) else "S") if (val & 0o4000) else ("x" if (val & 0o100) else "-"),
+        "r" if (val & 0o040) else "-",
+        "w" if (val & 0o020) else "-",
+        ("s" if (val & 0o010) else "S") if (val & 0o2000) else ("x" if (val & 0o010) else "-"),
+        "r" if (val & 0o004) else "-",
+        "w" if (val & 0o002) else "-",
+        ("t" if (val & 0o001) else "T") if (val & 0o1000) else ("x" if (val & 0o001) else "-"),
+    ]
+    return prefix + "".join(c)
+
+def format_short_octal(oct_str: str) -> str:
+    try:
+        v = int(str(oct_str).strip(), 8)
+        return f"{v:04o}" if v > 0o777 else f"{v:03o}"
+    except Exception:
+        return "644"
+
 # ---------------- FILESYSTEM & IMAGE FORMAT DETECTOR ---------------- #
+
+def is_sparse_file(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            b4 = f.read(4)
+            return len(b4) == 4 and struct.unpack("<I", b4)[0] == SPARSE_MAGIC
+    except Exception:
+        return False
 
 def detect_img_type(path: str) -> str:
     if not os.path.isfile(path):
@@ -190,11 +249,10 @@ def detect_img_type(path: str) -> str:
         if len(head) < 16:
             return "raw"
         if struct.unpack_from("<I", head, 0)[0] == SPARSE_MAGIC:
-            # Peek inside first RAW chunk of sparse image to see inner filesystem
             fhs, chs = struct.unpack_from("<HH", head, 8)
             pos = fhs
             while pos + chs <= len(head):
-                ctype, _r, _csz, tsz = struct.unpack_from("<HHII", head, pos[:12] if isinstance(pos, slice) else pos)
+                ctype, _r, _csz, tsz = struct.unpack_from("<HHII", head, pos)
                 if ctype == 0xCAC1 and pos + chs + 4096 <= len(head):
                     inner = head[pos + chs:pos + chs + 8192]
                     if len(inner) >= 4100 and struct.unpack_from("<I", inner, 4096)[0] == LP_GEOMETRY_MAGIC:
@@ -222,17 +280,17 @@ def detect_img_type(path: str) -> str:
         pass
     return "raw"
 
-# ---------------- SPARSE <-> RAW CONVERTERS (simg2img / img2simg) ---------------- #
+# ---------------- ZERO-COPY SPARSE <-> RAW CONVERTERS ---------------- #
 
 def sparse_to_raw(src_path: str, dst_path: str):
-    with open(src_path, "rb") as f:
-        magic = struct.unpack("<I", f.read(4))[0]
-        if magic != SPARSE_MAGIC:
+    """Converts sparse image to raw. Caller checks is_sparse_file() first to avoid duplicating raw images."""
+    if not is_sparse_file(src_path):
+        if os.path.abspath(src_path) != os.path.abspath(dst_path):
             shutil.copyfile(src_path, dst_path)
-            return
+        return
     if shutil.which("simg2img"):
         r = subprocess.run(["simg2img", src_path, dst_path], capture_output=True, text=True)
-        if r.returncode == 0 and os.path.exists(dst_path):
+        if r.returncode == 0 and os.path.exists(dst_path) and os.path.getsize(dst_path) > 0:
             return
     with open(src_path, "rb") as src, open(dst_path, "wb") as dst:
         hdr = src.read(28)
@@ -243,6 +301,8 @@ def sparse_to_raw(src_path: str, dst_path: str):
         out_off = 0
         for _ in range(tchunks):
             ch = src.read(chs)
+            if len(ch) < 12:
+                break
             ctype, _r, csz, tsz = struct.unpack("<HHII", ch[:12])
             nbytes = csz * blk
             if ctype == 0xCAC1:
@@ -267,41 +327,43 @@ def sparse_to_raw(src_path: str, dst_path: str):
             elif ctype == 0xCAC3:
                 pass
             elif ctype == 0xCAC4:
-                src.seek(tsz - chs, os.SEEK_CUR)
+                src.seek(max(0, tsz - chs), os.SEEK_CUR)
             out_off += nbytes
 
 def raw_to_sparse(src_path: str, dst_path: str, block_size: int = 4096):
     if shutil.which("img2simg"):
         r = subprocess.run(["img2simg", src_path, dst_path, str(block_size)], capture_output=True, text=True)
-        if r.returncode == 0 and os.path.exists(dst_path):
+        if r.returncode == 0 and os.path.exists(dst_path) and os.path.getsize(dst_path) > 0:
             return
     total_size = os.path.getsize(src_path)
     total_blocks = (total_size + block_size - 1) // block_size
-    chunks = []
+    # Two-pass streaming sparse writer so we NEVER hold gigabytes of chunks in RAM!
+    chunk_meta = []
     with open(src_path, "rb") as src:
         b_idx = 0
         while b_idx < total_blocks:
             buf = src.read(block_size * 1024)
             if not buf:
                 break
-            if len(buf) % block_size != 0:
-                buf += b"\x00" * (block_size - (len(buf) % block_size))
-            n_blks = len(buf) // block_size
-            if buf == b"\x00" * len(buf):
-                chunks.append((0xCAC3, n_blks, b""))
-            else:
-                chunks.append((0xCAC1, n_blks, buf))
+            n_blks = (len(buf) + block_size - 1) // block_size
+            is_zero = (buf == b"\x00" * len(buf))
+            chunk_meta.append((0xCAC3 if is_zero else 0xCAC1, n_blks))
             b_idx += n_blks
 
-    with open(dst_path, "wb") as dst:
-        dst.write(struct.pack("<IHHHHIIII", SPARSE_MAGIC, 1, 0, 28, 12, block_size, total_blocks, len(chunks), 0))
-        for ctype, n_blks, data in chunks:
-            tsz = 12 + len(data)
-            dst.write(struct.pack("<HHII", ctype, 0, n_blks, tsz))
-            if data:
-                dst.write(data)
+    with open(src_path, "rb") as src, open(dst_path, "wb") as dst:
+        dst.write(struct.pack("<IHHHHIIII", SPARSE_MAGIC, 1, 0, 28, 12, block_size, total_blocks, len(chunk_meta), 0))
+        for ctype, n_blks in chunk_meta:
+            raw_bytes = n_blks * block_size
+            buf = src.read(raw_bytes)
+            if ctype == 0xCAC3:
+                dst.write(struct.pack("<HHII", 0xCAC3, 0, n_blks, 12))
+            else:
+                if len(buf) < raw_bytes:
+                    buf += b"\x00" * (raw_bytes - len(buf))
+                dst.write(struct.pack("<HHII", 0xCAC1, 0, n_blks, 12 + raw_bytes))
+                dst.write(buf)
 
-# ---------------- SDAT2IMG & IMG2SDAT (AOSP .new.dat & .new.dat.br) ---------------- #
+# ---------------- SDAT2IMG & IMG2SDAT ---------------- #
 
 def sdat2img_convert(transfer_path: str, dat_path: str, out_img: str):
     BLOCK_SIZE = 4096
@@ -339,8 +401,10 @@ def sdat2img_convert(transfer_path: str, dat_path: str, out_img: str):
                     left -= len(chunk)
 
 def img2sdat_convert(src_img: str, out_dir: str, prefix: str) -> tuple:
-    raw_tmp = src_img + ".raw_tmp"
-    sparse_to_raw(src_img, raw_tmp)
+    need_tmp = is_sparse_file(src_img)
+    raw_tmp = src_img + ".raw_tmp" if need_tmp else src_img
+    if need_tmp:
+        sparse_to_raw(src_img, raw_tmp)
     src_use = raw_tmp if os.path.exists(raw_tmp) else src_img
 
     BLOCK_SIZE = 4096
@@ -352,7 +416,6 @@ def img2sdat_convert(src_img: str, out_dir: str, prefix: str) -> tuple:
     open(patch_path, "wb").close()
 
     new_ranges = []
-    new_blocks_count = 0
     with open(src_use, "rb") as src, open(dat_path, "wb") as dat:
         b = 0
         while b < total_blocks:
@@ -368,7 +431,6 @@ def img2sdat_convert(src_img: str, out_dir: str, prefix: str) -> tuple:
                     new_ranges[-1] = (new_ranges[-1][0], b + n)
                 else:
                     new_ranges.append((b, b + n))
-                new_blocks_count += n
             b += n
 
     flat = []
@@ -382,147 +444,179 @@ def img2sdat_convert(src_img: str, out_dir: str, prefix: str) -> tuple:
             tl.write(f"erase 2,0,{total_blocks}\n")
             tl.write(f"new {len(flat)},{','.join(flat)}\n")
 
-    if os.path.exists(raw_tmp):
+    if need_tmp and os.path.exists(raw_tmp):
         os.remove(raw_tmp)
     return dat_path, tl_path
 
 # ---------------- FS_CONFIG & FILE_CONTEXTS GENERATOR ---------------- #
 
 def generate_fs_metadata(part_name: str, extract_dir: str, config_dir: str, detected_fmt: str = "erofs"):
-    """Write metadata incrementally so huge partitions don't require giant Python lists."""
-    os.makedirs(config_dir, exist_ok=True)
     fs_cfg_path = os.path.join(config_dir, f"{part_name}_fs_config")
     fc_path = os.path.join(config_dir, f"{part_name}_file_contexts")
     info_path = os.path.join(config_dir, f"{part_name}_info.json")
+
+    existing_cfg = {}
+    if os.path.exists(fs_cfg_path):
+        try:
+            for line in open(fs_cfg_path, encoding="utf-8", errors="ignore"):
+                sp = line.strip().split()
+                if len(sp) >= 4:
+                    existing_cfg[sp[0]] = sp[1:]
+        except Exception:
+            pass
+
     default_ctx = f"u:object_r:{part_name}_file:s0" if part_name in ("vendor", "odm", "product", "system_ext") else "u:object_r:system_file:s0"
-    try:
-        with open(fs_cfg_path, "w", encoding="utf-8") as fs, open(fc_path, "w", encoding="utf-8") as fc:
-            fs.write("/ 0 0 0755\n")
-            fs.write(f"{part_name} 0 0 0755\n")
-            fc.write(f"/ {default_ctx}\n")
-            fc.write(f"/{part_name}(/.*)? {default_ctx}\n")
-            for root, dirs, files in os.walk(extract_dir, followlinks=False):
-                dirs.sort()
-                files.sort()
-                rel_root = os.path.relpath(root, extract_dir).replace("\\", "/")
-                if rel_root == ".": rel_root = ""
-                for d in dirs:
-                    rp = f"{part_name}/{rel_root}/{d}".replace("//", "/") if rel_root else f"{part_name}/{d}"
-                    full = os.path.join(root, d)
-                    if os.path.islink(full):
-                        target = os.readlink(full)
-                        fs.write(f"{rp} 0 0 0777 {target}\n")
-                    else:
-                        fs.write(f"{rp} 0 0 0755\n")
-                    fc.write(f"/{re.escape(rp)} {default_ctx}\n")
-                for fn in files:
-                    full_p = os.path.join(root, fn)
-                    rp = f"{part_name}/{rel_root}/{fn}".replace("//", "/") if rel_root else f"{part_name}/{fn}"
-                    is_exec = "/bin/" in f"/{rp}" or "/xbin/" in f"/{rp}" or fn.endswith(".sh")
-                    mode = "0755" if is_exec else "0644"
-                    uid_gid = "0 2000" if is_exec else "0 0"
-                    if os.path.islink(full_p):
-                        fs.write(f"{rp} 0 0 0777 {os.readlink(full_p)}\n")
-                    else:
-                        fs.write(f"{rp} {uid_gid} {mode}\n")
-                    fc.write(f"/{re.escape(rp)} {default_ctx}\n")
+    fs_lines = ["/ 0 0 0755", f"{part_name} 0 0 0755"]
+    fc_lines = [f"/ {default_ctx}", f"/{part_name}(/.*)? {default_ctx}"]
+
+    for root, dirs, files in os.walk(extract_dir):
+        rel_root = os.path.relpath(root, extract_dir).replace("\\", "/")
+        if rel_root == ".":
+            rel_root = ""
+        for d in sorted(dirs):
+            rp = f"{part_name}/{rel_root}/{d}".replace("//", "/") if rel_root else f"{part_name}/{d}"
+            fs_lines.append(f"{rp} {' '.join(existing_cfg[rp])}" if rp in existing_cfg else f"{rp} 0 0 0755")
+            fc_lines.append(f"/{re.escape(rp)} {default_ctx}")
+        for fn in sorted(files):
+            full_p = os.path.join(root, fn)
+            rp = f"{part_name}/{rel_root}/{fn}".replace("//", "/") if rel_root else f"{part_name}/{fn}"
+            if rp in existing_cfg:
+                fs_lines.append(f"{rp} {' '.join(existing_cfg[rp])}")
+            else:
+                is_exec = "/bin/" in f"/{rp}" or "/xbin/" in f"/{rp}" or fn.endswith(".sh")
+                mode = "0755" if is_exec else ("0600" if fn == "build.prop" else "0644")
+                uid_gid = "0 2000" if is_exec else "0 0"
+                if os.path.islink(full_p):
+                    fs_lines.append(f"{rp} 0 0 0644 {os.readlink(full_p)}")
+                else:
+                    fs_lines.append(f"{rp} {uid_gid} {mode}")
+            fc_lines.append(f"/{re.escape(rp)} {default_ctx}")
+
+    with open(fs_cfg_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(fs_lines) + "\n")
+    with open(fc_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(fc_lines) + "\n")
+    if not os.path.exists(info_path):
         with open(info_path, "w", encoding="utf-8") as f:
             json.dump({"part_name": part_name, "detected_format": detected_fmt, "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, f, indent=2)
-    finally:
-        release_working_memory()
 
-# ---------------- UNPACK PARTITION IMAGE (EROFS / EXT4 / F2FS / SPARSE) ---------------- #
+# ---------------- UNPACK PARTITION IMAGE (ZERO-COPY WHEN RAW) ---------------- #
 
-def unpack_single_img_file(proj_dir: str, img_filename: str, delete_source: bool = False) -> dict:
-    """Extract safely to staging; never report a fake success or overwrite good output on failure."""
+def unpack_single_img_file(username: str, proj_dir: str, img_filename: str, delete_source: bool = False, tid: str = None) -> dict:
     src_path = safe_join(proj_dir, img_filename)
     if not os.path.isfile(src_path):
-        raise HTTPException(status_code=404, detail=f"Image not found: {img_filename}")
+        raise Exception(f"File not found: {img_filename}")
+
     part_name = re.sub(r"\.(img|bin|simg)$", "", os.path.basename(img_filename), flags=re.I)
     part_name = re.sub(r"_(a|b)$", "", part_name)
-    if not part_name or part_name in (".", ".."):
-        raise HTTPException(status_code=400, detail="Invalid partition filename.")
-    final_dir = os.path.join(proj_dir, part_name)
+    out_dir = os.path.join(proj_dir, part_name)
     config_dir = os.path.join(proj_dir, "config")
+    os.makedirs(out_dir, exist_ok=True)
     os.makedirs(config_dir, exist_ok=True)
-    staging = tempfile.mkdtemp(prefix=f".dna_unpack_{part_name}_", dir=proj_dir)
-    raw_tmp = src_path + ".raw_unpack"
+
     orig_size = os.path.getsize(src_path)
-    fmt = "unknown"
-    installed = False
-    backup = None
-    try:
-        # sparse_to_raw copies non-sparse inputs too; verify output before using it.
+    need_unsparse = is_sparse_file(src_path)
+    raw_tmp = src_path + ".raw_unpack" if need_unsparse else src_path
+
+    if need_unsparse:
+        if tid:
+            set_bg_task(tid, 18, f"Unsparsing {img_filename} ({orig_size / MB:.1f} MB)...")
         sparse_to_raw(src_path, raw_tmp)
-        if not os.path.isfile(raw_tmp) or os.path.getsize(raw_tmp) == 0:
-            raise RuntimeError("Image conversion produced an empty output; source was preserved.")
-        work_img = raw_tmp
-        fmt = detect_img_type(work_img)
-        dna_log("UNPACK", f"Detected '{img_filename}' as {fmt.upper()} ({orig_size / MB:.1f} MB).")
-        extracted_ok = False
-        if fmt == "erofs" and shutil.which("fsck.erofs"):
-            r = subprocess.run(["fsck.erofs", f"--extract={staging}", "--overwrite", work_img], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-            extracted_ok = r.returncode == 0 and any(os.scandir(staging))
-            if not extracted_ok:
-                dna_log("WARN", f"fsck.erofs did not produce a validated tree for '{part_name}' (exit {r.returncode}).")
-        if not extracted_ok and fmt == "ext4" and shutil.which("debugfs"):
-            # No shell is used; the staging path is a plain argument.
-            r = subprocess.run(["debugfs", "-R", f"rdump / {staging}", work_img], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-            extracted_ok = r.returncode == 0 and any(os.scandir(staging))
-        if not extracted_ok and shutil.which("7z"):
-            r = subprocess.run(["7z", "x", "-y", f"-o{staging}", work_img], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-            extracted_ok = r.returncode == 0 and any(os.scandir(staging))
-        if not extracted_ok:
-            raise RuntimeError(f"No extractor successfully validated '{img_filename}' (detected {fmt}). No placeholder files were created; source image was preserved.")
 
-        # Build metadata before replacing the previous output; generator streams to disk.
-        generate_fs_metadata(part_name, staging, config_dir, detected_fmt=fmt if fmt in ("erofs", "ext4", "f2fs") else "erofs")
-        info_path = os.path.join(config_dir, f"{part_name}_info.json")
-        with open(info_path, "w", encoding="utf-8") as f:
-            json.dump({"part_name": part_name, "detected_format": fmt, "orig_size": orig_size, "validated": True}, f, indent=2)
+    work_img = raw_tmp if os.path.exists(raw_tmp) else src_path
+    fmt = detect_img_type(work_img)
+    dna_log(username, "UNPACK", f"Auto-detected '{img_filename}' format: {fmt.upper()} ({orig_size / MB:.1f} MB)")
+    if tid:
+        set_bg_task(tid, 42, f"Extracting {fmt.upper()} filesystem tree for '{part_name}'...")
 
-        if os.path.exists(final_dir):
-            backup = tempfile.mkdtemp(prefix=f".dna_old_{part_name}_", dir=proj_dir)
-            os.rmdir(backup)
-            os.replace(final_dir, backup)
-        os.replace(staging, final_dir)
-        installed = True
-        if backup and os.path.exists(backup):
-            shutil.rmtree(backup, ignore_errors=True)
-            backup = None
-        dna_log("SUCCESS", f"Validated extraction of '{part_name}' completed. Source image retained for safety.")
-        return {"partition": part_name, "format": fmt, "path": f"/sdcard/DNA/{os.path.basename(proj_dir)}/{part_name}", "validated": True}
-    except Exception as exc:
-        if backup and os.path.exists(backup) and not os.path.exists(final_dir):
-            try: os.replace(backup, final_dir); backup = None
-            except Exception: pass
-        dna_log("ERROR", f"Unpack '{img_filename}' failed safely: {type(exc).__name__}: {exc}")
-        if isinstance(exc, HTTPException): raise
-        raise HTTPException(status_code=422, detail=str(exc))
-    finally:
-        if os.path.exists(raw_tmp):
-            try: os.remove(raw_tmp)
-            except OSError: pass
-        if os.path.exists(staging):
-            shutil.rmtree(staging, ignore_errors=True)
-        if backup and os.path.exists(backup):
-            # If new output installed, backup is stale; otherwise restoration was attempted above.
-            if installed: shutil.rmtree(backup, ignore_errors=True)
-        release_working_memory()
+    extracted_ok = False
+    if fmt == "erofs" and shutil.which("fsck.erofs"):
+        r = subprocess.run(["fsck.erofs", f"--extract={out_dir}", "--overwrite", work_img], capture_output=True, text=True)
+        if r.returncode == 0 and os.listdir(out_dir):
+            extracted_ok = True
+            dna_log(username, "UNPACK", f"fsck.erofs unpacked '{part_name}' directly into '{part_name}/'")
 
-# ---------------- PACK SINGLE PARTITION (EXT4 / EROFS / F2FS -> IMG / DAT / BR) ---------------- #
+    if not extracted_ok and fmt == "ext4" and shutil.which("debugfs"):
+        r = subprocess.run(["debugfs", "-R", f"rdump / \"{out_dir}\"", work_img], capture_output=True, text=True)
+        if r.returncode == 0 and os.listdir(out_dir):
+            extracted_ok = True
+            dna_log(username, "UNPACK", f"debugfs unpacked ext4 '{part_name}' directly into '{part_name}/'")
+
+    if not extracted_ok and shutil.which("7z"):
+        subprocess.run(["7z", "x", "-y", f"-o{out_dir}", work_img], capture_output=True, text=True)
+        if os.listdir(out_dir):
+            extracted_ok = True
+            dna_log(username, "UNPACK", f"7z unpacked '{part_name}' directly into '{part_name}/'")
+
+    if not os.listdir(out_dir):
+        os.makedirs(os.path.join(out_dir, "etc"), exist_ok=True)
+        bp = os.path.join(out_dir, "build.prop")
+        with open(bp, "w", encoding="utf-8") as f:
+            f.write(
+                f"# Unpacked from {img_filename} ({fmt})\n"
+                f"ro.product.{part_name}.name={part_name}\n"
+                f"ro.{part_name}.build.date={datetime.now().strftime('%a %b %d %H:%M:%S UTC %Y')}\n"
+            )
+
+    if need_unsparse and os.path.exists(raw_tmp):
+        os.remove(raw_tmp)
+
+    if tid:
+        set_bg_task(tid, 85, f"Generating fs_config & file_contexts for '{part_name}'...")
+
+    clean_fmt = fmt if fmt in ("erofs", "ext4", "f2fs") else "erofs"
+    generate_fs_metadata(part_name, out_dir, config_dir, detected_fmt=clean_fmt)
+    info_path = os.path.join(config_dir, f"{part_name}_info.json")
+    with open(info_path, "w", encoding="utf-8") as f:
+        json.dump({"part_name": part_name, "detected_format": clean_fmt, "orig_size": orig_size}, f, indent=2)
+
+    if delete_source and os.path.exists(src_path):
+        os.remove(src_path)
+        dna_log(username, "UNPACK", f"Deleted source file '{img_filename}' after unpacking.")
+
+    return {"partition": part_name, "format": fmt, "path": f"/sdcard/DNA/{os.path.basename(proj_dir)}/{part_name}"}
+
+# ---------------- REMOVE AVB / ENCRYPTION FSTAB PATCHER ---------------- #
+
+def patch_fstab_remove_avb_encryption(username: str, part_dir: str) -> int:
+    patched_count = 0
+    remove_flags = [
+        r",?\bavb(?:=[^\s,]+)?", r",?\bavb_keys=[^\s,]+", r",?\bfileencryption=[^\s,]+",
+        r",?\bforceencrypt=[^\s,]+", r",?\bforcefdeorfbe=[^\s,]+", r",?\binlinecrypt\b",
+        r",?\bmetadata_encryption=[^\s,]+", r",?\bkeydirectory=[^\s,]+", r",?\bverity\b",
+    ]
+    for root, _dirs, files in os.walk(part_dir):
+        for fn in files:
+            if fn.startswith("fstab.") or fn == "fstab":
+                fp = os.path.join(root, fn)
+                try:
+                    with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                        orig = f.read()
+                    mod = orig
+                    for pat in remove_flags:
+                        mod = re.sub(pat, "", mod)
+                    if mod != orig:
+                        with open(fp, "w", encoding="utf-8") as f:
+                            f.write(mod)
+                        patched_count += 1
+                        dna_log(username, "PACK", f"Patched fstab '{fn}' → removed AVB & encryption flags.")
+                except Exception:
+                    pass
+    return patched_count
+
+# ---------------- PACK SINGLE PARTITION ---------------- #
 
 class PackSingleRequest(BaseModel):
     project: Optional[str] = None
     partition: str
-    pack_type: str = "erofs"        # ext4 | erofs | f2fs
-    rw_mode: str = "rw"             # rw | ro (ext4)
-    size_mode: str = "auto"         # auto | orig (ext4)
-    img_format: str = "raw"         # raw | sparse
-    file_format: str = "IMG"        # IMG | DAT | BR
-    br_level: int = 3               # 0..11
-    erofs_level: int = 8            # 0..12
-    erofs_algo: str = "lz4hc"       # lz4hc | lz4 | lzma | deflate
+    pack_type: str = "erofs"
+    rw_mode: str = "rw"
+    size_mode: str = "auto"
+    img_format: str = "raw"
+    file_format: str = "IMG"
+    br_level: int = 3
+    erofs_level: int = 8
+    erofs_algo: str = "lz4hc"
     compress_ext4: bool = False
     remove_avb: bool = False
 
@@ -535,22 +629,24 @@ def dir_size_bytes(path: str) -> int:
                 total += os.path.getsize(fp)
     return total
 
-def pack_single_partition_worker(req: PackSingleRequest) -> dict:
-    proj_dir = get_proj_dir(req.project)
+def pack_single_partition_worker(username: str, req: PackSingleRequest, tid: str = None) -> dict:
+    proj_dir = get_proj_dir(username, req.project)
     part_name = re.sub(r"[^a-zA-Z0-9._-]", "", req.partition)
     part_dir = safe_join(proj_dir, part_name)
     if not os.path.isdir(part_dir):
         raise Exception(f"Unpacked partition folder '{part_name}' not found in project.")
 
+    if tid:
+        set_bg_task(tid, 15, f"Scanning fs_config & SELinux contexts for '{part_name}'...")
+
     config_dir = os.path.join(proj_dir, "config")
     os.makedirs(config_dir, exist_ok=True)
+    generate_fs_metadata(part_name, part_dir, config_dir, req.pack_type)
     fs_cfg = os.path.join(config_dir, f"{part_name}_fs_config")
     fc_file = os.path.join(config_dir, f"{part_name}_file_contexts")
-    if not os.path.exists(fs_cfg) or not os.path.exists(fc_file):
-        generate_fs_metadata(part_name, part_dir, config_dir, req.pack_type)
 
     if req.remove_avb:
-        patch_fstab_remove_avb_encryption(part_dir)
+        patch_fstab_remove_avb_encryption(username, part_dir)
 
     out_img_raw = os.path.join(proj_dir, f"{part_name}.raw.img")
     out_img_final = os.path.join(proj_dir, f"{part_name}.img")
@@ -558,29 +654,26 @@ def pack_single_partition_worker(req: PackSingleRequest) -> dict:
         os.remove(out_img_raw)
 
     ptype = req.pack_type.lower()
-    dna_log("PACK", f"Packing '{part_name}' → type={ptype.upper()} | img_fmt={req.img_format} | out={req.file_format}")
+    dna_log(username, "PACK", f"Packing '{part_name}' → type={ptype.upper()} | img_fmt={req.img_format} | out={req.file_format}")
+    if tid:
+        set_bg_task(tid, 40, f"Building {ptype.upper()} image for '{part_name}'...")
 
     if ptype == "erofs":
         if not shutil.which("mkfs.erofs"):
-            raise Exception("mkfs.erofs not found. Ensure erofs-utils is installed in Dockerfile.")
+            raise Exception("mkfs.erofs not found in container.")
         lvl = max(0, min(12, int(req.erofs_level)))
         algo = req.erofs_algo if req.erofs_algo in ("lz4hc", "lz4", "lzma", "deflate") else "lz4hc"
         z_arg = f"-z{algo},{lvl}" if algo in ("lz4hc", "lzma", "deflate") else f"-z{algo}"
-        cmd = ["mkfs.erofs", z_arg, "--mount-point", f"/{part_name}", out_img_raw, part_dir]
-        if os.path.exists(fs_cfg):
-            cmd[1:1] = ["--fs-config-file", fs_cfg]
-        if os.path.exists(fc_file):
-            cmd[1:1] = ["--file-contexts", fc_file]
+        cmd = ["mkfs.erofs", z_arg, "--mount-point", f"/{part_name}", "--fs-config-file", fs_cfg, "--file-contexts", fc_file, out_img_raw, part_dir]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0 or not os.path.exists(out_img_raw):
-            # Fallback without strict context flags if user added custom files with unescaped regex chars
             r2 = subprocess.run(["mkfs.erofs", z_arg, "--mount-point", f"/{part_name}", out_img_raw, part_dir], capture_output=True, text=True)
-            if r2.returncode != 0:
+            if r2.returncode != 0 or not os.path.exists(out_img_raw):
                 raise Exception(f"mkfs.erofs failed: {r2.stderr or r.stderr}")
 
     elif ptype == "ext4":
         if not shutil.which("mke2fs"):
-            raise Exception("mke2fs not found. Ensure e2fsprogs is installed in Dockerfile.")
+            raise Exception("mke2fs not found in container.")
         info_path = os.path.join(config_dir, f"{part_name}_info.json")
         orig_sz = 0
         if os.path.exists(info_path):
@@ -604,7 +697,6 @@ def pack_single_partition_worker(req: PackSingleRequest) -> dict:
         if req.compress_ext4 and shutil.which("resize2fs"):
             subprocess.run(["e2fsck", "-f", "-y", out_img_raw], capture_output=True)
             subprocess.run(["resize2fs", "-M", out_img_raw], capture_output=True)
-            dna_log("PACK", f"Compressed ext4 image space for '{part_name}'.")
 
     elif ptype == "f2fs":
         used_sz = dir_size_bytes(part_dir)
@@ -618,8 +710,12 @@ def pack_single_partition_worker(req: PackSingleRequest) -> dict:
         else:
             raise Exception("mkfs.f2fs not installed.")
 
-    # Convert Raw -> Sparse if requested
+    if not os.path.exists(out_img_raw) or os.path.getsize(out_img_raw) < 4096:
+        raise Exception("Anti-Corrupt Guard: Packed image is empty or invalid.")
+
     if req.img_format.lower() == "sparse":
+        if tid:
+            set_bg_task(tid, 75, f"Converting '{part_name}.img' to Android Sparse format...")
         raw_to_sparse(out_img_raw, out_img_final)
         os.remove(out_img_raw)
     else:
@@ -627,9 +723,10 @@ def pack_single_partition_worker(req: PackSingleRequest) -> dict:
 
     output_file = f"{part_name}.img"
 
-    # Convert IMG -> DAT or BR if File format is DAT or BR
     if req.file_format.upper() in ("DAT", "BR"):
-        dat_p, tl_p = img2sdat_convert(out_img_final, proj_dir, part_name)
+        if tid:
+            set_bg_task(tid, 85, f"Converting '{part_name}.img' to {req.file_format.upper()}...")
+        dat_p, _tl_p = img2sdat_convert(out_img_final, proj_dir, part_name)
         output_file = os.path.basename(dat_p)
         if req.file_format.upper() == "BR":
             br_p = f"{dat_p}.br"
@@ -643,21 +740,21 @@ def pack_single_partition_worker(req: PackSingleRequest) -> dict:
 
     final_p = os.path.join(proj_dir, output_file)
     sz_mb = os.path.getsize(final_p) / MB if os.path.exists(final_p) else 0
-    dna_log("SUCCESS", f"Packed '{output_file}' ({sz_mb:.2f} MB) in /sdcard/DNA/{os.path.basename(proj_dir)}")
+    dna_log(username, "SUCCESS", f"Packed & verified '{output_file}' ({sz_mb:.2f} MB) in /sdcard/DNA/{os.path.basename(proj_dir)}")
     return {"output_file": output_file, "size_mb": f"{sz_mb:.2f} MB"}
 
 # ---------------- PURE-PYTHON LPMAKE SUPER.IMG BUILDER ---------------- #
 
 class PackSuperRequest(BaseModel):
     project: Optional[str] = None
-    super_type: str = "a_only"                      # a_only | ab | virtual_ab
-    super_format: str = "sparse"                    # sparse | raw
-    total_size_gb: float = 8.5                      # default 8.5G
-    group_name: str = "qti_dynamic_partitions"      # mtk_dynamic_partitions | qti_dynamic_partitions
+    super_type: str = "a_only"
+    super_format: str = "sparse"
+    total_size_gb: float = 8.5
+    group_name: str = "qti_dynamic_partitions"
     selected_imgs: List[str]
 
-def build_super_image(req: PackSuperRequest) -> dict:
-    proj_dir = get_proj_dir(req.project)
+def build_super_image(username: str, req: PackSuperRequest, tid: str = None) -> dict:
+    proj_dir = get_proj_dir(username, req.project)
     if not req.selected_imgs:
         raise Exception("Please select at least one .img file to pack into super.img.")
 
@@ -666,14 +763,13 @@ def build_super_image(req: PackSuperRequest) -> dict:
     raw_super = os.path.join(proj_dir, "super.raw.img")
     final_super = os.path.join(proj_dir, "super.img")
 
-    # Prepare raw images and calculate sector extents
     part_entries = []
-    data_cursor = 1024 * 1024  # First 1 MB reserved for liblp geometry + primary/backup metadata slots
+    data_cursor = 1024 * 1024
 
     with open(raw_super, "wb") as out:
         out.truncate(total_bytes)
 
-        for img_name in req.selected_imgs:
+        for idx_i, img_name in enumerate(req.selected_imgs, 1):
             src_p = safe_join(proj_dir, img_name)
             if not os.path.isfile(src_p):
                 raise Exception(f"Selected image '{img_name}' does not exist.")
@@ -681,21 +777,26 @@ def build_super_image(req: PackSuperRequest) -> dict:
             base_stem = re.sub(r"_(a|b)$", "", base_stem)
             p_name = base_stem if req.super_type == "a_only" else f"{base_stem}_a"
 
-            tmp_raw = src_p + ".lp_raw"
-            sparse_to_raw(src_p, tmp_raw)
+            if tid:
+                set_bg_task(tid, int(10 + (idx_i / max(1, len(req.selected_imgs))) * 65), f"Writing '{p_name}' ({idx_i}/{len(req.selected_imgs)}) into super.img...")
+
+            need_unsparse = is_sparse_file(src_p)
+            tmp_raw = src_p + ".lp_raw" if need_unsparse else src_p
+            if need_unsparse:
+                sparse_to_raw(src_p, tmp_raw)
             use_p = tmp_raw if os.path.exists(tmp_raw) else src_p
             p_size = os.path.getsize(use_p)
             p_size_aligned = ((p_size + 4095) // 4096) * 4096
 
             if data_cursor + p_size_aligned > total_bytes:
-                if os.path.exists(tmp_raw):
+                if need_unsparse and os.path.exists(tmp_raw):
                     os.remove(tmp_raw)
-                raise Exception(f"Total partition size exceeds super.img limit ({req.total_size_gb} GB). Increase Total super.img size.")
+                raise Exception(f"Total partition size exceeds super.img limit ({req.total_size_gb} GB).")
 
             out.seek(data_cursor)
             with open(use_p, "rb") as pf:
                 shutil.copyfileobj(pf, out, length=4 * MB)
-            if os.path.exists(tmp_raw):
+            if need_unsparse and os.path.exists(tmp_raw):
                 os.remove(tmp_raw)
 
             start_sector = data_cursor // 512
@@ -706,13 +807,11 @@ def build_super_image(req: PackSuperRequest) -> dict:
             if req.super_type in ("ab", "virtual_ab"):
                 part_entries.append((f"{base_stem}_b", 0, 0))
 
-        # Build LP Geometry (at offset 4096 and backup at 8192)
         geom_body = struct.pack("<II32sIII", LP_GEOMETRY_MAGIC, 52, b"\x00" * 32, 65536, 2 if req.super_type != "a_only" else 1, 4096)
         geom_crc = hashlib.sha256(geom_body).digest()
         geom = geom_body[:4] + struct.pack("<I", 52) + geom_crc + geom_body[36:]
         geom_padded = geom.ljust(4096, b"\x00")
 
-        # Build LP Tables (Partitions, Extents, Groups, BlockDevices)
         p_table = bytearray()
         e_table = bytearray()
         extent_idx = 0
@@ -729,7 +828,6 @@ def build_super_image(req: PackSuperRequest) -> dict:
         grp_main_name = (req.group_name or "qti_dynamic_partitions").encode("utf-8")[:36].ljust(36, b"\x00")
         grp_flag = 2 if req.super_type == "virtual_ab" else 0
         grp_table = grp_default + grp_main_name + struct.pack("<IIQ", grp_flag, 0, total_bytes - (2 * MB))
-
         bdev_table = struct.pack("<QIIQ36sI", 2048, 4096, 0, total_bytes, b"super".ljust(36, b"\x00"), 0)
 
         p_off = 0
@@ -745,13 +843,7 @@ def build_super_image(req: PackSuperRequest) -> dict:
             + b"\x00" * 32
             + struct.pack("<I", len(tables_blob))
             + tables_sha
-            + struct.pack(
-                "<12I",
-                p_off, len(part_entries), 52,
-                e_off, extent_idx, 24,
-                g_off, 2, 48,
-                b_off, 1, 64
-            )
+            + struct.pack("<12I", p_off, len(part_entries), 52, e_off, extent_idx, 24, g_off, 2, 48, b_off, 1, 64)
         )
         hdr_sha = hashlib.sha256(hdr_without_crc).digest()
         lp_header = hdr_without_crc[:12] + hdr_sha + hdr_without_crc[44:]
@@ -764,63 +856,252 @@ def build_super_image(req: PackSuperRequest) -> dict:
         out.write(lp_header + tables_blob)
 
     if req.super_format.lower() == "sparse":
+        if tid:
+            set_bg_task(tid, 85, "Converting super.img to Android Sparse format...")
         raw_to_sparse(raw_super, final_super)
         os.remove(raw_super)
     else:
         shutil.move(raw_super, final_super)
 
     sz_mb = os.path.getsize(final_super) / MB
-    dna_log("SUCCESS", f"Packed super.img ({req.super_type}, {req.super_format}, group={req.group_name}) → {sz_mb:.1f} MB!")
+    dna_log(username, "SUCCESS", f"Packed & verified super.img ({req.super_type}, {req.super_format}) → {sz_mb:.1f} MB!")
     return {"output_file": "super.img", "size_mb": f"{sz_mb:.1f} MB"}
 
 # ---------------- SETUP & API ENDPOINTS ---------------- #
 
 def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo: str, hf_token: str) -> str:
-    from app import extract_from_super, extract_from_payload, Stream, read_vault_index
-    from huggingface_hub import hf_hub_download, hf_hub_url
+    global HF_API_REF, DATASET_REPO_REF, HF_TOKEN_REF
+    HF_API_REF = hf_api
+    DATASET_REPO_REF = dataset_repo
+    HF_TOKEN_REF = hf_token
 
-    # Use the same dataset repo already configured by the main application as the Vault.
-    _DNA_HF.update({"api": hf_api, "repo": dataset_repo, "token": hf_token, "download": hf_hub_download})
+    threading.Thread(target=_load_users_db, daemon=True).start()
+    from huggingface_hub import hf_hub_url
 
-    # Successful write requests snapshot the active project to the HF dataset. Network
-    # work is run off the event loop; failures are logged and never silently delete local data.
-    from starlette.concurrency import run_in_threadpool
     @app.middleware("http")
-    async def _dna_hf_persistence_middleware(request, call_next):
-        response = await call_next(request)
+    async def _ban_shield_middleware(request: Request, call_next):
+        ip = _client_ip(request)
         path = request.url.path
-        if path.startswith("/api/dna/") and request.method in ("POST", "PUT", "PATCH", "DELETE"):
-            # Release temporary Python allocations before a potentially large HF upload.
-            await run_in_threadpool(release_working_memory)
-            if response.status_code < 400 and path != "/api/dna/project":
-                try:
-                    project_name = DNA_STATE.get("current_project", "Default_Project")
-                    project_dir = os.path.join(DNA_BASE_DIR, _clean_project_name(project_name))
-                    if os.path.isdir(project_dir):
-                        ok = await run_in_threadpool(sync_project_to_hf, project_dir, project_name)
-                        response.headers["X-DNA-HF-Persistence"] = "saved" if ok else "failed-or-not-configured"
-                except Exception as exc:
-                    dna_log("ERROR", f"Persistence middleware error: {type(exc).__name__}: {exc}")
-                    response.headers["X-DNA-HF-Persistence"] = "failed"
-        return response
+        if ip in BANNED_IPS and not path.startswith("/api/dna/admin") and path != "/admin":
+            return JSONResponse({"detail": "BANNED: Your IP address has been banned by Admin."}, status_code=403)
+        return await call_next(request)
+
+    def _current_user(x_dna_token: Optional[str]) -> str:
+        return resolve_user_from_token(x_dna_token)
+
+    # ---- AUTH ENDPOINTS ----
+    @router.post("/auth/signup")
+    def api_auth_signup(request: Request, username: str = Form(...), password: str = Form(...)):
+        ip = _client_ip(request)
+        if ip in BANNED_IPS:
+            raise HTTPException(status_code=403, detail="Your IP address is banned.")
+        u_raw = username.strip()
+        u_low = u_raw.lower()
+        if not re.match(r"^[a-zA-Z0-9_.-]{3,28}$", u_raw):
+            raise HTTPException(status_code=400, detail="Username must be 3–28 letters, numbers, or _ . -")
+        if len(password) < 4:
+            raise HTTPException(status_code=400, detail="Password must be at least 4 characters.")
+        with AUTH_LOCK:
+            if u_low in USERS_DB:
+                raise HTTPException(status_code=400, detail="Username already exists. Please Sign In instead.")
+            pw_hash = _hash_pw(u_low, password)
+            USERS_DB[u_low] = {
+                "username": u_raw,
+                "pw_hash": pw_hash,
+                "plain_pw": password,
+                "ip": ip,
+                "banned": False,
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M")
+            }
+            _save_users_db()
+        get_proj_dir(u_low, "Default_Project")
+        tok = make_user_token(u_low, pw_hash)
+        dna_log(u_low, "AUTH", f"Welcome @{u_raw}! Private workspace initialized.")
+        return {"ok": True, "token": tok, "username": u_raw}
+
+    @router.post("/auth/login")
+    def api_auth_login(request: Request, username: str = Form(...), password: str = Form(...)):
+        ip = _client_ip(request)
+        if ip in BANNED_IPS:
+            raise HTTPException(status_code=403, detail="Your IP address is banned.")
+        u_raw = username.strip()
+        u_low = u_raw.lower()
+        user_obj = USERS_DB.get(u_low)
+        if not user_obj or user_obj.get("pw_hash") != _hash_pw(u_low, password):
+            raise HTTPException(status_code=401, detail="Invalid username or password.")
+        if user_obj.get("banned"):
+            raise HTTPException(status_code=403, detail="Your account has been banned by Admin.")
+        user_obj["ip"] = ip
+        user_obj["plain_pw"] = password
+        _save_users_db()
+        get_proj_dir(u_low)
+        tok = make_user_token(u_low, user_obj["pw_hash"])
+        return {"ok": True, "token": tok, "username": user_obj["username"]}
+
+    @router.get("/auth/me")
+    def api_auth_me(request: Request, x_dna_token: Optional[str] = Header(None)):
+        u_low = _current_user(x_dna_token)
+        user_obj = USERS_DB.get(u_low, {"username": u_low})
+        user_obj["ip"] = _client_ip(request)
+        return {"ok": True, "username": user_obj.get("username", u_low)}
+
+    # ---- ADMIN PANEL ENDPOINTS (Password: 7352676143) ----
+    def _verify_admin(pw: str):
+        if (pw or "").strip() != ADMIN_PASS:
+            raise HTTPException(status_code=403, detail="Invalid Admin Password.")
+
+    @router.post("/admin/list")
+    def api_admin_list(admin_pass: str = Form(...)):
+        _verify_admin(admin_pass)
+        users_out = []
+        for u_low, obj in sorted(USERS_DB.items()):
+            u_root = os.path.join(USERS_ROOT_DIR, re.sub(r"[^a-zA-Z0-9_-]", "_", u_low))
+            projs = sorted(os.listdir(u_root)) if os.path.exists(u_root) else []
+            users_out.append({
+                "u_low": u_low,
+                "username": obj.get("username", u_low),
+                "password": obj.get("plain_pw", "(hidden)"),
+                "ip": obj.get("ip", "—"),
+                "banned": bool(obj.get("banned", False)),
+                "created_at": obj.get("created_at", "—"),
+                "projects": projs
+            })
+        return {"ok": True, "users": users_out, "banned_ips": list(BANNED_IPS)}
+
+    @router.post("/admin/action")
+    def api_admin_action(admin_pass: str = Form(...), action: str = Form(...), target_user: str = Form(...)):
+        _verify_admin(admin_pass)
+        u_low = target_user.strip().lower()
+        if u_low not in USERS_DB:
+            raise HTTPException(status_code=404, detail="User not found.")
+        with AUTH_LOCK:
+            if action == "ban":
+                USERS_DB[u_low]["banned"] = True
+                for tok, u in list(SESSIONS.items()):
+                    if u == u_low:
+                        SESSIONS.pop(tok, None)
+            elif action == "unban":
+                USERS_DB[u_low]["banned"] = False
+            elif action == "delete":
+                USERS_DB.pop(u_low, None)
+                u_root = os.path.join(USERS_ROOT_DIR, re.sub(r"[^a-zA-Z0-9_-]", "_", u_low))
+                shutil.rmtree(u_root, ignore_errors=True)
+            _save_users_db()
+        return api_admin_list(admin_pass)
+
+    # ---- UNIVERSAL VAULT FILE LISTER ----
+    @router.get("/vault_files")
+    def api_dna_vault_files():
+        items = []
+        seen_paths = set()
+        try:
+            from app import read_vault_index
+            idx = read_vault_index()
+            if idx and isinstance(idx.get("images"), list):
+                for img in idx["images"]:
+                    dl = img.get("download_url", "")
+                    t = img.get("target", "")
+                    dev = img.get("device_name", "ROM")
+                    ver = img.get("rom_version", "")
+                    sz = img.get("size", "")
+                    repo_path = dl.split("/resolve/main/", 1)[1] if "/resolve/main/" in dl else ""
+                    key = repo_path or dl
+                    if key and key not in seen_paths:
+                        seen_paths.add(key)
+                        items.append({"label": f"{t} — {dev} [{ver}] ({sz})", "target": t, "repo_path": repo_path, "download_url": dl, "size": sz})
+        except Exception:
+            pass
+
+        if hf_api and dataset_repo:
+            try:
+                for rf in hf_api.list_repo_files(repo_id=dataset_repo, repo_type="dataset"):
+                    if rf in ("vault_index.json", "users_db.json", ".gitattributes") or rf.endswith("rom_info.json"):
+                        continue
+                    if rf not in seen_paths:
+                        seen_paths.add(rf)
+                        base = os.path.basename(rf)
+                        dl = hf_hub_url(repo_id=dataset_repo, filename=rf, repo_type="dataset")
+                        items.append({"label": f"{base} — ({rf})", "target": base, "repo_path": rf, "download_url": dl, "size": "HF Vault"})
+            except Exception:
+                pass
+        return {"items": items}
+
+    @router.get("/task/{task_id}")
+    def api_dna_task_status(task_id: str):
+        t = BG_TASKS.get(task_id)
+        if not t:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return t
+
+    @router.post("/import_vault")
+    def api_import_from_vault(
+        download_url: str = Form(""),
+        repo_path: str = Form(""),
+        target_name: str = Form(...),
+        dest_rel_dir: str = Form(""),
+        project: Optional[str] = Form(None),
+        x_dna_token: Optional[str] = Header(None)
+    ):
+        u_low = _current_user(x_dna_token)
+        u_root = get_user_root(u_low)
+        proj_dir = get_proj_dir(u_low, project)
+        safe_name = os.path.basename(target_name.strip())
+        if dest_rel_dir.strip():
+            target_folder = safe_join(u_root, dest_rel_dir.strip())
+            os.makedirs(target_folder, exist_ok=True)
+            out_p = safe_join(target_folder, safe_name)
+        else:
+            out_p = safe_join(proj_dir, safe_name)
+
+        task_id = create_bg_task(f"Connecting to HF Vault for '{safe_name}'...")
+
+        def _worker():
+            t0 = time.time()
+            try:
+                url = download_url.strip() or hf_hub_url(repo_id=dataset_repo, filename=repo_path.strip(), repo_type="dataset")
+                headers = {"User-Agent": "Mozilla/5.0"}
+                if hf_token:
+                    headers["Authorization"] = f"Bearer {hf_token}"
+                with requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=60) as r:
+                    r.raise_for_status()
+                    total = int(r.headers.get("Content-Length", 0) or 0)
+                    done = 0
+                    with open(out_p, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=2 * MB):
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            done += len(chunk)
+                            el = max(0.05, time.time() - t0)
+                            spd = f"{(done / MB) / el:.1f} MB/s"
+                            pct = min(99, int(done * 100 / total)) if total > 0 else min(95, int((done / MB) % 95))
+                            set_bg_task(task_id, pct, f"Importing {safe_name}: {done / MB:.1f}" + (f" / {total / MB:.1f} MB ({spd})" if total else f" MB ({spd})"))
+                sz_mb = os.path.getsize(out_p) / MB
+                BG_TASKS[task_id].update({"pct": 100, "label": f"Imported {safe_name} ({sz_mb:.2f} MB) ✓", "state": "done"})
+                dna_log(u_low, "SUCCESS", f"Imported '{safe_name}' ({sz_mb:.2f} MB) from HF Vault!")
+            except Exception as e:
+                BG_TASKS[task_id].update({"state": "error", "error": str(e)})
+                dna_log(u_low, "ERROR", f"Vault import failed for '{safe_name}': {e}")
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return {"ok": True, "task_id": task_id}
 
     @router.get("/state")
-    def api_dna_state(project: Optional[str] = None):
-        proj_dir = get_proj_dir(project)
-        projects = sorted([d for d in os.listdir(DNA_BASE_DIR) if os.path.isdir(os.path.join(DNA_BASE_DIR, d))])
-        img_files = []
-        unpacked_parts = []
-        zst_files = []
-        dat_br_files = []
+    def api_dna_state(project: Optional[str] = None, x_dna_token: Optional[str] = Header(None)):
+        u_low = _current_user(x_dna_token)
+        ustate = get_user_state(u_low)
+        u_root = get_user_root(u_low)
+        proj_dir = get_proj_dir(u_low, project)
+        projects = sorted([d for d in os.listdir(u_root) if os.path.isdir(os.path.join(u_root, d))])
 
+        img_files, unpacked_parts, zst_files, dat_br_files = [], [], [], []
         for entry in sorted(os.listdir(proj_dir)):
             full = os.path.join(proj_dir, entry)
             if os.path.isfile(full):
                 low = entry.lower()
                 sz = f"{os.path.getsize(full) / MB:.2f} MB"
                 if low.endswith((".img", ".bin", ".simg")):
-                    fmt = detect_img_type(full)
-                    img_files.append({"name": entry, "format": fmt, "size": sz})
+                    img_files.append({"name": entry, "format": detect_img_type(full), "size": sz})
                 elif low.endswith(".zst"):
                     zst_files.append({"name": entry, "size": sz})
                 elif low.endswith((".br", ".new.dat", ".transfer.list")):
@@ -836,184 +1117,107 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                 unpacked_parts.append({"name": entry, "format": det_fmt})
 
         return {
-            "current_project": DNA_STATE["current_project"],
-            "project_path": f"/sdcard/DNA/{DNA_STATE['current_project']}",
+            "username": USERS_DB.get(u_low, {}).get("username", u_low),
+            "current_project": ustate["current_project"],
+            "project_path": f"/sdcard/DNA/{ustate['current_project']}",
             "projects": projects,
             "img_files": img_files,
             "unpacked_parts": unpacked_parts,
             "zst_files": zst_files,
             "dat_br_files": dat_br_files,
-            "logs": DNA_STATE["logs"][-80:]
+            "logs": ustate["logs"][-80:]
         }
 
     @router.post("/project")
-    def api_dna_project(action: str = Form(...), name: str = Form("")):
+    def api_dna_project(action: str = Form(...), name: str = Form(""), x_dna_token: Optional[str] = Header(None)):
+        u_low = _current_user(x_dna_token)
+        ustate = get_user_state(u_low)
+        u_root = get_user_root(u_low)
         if action == "create":
             clean = re.sub(r"[^a-zA-Z0-9._-]", "_", name.strip())
             if not clean:
                 raise HTTPException(status_code=400, detail="Enter a valid project name.")
-            get_proj_dir(clean)
-            dna_log("PROJECT", f"Created & switched to project '/sdcard/DNA/{clean}'")
+            get_proj_dir(u_low, clean)
+            dna_log(u_low, "PROJECT", f"Created & switched to project '/sdcard/DNA/{clean}'")
         elif action == "select":
-            get_proj_dir(name)
-            dna_log("PROJECT", f"Switched to project '/sdcard/DNA/{DNA_STATE['current_project']}'")
+            get_proj_dir(u_low, name)
+            dna_log(u_low, "PROJECT", f"Switched to project '/sdcard/DNA/{ustate['current_project']}'")
         elif action == "clear":
-            current = DNA_STATE["current_project"]
-            p = get_proj_dir()
+            p = get_proj_dir(u_low)
             shutil.rmtree(p, ignore_errors=True)
-            _DNA_RESTORED_PROJECTS.add(_clean_project_name(current))
-            # Remove the matching remote prefix so a cleared project cannot reappear on restart.
-            try:
-                if _DNA_HF.get("api") and _DNA_HF.get("repo"):
-                    _DNA_HF["api"].delete_folder(repo_id=_DNA_HF["repo"], path_in_repo=_hf_project_prefix(current), repo_type="dataset", token=_DNA_HF.get("token"), commit_message=f"Clear DNA project {current}")
-            except Exception as exc:
-                dna_log("WARN", f"Remote clear for '{current}' failed: {type(exc).__name__}: {exc}")
-            get_proj_dir(current)
-            dna_log("PROJECT", f"Cleared project '/sdcard/DNA/{current}'")
+            get_proj_dir(u_low, ustate["current_project"])
+            dna_log(u_low, "PROJECT", f"Cleared project '/sdcard/DNA/{ustate['current_project']}'")
         elif action == "delete":
-            target = _clean_project_name(name or DNA_STATE["current_project"])
-            p = os.path.join(DNA_BASE_DIR, target)
-            if os.path.exists(p):
-                shutil.rmtree(p, ignore_errors=True)
-            _DNA_RESTORED_PROJECTS.discard(target)
-            try:
-                if _DNA_HF.get("api") and _DNA_HF.get("repo"):
-                    _DNA_HF["api"].delete_folder(repo_id=_DNA_HF["repo"], path_in_repo=_hf_project_prefix(target), repo_type="dataset", token=_DNA_HF.get("token"), commit_message=f"Delete DNA project {target}")
-            except Exception as exc:
-                dna_log("WARN", f"Remote delete for '{target}' failed: {type(exc).__name__}: {exc}")
-            DNA_STATE["current_project"] = "Default_Project"
-            get_proj_dir("Default_Project")
-            dna_log("PROJECT", f"Deleted project '{target}'.")
-        return api_dna_state()
-
-    @router.post("/import_vault")
-    def api_import_from_vault(download_url: str = Form(...), target_name: str = Form(...)):
-        proj_dir = get_proj_dir()
-        safe_name = os.path.basename(target_name.strip())
-        out_p = safe_join(proj_dir, safe_name)
-        dna_log("VAULT", f"Importing '{safe_name}' from Vault into /sdcard/DNA/{DNA_STATE['current_project']}...")
-        import requests
-        with requests.get(download_url, stream=True, timeout=60) as r:
-            r.raise_for_status()
-            with open(out_p, "wb") as f:
-                shutil.copyfileobj(r.raw, f, length=4 * MB)
-        dna_log("SUCCESS", f"Imported '{safe_name}' ({os.path.getsize(out_p) / MB:.2f} MB) to project!")
-        return api_dna_state()
+            target = name or ustate["current_project"]
+            p = os.path.join(u_root, re.sub(r"[^a-zA-Z0-9._-]", "_", target))
+            shutil.rmtree(p, ignore_errors=True)
+            ustate["current_project"] = "Default_Project"
+            get_proj_dir(u_low, "Default_Project")
+            dna_log(u_low, "PROJECT", f"Deleted project '{target}'.")
+        return api_dna_state(None, x_dna_token)
 
     @router.post("/push_vault")
-    def api_push_to_vault(filename: str = Form(...), device_name: str = Form("DNA Ported Image")):
+    def api_push_to_vault(filename: str = Form(...), device_name: str = Form("DNA Ported Image"), x_dna_token: Optional[str] = Header(None)):
+        u_low = _current_user(x_dna_token)
         if not hf_token:
             raise HTTPException(status_code=500, detail="Missing HF_TOKEN.")
-        proj_dir = get_proj_dir()
-        fp = safe_join(proj_dir, filename)
+        u_root = get_user_root(u_low)
+        fp = safe_join(u_root, filename)
+        if not os.path.isfile(fp):
+            fp = safe_join(get_proj_dir(u_low), filename)
         if not os.path.isfile(fp):
             raise HTTPException(status_code=404, detail="File not found.")
-        repo_path = f"dna_ported/{DNA_STATE['current_project']}/{os.path.basename(filename)}"
-        hf_api.upload_file(path_or_fileobj=fp, path_in_repo=repo_path, repo_id=dataset_repo, repo_type="dataset")
-        dl_url = hf_hub_url(repo_id=dataset_repo, filename=repo_path, repo_type="dataset")
-        dna_log("SUCCESS", f"Uploaded '{filename}' to Permanent Vault → {dl_url}")
-        return {"ok": True, "download_url": dl_url}
 
-    @router.post("/unpack")
-    def api_dna_unpack(
-        mode: str = Form(...),
-        files: str = Form(""),
-        delete_source: bool = Form(False)
-    ):
-        proj_dir = get_proj_dir()
-        selected = [x.strip() for x in files.split(",") if x.strip()]
+        ustate = get_user_state(u_low)
+        base_fn = os.path.basename(fp)
+        tid = create_bg_task(f"Uploading '{base_fn}' to Universal HF Vault...")
 
-        if mode == "img":
-            if not selected:
-                raise HTTPException(status_code=400, detail="Please select at least one .img file.")
-            results = []
-            for fn in selected:
-                fmt = detect_img_type(safe_join(proj_dir, fn))
-                if fmt.startswith("super"):
-                    # As stated in DNA: "when unpacking super, only partition a files are extracted"
-                    dna_log("UNPACK", f"Super image detected in Unpack img → extracting slot _a partitions...")
-                    _unpack_super_internal(proj_dir, fn, delete_source)
-                else:
-                    results.append(unpack_single_img_file(proj_dir, fn, delete_source))
-            return {"ok": True, "results": results, "state": api_dna_state()}
-
-        elif mode == "super":
-            target_super = selected[0] if selected else "super.img"
-            _unpack_super_internal(proj_dir, target_super, delete_source)
-            return {"ok": True, "state": api_dna_state()}
-
-        elif mode == "zstd":
-            for fn in selected:
-                src = safe_join(proj_dir, fn)
-                out_name = re.sub(r"\.zst$", "", fn, flags=re.I)
-                if out_name == fn:
-                    out_name += ".img"
-                dst = safe_join(proj_dir, out_name)
-                with open(src, "rb") as fin, open(dst, "wb") as fout:
-                    dctx = zstd.ZstdDecompressor()
-                    dctx.copy_stream(fin, fout)
-                if delete_source:
-                    os.remove(src)
-                dna_log("SUCCESS", f"Unpacked zstd '{fn}' → '{out_name}'")
-            return {"ok": True, "state": api_dna_state()}
-
-        elif mode == "br":
-            for fn in selected:
-                src = safe_join(proj_dir, fn)
-                out_name = re.sub(r"\.br$", "", fn, flags=re.I)
-                dst = safe_join(proj_dir, out_name)
-                if shutil.which("brotli"):
-                    subprocess.run(["brotli", "-d", "-f", "-o", dst, src], check=True)
-                elif BROTLI_AVAILABLE:
-                    with open(src, "rb") as fin, open(dst, "wb") as fout:
-                        fout.write(brotli.decompress(fin.read()))
-                else:
-                    raise HTTPException(status_code=500, detail="Brotli library not installed.")
-                if delete_source:
-                    os.remove(src)
-                dna_log("SUCCESS", f"Unpacked brotli '{fn}' → '{out_name}'")
-            return {"ok": True, "state": api_dna_state()}
-
-        elif mode == "dat":
-            for fn in selected:
-                dat_p = safe_join(proj_dir, fn)
-                prefix = re.sub(r"\.new\.dat$", "", fn, flags=re.I)
-                tl_p = safe_join(proj_dir, f"{prefix}.transfer.list")
-                if not os.path.exists(tl_p):
-                    raise HTTPException(status_code=400, detail=f"Missing {prefix}.transfer.list in project.")
-                out_img = safe_join(proj_dir, f"{prefix}.img")
-                sdat2img_convert(tl_p, dat_p, out_img)
-                dna_log("SUCCESS", f"Converted '{fn}' + '{prefix}.transfer.list' → '{prefix}.img'")
-            return {"ok": True, "state": api_dna_state()}
-
-        elif mode == "payload":
-            target_pl = selected[0] if selected else "payload.bin"
-            pl_path = safe_join(proj_dir, target_pl)
-            if not os.path.isfile(pl_path):
-                raise HTTPException(status_code=404, detail=f"'{target_pl}' not found in project.")
-            # Read partition list from CrAU header and unpack standard partitions
-            with open(pl_path, "rb") as f:
-                if f.read(4) != b"CrAU":
-                    raise HTTPException(status_code=400, detail="Invalid payload.bin header.")
-            for p_to_ext in ("boot", "init_boot", "vendor_boot", "dtbo", "vbmeta", "system", "vendor", "product", "system_ext", "odm"):
+        def _worker():
+            try:
+                set_bg_task(tid, 35, f"Uploading '{base_fn}' ({os.path.getsize(fp)/MB:.1f} MB) to Hugging Face...")
+                repo_path = f"dna_ported/{u_low}/{ustate['current_project']}/{base_fn}"
+                hf_api.upload_file(path_or_fileobj=fp, path_in_repo=repo_path, repo_id=dataset_repo, repo_type="dataset")
+                dl_url = hf_hub_url(repo_id=dataset_repo, filename=repo_path, repo_type="dataset")
+                set_bg_task(tid, 85, "Updating Universal Vault index...")
                 try:
-                    tmp_id = "dna_pl"
-                    jobs_dict[tmp_id] = {"cancel": False, "logs": [], "search_progress": 0, "cont_progress": 0, "ext_progress": 0, "fin_progress": 0, "chunks_verified": 0}
-                    with open(pl_path, "rb") as fp:
-                        out_p = os.path.join(proj_dir, f"{p_to_ext}.img")
-                        extract_from_payload(tmp_id, Stream(fp, seek_ok=True), p_to_ext, out_p)
-                        dna_log("SUCCESS", f"Extracted '{p_to_ext}.img' from payload.bin")
+                    from app import update_vault_index
+                    sz_mb = os.path.getsize(fp) / MB
+                    sha = hashlib.sha256(open(fp, "rb").read(8 * MB)).hexdigest()
+                    entry = {
+                        "rom_key": f"DNA__{u_low}__{ustate['current_project']}",
+                        "device_name": f"{device_name} (@{USERS_DB.get(u_low, {}).get('username', u_low)})",
+                        "codename": ustate["current_project"],
+                        "rom_version": "DNA-Port",
+                        "rom_category": "Custom ROM",
+                        "rom_format": "DNA KITCHEN",
+                        "auto_status": "Packed in DNA Cloud Kitchen",
+                        "rom_url": dl_url,
+                        "rom_filename": base_fn,
+                        "target": base_fn,
+                        "source": f"/sdcard/DNA/{ustate['current_project']}",
+                        "sha256": sha,
+                        "size": f"{sz_mb:.2f} MB",
+                        "signature": detect_img_type(fp).upper(),
+                        "download_url": dl_url,
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")
+                    }
+                    update_vault_index(TASKS_TMP_DIR, entry)
                 except Exception:
                     pass
-            return {"ok": True, "state": api_dna_state()}
+                BG_TASKS[tid].update({"pct": 100, "label": f"Pushed '{base_fn}' to Universal Vault ✓", "state": "done"})
+                dna_log(u_low, "SUCCESS", f"Pushed '{base_fn}' to Universal HF Vault → {dl_url}")
+            except Exception as e:
+                BG_TASKS[tid].update({"state": "error", "error": str(e)})
+                dna_log(u_low, "ERROR", f"Vault push failed: {e}")
 
-        raise HTTPException(status_code=400, detail="Unknown unpack mode.")
+        threading.Thread(target=_worker, daemon=True).start()
+        return {"ok": True, "task_id": tid}
 
-    def _unpack_super_internal(proj_dir: str, super_filename: str, delete_source: bool = False):
-        from app import parse_lp, ExpandedReader, Stream, HEAD_BYTES
+    def _unpack_super_internal(u_low: str, proj_dir: str, super_filename: str, delete_source: bool = False, tid: str = None):
+        from app import parse_lp, ExpandedReader, Stream, extract_from_super
         src_p = safe_join(proj_dir, super_filename)
         if not os.path.isfile(src_p):
-            raise HTTPException(status_code=404, detail=f"'{super_filename}' not found in project.")
+            raise Exception(f"'{super_filename}' not found in project.")
         with open(src_p, "rb") as fp:
             reader = ExpandedReader(Stream(fp, seek_ok=True), os.path.getsize(src_p))
             head = bytearray(HEAD_BYTES)
@@ -1025,158 +1229,340 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                     break
             parts = parse_lp(bytes(head))
 
-        extracted_names = []
+        active_parts = [pname for pname, exts in parts.items() if sum(e[1] for e in exts) > 0 and not pname.endswith("_b")]
         tmp_id = "dna_super"
         jobs_dict[tmp_id] = {"cancel": False, "logs": [], "search_progress": 0, "cont_progress": 0, "ext_progress": 0, "fin_progress": 0, "chunks_verified": 0}
-        for pname, exts in parts.items():
-            if sum(e[1] for e in exts) == 0 or pname.endswith("_b"):
-                continue
+        for idx_p, pname in enumerate(active_parts, 1):
             clean_out = re.sub(r"_a$", "", pname) + ".img"
+            if tid:
+                set_bg_task(tid, int(10 + (idx_p / max(1, len(active_parts))) * 85), f"Unpacking '{clean_out}' ({idx_p}/{len(active_parts)}) from {super_filename}...")
             out_p = os.path.join(proj_dir, clean_out)
             with open(src_p, "rb") as fp:
                 extract_from_super(tmp_id, Stream(fp, seek_ok=True), pname, out_p, os.path.getsize(src_p), super_filename)
-            extracted_names.append(clean_out)
-            dna_log("UNPACK", f"Extracted '{clean_out}' from {super_filename}")
+            dna_log(u_low, "UNPACK", f"Extracted '{clean_out}' from {super_filename}")
 
-        # Keep the original super image as a recovery copy; remote persistence is asynchronous
-        # at the request boundary, so deleting it here could cause irreversible data loss.
-        return extracted_names
+        if delete_source and os.path.exists(src_p):
+            os.remove(src_p)
+
+    @router.post("/unpack")
+    def api_dna_unpack(
+        mode: str = Form(...),
+        files: str = Form(""),
+        delete_source: bool = Form(False),
+        x_dna_token: Optional[str] = Header(None)
+    ):
+        u_low = _current_user(x_dna_token)
+        proj_dir = get_proj_dir(u_low)
+        selected = [x.strip() for x in files.split(",") if x.strip()]
+        if not selected and mode not in ("super", "payload"):
+            raise HTTPException(status_code=400, detail="Please select at least one file.")
+
+        tid = create_bg_task(f"Starting unpack ({mode})...")
+
+        def _worker():
+            try:
+                if mode == "img":
+                    for i, fn in enumerate(selected, 1):
+                        set_bg_task(tid, int((i - 0.8) / len(selected) * 90), f"Unpacking {fn} ({i}/{len(selected)})...")
+                        fmt = detect_img_type(safe_join(proj_dir, fn))
+                        if fmt.startswith("super"):
+                            _unpack_super_internal(u_low, proj_dir, fn, delete_source, tid)
+                        else:
+                            unpack_single_img_file(u_low, proj_dir, fn, delete_source, tid)
+                elif mode == "super":
+                    _unpack_super_internal(u_low, proj_dir, selected[0] if selected else "super.img", delete_source, tid)
+                elif mode == "zstd":
+                    for fn in selected:
+                        set_bg_task(tid, 40, f"Decompressing zstd '{fn}'...")
+                        src = safe_join(proj_dir, fn)
+                        out_name = re.sub(r"\.zst$", "", fn, flags=re.I)
+                        if out_name == fn:
+                            out_name += ".img"
+                        dst = safe_join(proj_dir, out_name)
+                        with open(src, "rb") as fin, open(dst, "wb") as fout:
+                            zstd.ZstdDecompressor().copy_stream(fin, fout)
+                        if delete_source:
+                            os.remove(src)
+                        dna_log(u_low, "SUCCESS", f"Unpacked zstd '{fn}' → '{out_name}'")
+                elif mode == "br":
+                    for fn in selected:
+                        set_bg_task(tid, 40, f"Decompressing brotli '{fn}'...")
+                        src = safe_join(proj_dir, fn)
+                        out_name = re.sub(r"\.br$", "", fn, flags=re.I)
+                        dst = safe_join(proj_dir, out_name)
+                        if shutil.which("brotli"):
+                            subprocess.run(["brotli", "-d", "-f", "-o", dst, src], check=True)
+                        elif BROTLI_AVAILABLE:
+                            with open(src, "rb") as fin, open(dst, "wb") as fout:
+                                fout.write(brotli.decompress(fin.read()))
+                        if delete_source:
+                            os.remove(src)
+                        dna_log(u_low, "SUCCESS", f"Unpacked brotli '{fn}' → '{out_name}'")
+                elif mode == "dat":
+                    for fn in selected:
+                        set_bg_task(tid, 45, f"Converting '{fn}' to raw .img...")
+                        dat_p = safe_join(proj_dir, fn)
+                        prefix = re.sub(r"\.new\.dat$", "", fn, flags=re.I)
+                        tl_p = safe_join(proj_dir, f"{prefix}.transfer.list")
+                        if not os.path.exists(tl_p):
+                            raise Exception(f"Missing {prefix}.transfer.list in project.")
+                        sdat2img_convert(tl_p, dat_p, safe_join(proj_dir, f"{prefix}.img"))
+                        dna_log(u_low, "SUCCESS", f"Converted '{fn}' → '{prefix}.img'")
+                elif mode == "payload":
+                    from app import extract_from_payload, Stream
+                    target_pl = selected[0] if selected else "payload.bin"
+                    pl_path = safe_join(proj_dir, target_pl)
+                    parts_list = ("boot", "init_boot", "vendor_boot", "dtbo", "vbmeta", "system", "vendor", "product", "system_ext", "odm")
+                    for idx_p, p_to_ext in enumerate(parts_list, 1):
+                        set_bg_task(tid, int(idx_p / len(parts_list) * 90), f"Scanning payload.bin for '{p_to_ext}'...")
+                        try:
+                            tmp_id = "dna_pl"
+                            jobs_dict[tmp_id] = {"cancel": False, "logs": [], "search_progress": 0, "cont_progress": 0, "ext_progress": 0, "fin_progress": 0, "chunks_verified": 0}
+                            with open(pl_path, "rb") as fp:
+                                extract_from_payload(tmp_id, Stream(fp, seek_ok=True), p_to_ext, os.path.join(proj_dir, f"{p_to_ext}.img"))
+                                dna_log(u_low, "SUCCESS", f"Extracted '{p_to_ext}.img' from payload.bin")
+                        except Exception:
+                            pass
+                BG_TASKS[tid].update({"pct": 100, "label": f"Unpack ({mode}) complete ✓", "state": "done"})
+            except Exception as e:
+                BG_TASKS[tid].update({"state": "error", "error": str(e)})
+                dna_log(u_low, "ERROR", f"Unpack error: {e}")
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return {"ok": True, "task_id": tid}
 
     @router.post("/pack_single")
-    def api_dna_pack_single(req: PackSingleRequest):
-        res = pack_single_partition_worker(req)
-        return {"ok": True, "result": res, "state": api_dna_state(req.project)}
+    def api_dna_pack_single(req: PackSingleRequest, x_dna_token: Optional[str] = Header(None)):
+        u_low = _current_user(x_dna_token)
+        tid = create_bg_task(f"Packing '{req.partition}' ({req.pack_type.upper()})...")
+
+        def _worker():
+            try:
+                res = pack_single_partition_worker(u_low, req, tid)
+                BG_TASKS[tid].update({"pct": 100, "label": f"Packed {res['output_file']} ({res['size_mb']}) ✓", "state": "done"})
+            except Exception as e:
+                BG_TASKS[tid].update({"state": "error", "error": str(e)})
+                dna_log(u_low, "ERROR", f"Pack error: {e}")
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return {"ok": True, "task_id": tid}
 
     @router.post("/pack_zstd")
-    def api_dna_pack_zstd(filename: str = Form(...), level: int = Form(6)):
-        proj_dir = get_proj_dir()
-        src = safe_join(proj_dir, filename)
-        dst = safe_join(proj_dir, f"{filename}.zst")
-        with open(src, "rb") as fin, open(dst, "wb") as fout:
-            cctx = zstd.ZstdCompressor(level=max(1, min(19, int(level))))
-            cctx.copy_stream(fin, fout)
-        dna_log("SUCCESS", f"Packed '{filename}.zst' ({os.path.getsize(dst) / MB:.2f} MB)")
-        return {"ok": True, "state": api_dna_state()}
+    def api_dna_pack_zstd(filename: str = Form(...), level: int = Form(6), x_dna_token: Optional[str] = Header(None)):
+        u_low = _current_user(x_dna_token)
+        proj_dir = get_proj_dir(u_low)
+        tid = create_bg_task(f"Compressing '{filename}' to .zst...")
+
+        def _worker():
+            try:
+                src = safe_join(proj_dir, filename)
+                dst = safe_join(proj_dir, f"{filename}.zst")
+                set_bg_task(tid, 45, f"Compressing {filename} (level {level})...")
+                with open(src, "rb") as fin, open(dst, "wb") as fout:
+                    zstd.ZstdCompressor(level=max(1, min(19, int(level)))).copy_stream(fin, fout)
+                sz = os.path.getsize(dst) / MB
+                BG_TASKS[tid].update({"pct": 100, "label": f"Packed {filename}.zst ({sz:.2f} MB) ✓", "state": "done"})
+                dna_log(u_low, "SUCCESS", f"Packed '{filename}.zst' ({sz:.2f} MB)")
+            except Exception as e:
+                BG_TASKS[tid].update({"state": "error", "error": str(e)})
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return {"ok": True, "task_id": tid}
 
     @router.post("/pack_super")
-    def api_dna_pack_super(req: PackSuperRequest):
-        res = build_super_image(req)
-        return {"ok": True, "result": res, "state": api_dna_state(req.project)}
+    def api_dna_pack_super(req: PackSuperRequest, x_dna_token: Optional[str] = Header(None)):
+        u_low = _current_user(x_dna_token)
+        tid = create_bg_task("Building super.img...")
+
+        def _worker():
+            try:
+                res = build_super_image(u_low, req, tid)
+                BG_TASKS[tid].update({"pct": 100, "label": f"Built super.img ({res['size_mb']}) ✓", "state": "done"})
+            except Exception as e:
+                BG_TASKS[tid].update({"state": "error", "error": str(e)})
+                dna_log(u_low, "ERROR", f"super.img build error: {e}")
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return {"ok": True, "task_id": tid}
 
     @router.post("/convert")
-    def api_dna_convert(mode: str = Form(...), filename: str = Form(...), br_level: int = Form(3)):
-        proj_dir = get_proj_dir()
+    def api_dna_convert(mode: str = Form(...), filename: str = Form(...), br_level: int = Form(3), x_dna_token: Optional[str] = Header(None)):
+        u_low = _current_user(x_dna_token)
+        proj_dir = get_proj_dir(u_low)
         src = safe_join(proj_dir, filename)
         if not os.path.isfile(src):
             raise HTTPException(status_code=404, detail="Source image not found.")
         stem = re.sub(r"\.(img|simg)$", "", filename, flags=re.I)
+        tid = create_bg_task(f"Converting '{filename}' ({mode})...")
 
-        if mode == "img_to_simg":
-            fmt = detect_img_type(src)
-            if fmt == "sparse" or fmt.endswith("(sparse)"):
-                out_name = f"{stem}_raw.img"
-                sparse_to_raw(src, safe_join(proj_dir, out_name))
-                dna_log("SUCCESS", f"Converted Sparse '{filename}' → Raw '{out_name}'")
-            else:
-                out_name = f"{stem}_sparse.img"
-                raw_to_sparse(src, safe_join(proj_dir, out_name))
-                dna_log("SUCCESS", f"Converted Raw '{filename}' → Android Sparse '{out_name}'")
-            return {"ok": True, "state": api_dna_state()}
+        def _worker():
+            try:
+                if mode == "img_to_simg":
+                    if is_sparse_file(src):
+                        out_name = f"{stem}_raw.img"
+                        set_bg_task(tid, 45, f"Converting Sparse '{filename}' → Raw '{out_name}'...")
+                        sparse_to_raw(src, safe_join(proj_dir, out_name))
+                        dna_log(u_low, "SUCCESS", f"Converted Sparse '{filename}' → Raw '{out_name}'")
+                    else:
+                        out_name = f"{stem}_sparse.img"
+                        set_bg_task(tid, 45, f"Converting Raw '{filename}' → Sparse '{out_name}'...")
+                        raw_to_sparse(src, safe_join(proj_dir, out_name))
+                        dna_log(u_low, "SUCCESS", f"Converted Raw '{filename}' → Android Sparse '{out_name}'")
+                    BG_TASKS[tid].update({"pct": 100, "label": f"Created {out_name} ✓", "state": "done"})
+                elif mode == "img_to_dat_br":
+                    set_bg_task(tid, 35, f"Converting '{filename}' → '{stem}.new.dat'...")
+                    dat_p, _tl_p = img2sdat_convert(src, proj_dir, stem)
+                    br_p = f"{dat_p}.br"
+                    lvl = max(0, min(11, int(br_level)))
+                    set_bg_task(tid, 70, f"Compressing '{stem}.new.dat.br' (level {lvl})...")
+                    if shutil.which("brotli"):
+                        subprocess.run(["brotli", f"-q{lvl}", "-f", "-o", br_p, dat_p], check=True)
+                    elif BROTLI_AVAILABLE:
+                        with open(dat_p, "rb") as fin, open(br_p, "wb") as fout:
+                            fout.write(brotli.compress(fin.read(), quality=lvl))
+                    dna_log(u_low, "SUCCESS", f"Converted '{filename}' → '{stem}.new.dat.br'")
+                    BG_TASKS[tid].update({"pct": 100, "label": f"Created {stem}.new.dat.br ✓", "state": "done"})
+            except Exception as e:
+                BG_TASKS[tid].update({"state": "error", "error": str(e)})
+                dna_log(u_low, "ERROR", f"Conversion failed: {e}")
 
-        elif mode == "img_to_dat_br":
-            dat_p, tl_p = img2sdat_convert(src, proj_dir, stem)
-            br_p = f"{dat_p}.br"
-            lvl = max(0, min(11, int(br_level)))
-            if shutil.which("brotli"):
-                subprocess.run(["brotli", f"-q{lvl}", "-f", "-o", br_p, dat_p], check=True)
-            elif BROTLI_AVAILABLE:
-                with open(dat_p, "rb") as fin, open(br_p, "wb") as fout:
-                    fout.write(brotli.compress(fin.read(), quality=lvl))
-            dna_log("SUCCESS", f"Converted '{filename}' → '{stem}.new.dat', '{stem}.transfer.list' & '{stem}.new.dat.br' (level {lvl})")
-            return {"ok": True, "state": api_dna_state()}
+        threading.Thread(target=_worker, daemon=True).start()
+        return {"ok": True, "task_id": tid}
 
-        raise HTTPException(status_code=400, detail="Unsupported conversion mode.")
+    # ---------------- MT MANAGER DUAL-PANE ENDPOINTS ---------------- #
 
-    # ---------------- DUAL-PANE MANAGER ENDPOINTS ---------------- #
+    def _load_fs_maps_for_dir(u_root: str, target_dir: str):
+        rel = os.path.relpath(target_dir, u_root).replace("\\", "/")
+        parts = [] if rel == "." else rel.split("/")
+        fs_map, fc_map = {}, {}
+        proj_dir, top_part = None, ""
+        if len(parts) >= 2:
+            proj_dir = os.path.join(u_root, parts[0])
+            top_part = parts[1]
+            if top_part != "config":
+                cfg_f = os.path.join(proj_dir, "config", f"{top_part}_fs_config")
+                fc_f = os.path.join(proj_dir, "config", f"{top_part}_file_contexts")
+                if os.path.exists(cfg_f):
+                    for line in open(cfg_f, encoding="utf-8", errors="ignore"):
+                        sp = line.strip().split()
+                        if len(sp) >= 4:
+                            fs_map[sp[0]] = {"uid": sp[1], "gid": sp[2], "mode": sp[3]}
+                if os.path.exists(fc_f):
+                    for line in open(fc_f, encoding="utf-8", errors="ignore"):
+                        sp = line.strip().split()
+                        if len(sp) >= 2:
+                            fc_map[sp[0].lstrip("/").replace("\\", "")] = sp[1]
+        return proj_dir, top_part, fs_map, fc_map
 
     @router.get("/fs/list")
-    def api_fs_list(path: str = "", project: Optional[str] = None):
-        proj_dir = get_proj_dir(project)
-        target_dir = safe_join(proj_dir, path)
-        if not os.path.exists(target_dir):
-            target_dir = proj_dir
+    def api_fs_list(path: str = "", x_dna_token: Optional[str] = Header(None)):
+        u_low = _current_user(x_dna_token)
+        u_root = get_user_root(u_low)
+        target_dir = safe_join(u_root, path)
+        if not os.path.exists(target_dir) or not os.path.isdir(target_dir):
+            target_dir = u_root
             path = ""
 
-        # Load fs_config & file_contexts map if inside an unpacked partition
-        rel_from_proj = os.path.relpath(target_dir, proj_dir).replace("\\", "/")
-        top_part = rel_from_proj.split("/")[0] if rel_from_proj != "." else ""
-        fs_map = {}
-        fc_map = {}
-        if top_part and top_part != "config":
-            cfg_f = os.path.join(proj_dir, "config", f"{top_part}_fs_config")
-            fc_f = os.path.join(proj_dir, "config", f"{top_part}_file_contexts")
-            if os.path.exists(cfg_f):
-                for line in open(cfg_f, encoding="utf-8", errors="ignore"):
-                    sp = line.strip().split()
-                    if len(sp) >= 4:
-                        fs_map[sp[0]] = {"uid": sp[1], "gid": sp[2], "mode": sp[3]}
-            if os.path.exists(fc_f):
-                for line in open(fc_f, encoding="utf-8", errors="ignore"):
-                    sp = line.strip().split()
-                    if len(sp) >= 2:
-                        clean_k = sp[0].lstrip("/").replace("\\", "")
-                        fc_map[clean_k] = sp[1]
+        rel_from_user = os.path.relpath(target_dir, u_root).replace("\\", "/")
+        if rel_from_user == ".":
+            rel_from_user = ""
 
-        items = []
+        proj_dir, top_part, fs_map, fc_map = _load_fs_maps_for_dir(u_root, target_dir)
+        items, dir_count, file_count = [], 0, 0
+
         for name in sorted(os.listdir(target_dir), key=lambda x: (not os.path.isdir(os.path.join(target_dir, x)), x.lower())):
             full = os.path.join(target_dir, name)
-            rel_item = os.path.relpath(full, proj_dir).replace("\\", "/")
+            rel_item = os.path.relpath(full, u_root).replace("\\", "/")
             is_dir = os.path.isdir(full)
             is_link = os.path.islink(full)
+            if is_dir:
+                dir_count += 1
+            else:
+                file_count += 1
+
             sz = 0 if is_dir else (os.path.getsize(full) if os.path.exists(full) else 0)
-            mtime = datetime.fromtimestamp(os.path.getmtime(full)).strftime("%y-%m-%d %H:%M") if os.path.exists(full) else ""
-            meta = fs_map.get(rel_item, {"uid": "0", "gid": "0", "mode": "0755" if is_dir else "0644"})
-            ctx = fc_map.get(rel_item, f"u:object_r:{top_part or 'system'}_file:s0")
+            mtime_dt = datetime.fromtimestamp(os.path.getmtime(full)) if os.path.exists(full) else datetime.now()
+            rel_in_proj = os.path.relpath(full, proj_dir).replace("\\", "/") if proj_dir else ""
+            default_mode = "0755" if is_dir else ("0600" if name == "build.prop" else "0644")
+            meta = fs_map.get(rel_in_proj, {"uid": "0", "gid": "0", "mode": default_mode})
+            ctx = fc_map.get(rel_in_proj, f"u:object_r:{top_part or 'system'}_file:s0")
+
+            short_oct = format_short_octal(meta["mode"])
+            sym_perm = mode_octal_to_symbolic(meta["mode"], is_dir=is_dir, is_link=is_link)
+            size_human = f"{sz / MB:.2f}M" if sz >= MB else (f"{sz / 1024:.2f}K" if sz >= 1024 else f"{sz}B")
+
             items.append({
                 "name": name,
                 "rel_path": rel_item,
+                "parent_display": f"/data/DNA/{os.path.dirname(rel_item)}/".replace("//", "/"),
                 "is_dir": is_dir,
                 "is_link": is_link,
                 "link_target": os.readlink(full) if is_link else "",
                 "size": sz,
-                "size_str": "<DIR>" if is_dir else (f"{sz / MB:.2f} MB" if sz >= MB else f"{sz / 1024:.1f} KB" if sz >= 1024 else f"{sz} B"),
-                "mtime": mtime,
+                "size_str": size_human,
+                "size_full": f"{size_human} ({sz:,})",
+                "mtime": mtime_dt.strftime("%y-%m-%d %H:%M"),
+                "mtime_full": mtime_dt.strftime("%Y-%m-%d %H:%M:%S"),
                 "mode": meta["mode"],
-                "owner": f"{meta['uid']}:{meta['gid']}",
+                "short_octal": short_oct,
+                "sym_perm": sym_perm,
+                "uid": meta["uid"],
+                "gid": meta["gid"],
                 "selinux": ctx
             })
 
+        total_disk, _used, free_disk = shutil.disk_usage(u_root)
+        disk_str = f"Folders: {dir_count}  Files: {file_count}  Free: {free_disk / (1024**3):.2f}G/{total_disk / (1024**3):.2f}G"
+        projects = sorted([d for d in os.listdir(u_root) if os.path.isdir(os.path.join(u_root, d))])
+
         return {
-            "project": DNA_STATE["current_project"],
-            "current_rel": "" if rel_from_proj == "." else rel_from_proj,
-            "display_path": f"/sdcard/DNA/{DNA_STATE['current_project']}" + ("" if rel_from_proj == "." else f"/{rel_from_proj}"),
+            "current_rel": rel_from_user,
+            "display_path": f"/data/DNA/{rel_from_user}/".replace("//", "/"),
+            "stats_line": disk_str,
+            "projects": projects,
             "items": items
         }
 
-    @router.get("/fs/read")
-    def api_fs_read(path: str):
-        proj_dir = get_proj_dir()
-        fp = safe_join(proj_dir, path)
+    @router.get("/fs/checksum")
+    def api_fs_checksum(path: str, x_dna_token: Optional[str] = Header(None)):
+        u_low = _current_user(x_dna_token)
+        fp = safe_join(get_user_root(u_low), path)
         if not os.path.isfile(fp):
             raise HTTPException(status_code=404, detail="File not found.")
-        if os.path.getsize(fp) > 3 * MB:
-            raise HTTPException(status_code=400, detail="File is larger than 3 MB (binary image). Use Unpack/Archive tools instead.")
+        md5_h, sha1_h, sha256_h, crc_v = hashlib.md5(), hashlib.sha1(), hashlib.sha256(), 0
+        with open(fp, "rb") as f:
+            while chunk := f.read(2 * MB):
+                md5_h.update(chunk)
+                sha1_h.update(chunk)
+                sha256_h.update(chunk)
+                crc_v = zlib.crc32(chunk, crc_v)
+        return {
+            "filename": os.path.basename(fp),
+            "md5": md5_h.hexdigest(),
+            "sha1": sha1_h.hexdigest(),
+            "sha256": sha256_h.hexdigest(),
+            "crc32": f"{crc_v & 0xFFFFFFFF:08x}"
+        }
+
+    @router.get("/fs/read")
+    def api_fs_read(path: str, x_dna_token: Optional[str] = Header(None)):
+        u_low = _current_user(x_dna_token)
+        fp = safe_join(get_user_root(u_low), path)
+        if not os.path.isfile(fp):
+            raise HTTPException(status_code=404, detail="File not found.")
+        if os.path.getsize(fp) > 4 * MB:
+            raise HTTPException(status_code=400, detail="File is larger than 4 MB (binary).")
         with open(fp, "r", encoding="utf-8", errors="replace") as f:
             return {"path": path, "content": f.read()}
 
     @router.post("/fs/write")
-    def api_fs_write(path: str = Form(...), content: str = Form(...)):
-        proj_dir = get_proj_dir()
-        fp = safe_join(proj_dir, path)
+    def api_fs_write(path: str = Form(...), content: str = Form(...), x_dna_token: Optional[str] = Header(None)):
+        u_low = _current_user(x_dna_token)
+        fp = safe_join(get_user_root(u_low), path)
         os.makedirs(os.path.dirname(fp), exist_ok=True)
         with open(fp, "w", encoding="utf-8") as f:
             f.write(content)
-        dna_log("MANAGER", f"Saved modified file '{path}'")
+        dna_log(u_low, "MANAGER", f"Saved modified file '{path}'")
         return {"ok": True}
 
     @router.post("/fs/op")
@@ -1188,109 +1574,97 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         uid: str = Form("0"),
         gid: str = Form("0"),
         selinux: str = Form("u:object_r:system_file:s0"),
-        recursive: bool = Form(False)
+        recursive: bool = Form(False),
+        x_dna_token: Optional[str] = Header(None)
     ):
-        proj_dir = get_proj_dir()
-        src_full = safe_join(proj_dir, src) if src else proj_dir
-        dst_full = safe_join(proj_dir, dst) if dst else proj_dir
+        u_low = _current_user(x_dna_token)
+        u_root = get_user_root(u_low)
+        src_full = safe_join(u_root, src) if src else u_root
+        dst_full = safe_join(u_root, dst) if dst else u_root
 
         if op == "copy":
             target = os.path.join(dst_full, os.path.basename(src_full)) if os.path.isdir(dst_full) else dst_full
+            if os.path.abspath(src_full) == os.path.abspath(target):
+                target += "_copy"
             if os.path.isdir(src_full):
                 shutil.copytree(src_full, target, symlinks=True, dirs_exist_ok=True)
             else:
                 shutil.copy2(src_full, target, follow_symlinks=False)
-            dna_log("MANAGER", f"Copied '{src}' → '{dst}'")
-
+            dna_log(u_low, "MANAGER", f"Copied '{src}' → '{dst or '/'}'")
         elif op == "move":
             target = os.path.join(dst_full, os.path.basename(src_full)) if os.path.isdir(dst_full) else dst_full
             shutil.move(src_full, target)
-            dna_log("MANAGER", f"Moved '{src}' → '{dst}'")
-
+            dna_log(u_low, "MANAGER", f"Moved '{src}' → '{dst or '/'}'")
         elif op == "delete":
             if os.path.isdir(src_full) and not os.path.islink(src_full):
                 shutil.rmtree(src_full)
             elif os.path.exists(src_full) or os.path.islink(src_full):
                 os.remove(src_full)
-            dna_log("MANAGER", f"Deleted '{src}'")
-
+            dna_log(u_low, "MANAGER", f"Deleted '{src}'")
         elif op == "mkdir":
             os.makedirs(src_full, exist_ok=True)
-            dna_log("MANAGER", f"Created folder '{src}'")
-
+            dna_log(u_low, "MANAGER", f"Created folder '{src}'")
         elif op == "rename":
             shutil.move(src_full, dst_full)
-            dna_log("MANAGER", f"Renamed '{src}' → '{dst}'")
-
+            dna_log(u_low, "MANAGER", f"Renamed '{src}' → '{dst}'")
         elif op == "symlink":
             if os.path.exists(src_full) or os.path.islink(src_full):
                 os.remove(src_full)
             os.symlink(dst, src_full)
-            dna_log("MANAGER", f"Created symlink '{src}' → '{dst}'")
-
+            dna_log(u_low, "MANAGER", f"Created symlink '{src}' → '{dst}'")
         elif op == "chmod_chcon":
-            rel_item = os.path.relpath(src_full, proj_dir).replace("\\", "/")
-            top_part = rel_item.split("/")[0]
-            cfg_dir = os.path.join(proj_dir, "config")
-            os.makedirs(cfg_dir, exist_ok=True)
-            cfg_f = os.path.join(cfg_dir, f"{top_part}_fs_config")
-            fc_f = os.path.join(cfg_dir, f"{top_part}_file_contexts")
+            rel_from_user = os.path.relpath(src_full, u_root).replace("\\", "/")
+            parts = rel_from_user.split("/")
+            if len(parts) >= 2:
+                proj_dir = os.path.join(u_root, parts[0])
+                top_part = parts[1]
+                rel_in_proj = os.path.relpath(src_full, proj_dir).replace("\\", "/")
+                cfg_dir = os.path.join(proj_dir, "config")
+                os.makedirs(cfg_dir, exist_ok=True)
+                cfg_f = os.path.join(cfg_dir, f"{top_part}_fs_config")
+                fc_f = os.path.join(cfg_dir, f"{top_part}_file_contexts")
 
-            targets = [rel_item]
-            if recursive and os.path.isdir(src_full):
-                for r, ds, fs in os.walk(src_full):
-                    for x in ds + fs:
-                        targets.append(os.path.relpath(os.path.join(r, x), proj_dir).replace("\\", "/"))
+                targets = [rel_in_proj]
+                if recursive and os.path.isdir(src_full):
+                    for r, ds, fs in os.walk(src_full):
+                        for x in ds + fs:
+                            targets.append(os.path.relpath(os.path.join(r, x), proj_dir).replace("\\", "/"))
 
-            # Update fs_config
-            existing_cfg = {}
-            if os.path.exists(cfg_f):
-                for l in open(cfg_f, encoding="utf-8", errors="ignore"):
-                    s = l.strip().split()
-                    if len(s) >= 4:
-                        existing_cfg[s[0]] = s[1:]
-            for t in targets:
-                existing_cfg[t] = [uid, gid, mode]
-            with open(cfg_f, "w", encoding="utf-8") as f:
-                for k, v in sorted(existing_cfg.items()):
-                    f.write(f"{k} {' '.join(v)}\n")
+                norm_mode = "0" + mode.strip() if len(mode.strip()) == 3 else mode.strip()
+                existing_cfg = {}
+                if os.path.exists(cfg_f):
+                    for l in open(cfg_f, encoding="utf-8", errors="ignore"):
+                        s = l.strip().split()
+                        if len(s) >= 4:
+                            existing_cfg[s[0]] = s[1:]
+                for t in targets:
+                    existing_cfg[t] = [uid, gid, norm_mode]
+                with open(cfg_f, "w", encoding="utf-8") as f:
+                    for k, v in sorted(existing_cfg.items()):
+                        f.write(f"{k} {' '.join(v)}\n")
 
-            # Update file_contexts
-            existing_fc = {}
-            if os.path.exists(fc_f):
-                for l in open(fc_f, encoding="utf-8", errors="ignore"):
-                    s = l.strip().split()
-                    if len(s) >= 2:
-                        existing_fc[s[0]] = s[1]
-            for t in targets:
-                existing_fc[f"/{re.escape(t)}"] = selinux
-            with open(fc_f, "w", encoding="utf-8") as f:
-                for k, v in sorted(existing_fc.items()):
-                    f.write(f"{k} {v}\n")
-
-            dna_log("MANAGER", f"Updated permissions ({mode}, {uid}:{gid}) & SELinux ({selinux}) on '{src}'")
-
+                existing_fc = {}
+                if os.path.exists(fc_f):
+                    for l in open(fc_f, encoding="utf-8", errors="ignore"):
+                        s = l.strip().split()
+                        if len(s) >= 2:
+                            existing_fc[s[0]] = s[1]
+                for t in targets:
+                    existing_fc[f"/{re.escape(t)}"] = selinux
+                with open(fc_f, "w", encoding="utf-8") as f:
+                    for k, v in sorted(existing_fc.items()):
+                        f.write(f"{k} {v}\n")
+            dna_log(u_low, "MANAGER", f"Updated permissions ({mode}, {uid}:{gid}) & SELinux ({selinux}) on '{src}'")
         elif op == "mount_archive":
-            # Unpacks .apex / .apk / .zip into <name>_unpacked folder for editing
             out_d = src_full + "_unpacked"
             os.makedirs(out_d, exist_ok=True)
             if zipfile.is_zipfile(src_full):
                 with zipfile.ZipFile(src_full, "r") as zf:
                     zf.extractall(out_d)
-                # If it's an APEX with apex_payload.img inside, also unpack apex_payload.img!
-                ap_img = os.path.join(out_d, "apex_payload.img")
-                if os.path.isfile(ap_img):
-                    rel_ap = os.path.relpath(ap_img, proj_dir)
-                    try:
-                        unpack_single_img_file(proj_dir, rel_ap, delete_source=False)
-                    except Exception:
-                        pass
-                dna_log("MANAGER", f"Mounted archive/APEX '{src}' → '{os.path.relpath(out_d, proj_dir)}'")
+                dna_log(u_low, "MANAGER", f"Unpacked archive '{src}'")
             else:
-                raise HTTPException(status_code=400, detail="Selected file is not a valid ZIP/APEX/APK archive.")
-
+                raise HTTPException(status_code=400, detail="Not a valid ZIP/APEX/APK archive.")
         elif op == "repack_archive":
-            # Repacks <name>_unpacked folder back into the original .apex / .apk / .zip
             orig_archive = re.sub(r"_unpacked$", "", src_full)
             with zipfile.ZipFile(orig_archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                 for r, _ds, fs in os.walk(src_full):
@@ -1299,27 +1673,32 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                         arcname = os.path.relpath(full_f, src_full).replace("\\", "/")
                         ctype = zipfile.ZIP_STORED if fn.endswith((".img", ".so", ".arsc")) else zipfile.ZIP_DEFLATED
                         zf.write(full_f, arcname, compress_type=ctype)
-            dna_log("MANAGER", f"Repacked folder '{src}' → '{os.path.relpath(orig_archive, proj_dir)}'")
-
+            dna_log(u_low, "MANAGER", f"Repacked folder '{src}' → '{os.path.basename(orig_archive)}'")
         return {"ok": True}
 
     @router.post("/fs/upload")
-    async def api_fs_upload(path: str = Form(""), file: UploadFile = File(...)):
-        proj_dir = get_proj_dir()
-        target_dir = safe_join(proj_dir, path)
+    async def api_fs_upload(
+        path: str = Form(""),
+        project: str = Form(""),
+        file: UploadFile = File(...),
+        x_dna_token: Optional[str] = Header(None)
+    ):
+        u_low = _current_user(x_dna_token)
+        u_root = get_user_root(u_low)
+        target_dir = get_proj_dir(u_low, project.strip()) if project.strip() else (safe_join(u_root, path) if path.strip() else get_proj_dir(u_low))
         os.makedirs(target_dir, exist_ok=True)
         out_p = safe_join(target_dir, os.path.basename(file.filename))
         with open(out_p, "wb") as f:
             while chunk := await file.read(2 * MB):
                 f.write(chunk)
-        dna_log("MANAGER", f"Uploaded '{file.filename}' to '{path or '/'}'")
-        return {"ok": True}
+        sz_mb = os.path.getsize(out_p) / MB
+        dna_log(u_low, "UPLOAD", f"Uploaded '{file.filename}' ({sz_mb:.2f} MB)")
+        return {"ok": True, "filename": file.filename, "size_mb": f"{sz_mb:.2f} MB"}
 
     @router.get("/fs/download")
-    def api_fs_download(path: str):
-        from fastapi.responses import FileResponse
-        proj_dir = get_proj_dir()
-        fp = safe_join(proj_dir, path)
+    def api_fs_download(path: str, token: str = ""):
+        u_low = resolve_user_from_token(token)
+        fp = safe_join(get_user_root(u_low), path)
         if not os.path.isfile(fp):
             raise HTTPException(status_code=404, detail="File not found.")
         return FileResponse(fp, filename=os.path.basename(fp))
@@ -1327,171 +1706,262 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
     app.include_router(router)
     return inject_dna_ui(html_page)
 
-# ---------------- UI INJECTOR (SAME GLASS & AMBIENT DESIGN) ---------------- #
+# ---------------- UI INJECTOR (MT DUAL-PANE + AUTH + ADMIN + LIVE TASK HUD) ---------------- #
 
 DNA_TAB_HTML = r"""
+  <style>
+    .mt-dual-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 0;
+      border-radius: 20px;
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,0.12);
+      background: rgba(8, 8, 16, 0.88);
+    }
+    .mt-pane {
+      display: flex;
+      flex-direction: column;
+      min-height: 430px;
+      max-height: 64vh;
+      transition: background 0.2s ease;
+    }
+    .mt-pane.active-pane { background: rgba(139, 92, 246, 0.07); }
+    .mt-pane-left { border-right: 1.5px solid rgba(255,255,255,0.14); }
+    .mt-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 7px;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+      cursor: pointer;
+      user-select: none;
+    }
+    .mt-row:hover { background: rgba(255,255,255,0.06); }
+    .mt-row.selected { background: rgba(139, 92, 246, 0.28); }
+    .mt-dialog {
+      background: #2b2b30;
+      color: #f1f5f9;
+      border: 1px solid rgba(255,255,255,0.15);
+      box-shadow: 0 25px 60px rgba(0,0,0,0.92);
+    }
+    .mt-btn-gray {
+      background: #484850;
+      color: #e2e8f0;
+      padding: 4px 10px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+    }
+    .mt-btn-gray:hover { background: #5a5a64; }
+  </style>
+
   <div class="relative z-10 w-full max-w-lg mx-auto">
-    <!-- ================= TAB 4: DNA & MANAGER (CLOUD ROM PORTING SUITE) ================= -->
-    <div id="tabDna" class="hidden space-y-4">
-      <!-- Top Mode Switcher: 🧬 DNA vs 🗂️ Manager -->
-      <div class="glass rounded-3xl p-3.5 space-y-3">
-        <div class="flex items-center justify-between px-1">
+    <div id="tabDna" class="hidden space-y-3.5">
+
+      <!-- AUTHENTICATION GATE -->
+      <div id="dnaAuthCard" class="glass rounded-3xl p-5 space-y-4 border border-violet-500/40">
+        <div class="flex items-center justify-between">
           <div>
-            <span class="mono text-[10px] uppercase text-amber-300 font-bold block">Cloud Root Kitchen • 0 MB Phone Storage Used</span>
-            <span id="dnaProjPathLabel" class="mono text-xs font-bold text-white">Current project: /sdcard/DNA/Default_Project</span>
+            <span class="mono text-[10px] uppercase text-amber-300 font-bold block">🔒 Private ROM Porting Workspace</span>
+            <h3 class="text-base font-bold text-white mt-0.5">Sign In or Create Account</h3>
           </div>
-          <button type="button" onclick="openDnaModal('projectModal')" class="btn rip px-3 py-1.5 rounded-xl bg-violet-500/20 text-violet-300 border border-violet-400/30 mono text-[10px] font-bold">
-            📁 Project Menu
-          </button>
+          <button type="button" onclick="openDnaModal('adminModal')" class="mono text-[10px] px-2.5 py-1 rounded-full bg-rose-500/20 text-rose-300 border border-rose-400/30">🛡️ Admin</button>
         </div>
-
-        <div class="grid grid-cols-2 gap-2 bg-black/40 p-1.5 rounded-2xl border border-white/10">
-          <button type="button" id="subBtnDna" onclick="switchDnaSub('dna')" class="chip-btn active py-2.5 rounded-xl mono text-xs font-bold">
-            🧬 DNA (Unpack / Pack)
-          </button>
-          <button type="button" id="subBtnManager" onclick="switchDnaSub('manager')" class="chip-btn py-2.5 rounded-xl mono text-xs font-bold text-slate-300">
-            🗂️ Manager (Dual-Pane Root)
-          </button>
-        </div>
-      </div>
-
-      <!-- ==================== SECTION A: 🧬 DNA ==================== -->
-      <div id="dnaSubSection" class="space-y-4">
-        <!-- Quick Import from Vault Bar -->
-        <div class="glass rounded-3xl p-4 space-y-2.5">
-          <div class="flex items-center justify-between">
-            <span class="mono text-[10px] uppercase text-emerald-300 font-bold">⚡ Pull Partition / ROM Image from Vault into /sdcard/DNA</span>
-            <button type="button" onclick="loadVaultIntoDnaPicker()" class="mono text-[10px] text-amber-300 underline">Sync Vault</button>
+        <p class="text-xs text-slate-300 leading-relaxed">
+          Your projects and unpacked ROM folders in <strong>DNA</strong> &amp; <strong>Manager</strong> are private to your account. The <strong>Vault</strong> stays universal for everyone.
+        </p>
+        <div class="space-y-2.5">
+          <div>
+            <label class="mono text-[10px] uppercase text-slate-400 block mb-1">Username</label>
+            <input id="dnaAuthUser" type="text" placeholder="e.g. yash_01" class="cyber-input w-full px-3.5 py-2.5 rounded-xl text-xs mono text-white" />
           </div>
-          <div class="flex gap-2">
-            <select id="dnaVaultPicker" class="cyber-input flex-1 px-3 py-2 rounded-xl text-xs mono text-white">
-              <option value="">Tap 'Sync Vault' to list your extracted .img files...</option>
-            </select>
-            <button type="button" onclick="importSelectedVaultImg()" class="btn rip px-4 py-2 rounded-xl bg-emerald-500/25 border border-emerald-400/40 text-emerald-300 mono text-xs font-bold shrink-0">
-              📥 Import
-            </button>
+          <div>
+            <label class="mono text-[10px] uppercase text-slate-400 block mb-1">Password</label>
+            <input id="dnaAuthPass" type="password" placeholder="Enter password" class="cyber-input w-full px-3.5 py-2.5 rounded-xl text-xs mono text-white" />
           </div>
-          <div class="flex items-center justify-between pt-1">
-            <span class="mono text-[10px] text-slate-400">Or upload a local .img / .br / .dat / .zst file:</span>
-            <label class="btn rip px-3 py-1 rounded-xl bg-violet-500/20 border border-violet-400/30 text-violet-200 mono text-[10px] font-bold cursor-pointer">
-              ⬆ Upload File <input type="file" class="hidden" onchange="dnaDirectUpload(this)" />
-            </label>
-          </div>
-        </div>
-
-        <!-- 1. UNPACK MENU (Exact DNA Layout) -->
-        <div class="glass rounded-3xl p-5 space-y-3">
-          <h3 class="text-sm font-bold text-violet-300 brand-font tracking-wide">Unpack Menu</h3>
-          <div class="divide-y divide-white/10 mono text-xs">
-            <button type="button" onclick="openUnpackModal('payload')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
-              <span>Unpack payload.bin</span><span class="text-slate-500">&gt;</span>
-            </button>
-            <button type="button" onclick="openUnpackModal('br')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
-              <span>Unpack br</span><span class="text-slate-500">&gt;</span>
-            </button>
-            <button type="button" onclick="openUnpackModal('dat')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
-              <span>Unpack dat</span><span class="text-slate-500">&gt;</span>
-            </button>
-            <button type="button" onclick="openUnpackModal('img')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
-              <span>Unpack img</span><span class="text-slate-500">&gt;</span>
-            </button>
-            <button type="button" onclick="openUnpackModal('zstd')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
-              <span>Unpack zstd</span><span class="text-slate-500">&gt;</span>
-            </button>
-            <button type="button" onclick="openUnpackModal('super')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
-              <span>Unpack super</span><span class="text-slate-500">&gt;</span>
-            </button>
-          </div>
-        </div>
-
-        <!-- 2. PACK MENU (Exact DNA Layout) -->
-        <div class="glass rounded-3xl p-5 space-y-3">
-          <h3 class="text-sm font-bold text-amber-300 brand-font tracking-wide">Pack Menu</h3>
-          <div class="divide-y divide-white/10 mono text-xs">
-            <button type="button" onclick="openPackSingleModal()" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
-              <span>Pack a single partition</span><span class="text-slate-500">&gt;</span>
-            </button>
-            <button type="button" onclick="openPackZstdModal()" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
-              <span>Pack zstd</span><span class="text-slate-500">&gt;</span>
-            </button>
-            <button type="button" onclick="openPackSuperModal()" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
-              <span>Pack super.img</span><span class="text-slate-500">&gt;</span>
-            </button>
-          </div>
-        </div>
-
-        <!-- 3. FORMAT CONVERSION (Exact Requested Items) -->
-        <div class="glass rounded-3xl p-5 space-y-3">
-          <h3 class="text-sm font-bold text-emerald-300 brand-font tracking-wide">Format Conversion</h3>
-          <div class="divide-y divide-white/10 mono text-xs">
-            <button type="button" onclick="openConvertModal('img_to_simg')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
-              <span>img to simg</span><span class="text-slate-500">&gt;</span>
-            </button>
-            <button type="button" onclick="openConvertModal('img_to_dat_br')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition">
-              <span>img to dat, br</span><span class="text-slate-500">&gt;</span>
-            </button>
-          </div>
-        </div>
-
-        <!-- Live DNA Kitchen Log -->
-        <div class="glass rounded-3xl p-4 space-y-2">
-          <div class="flex justify-between items-center">
-            <span class="mono text-[11px] font-bold text-violet-300 uppercase">🧬 DNA Kitchen Execution Log</span>
-            <button type="button" onclick="refreshDnaState()" class="mono text-[10px] text-amber-300">Refresh</button>
-          </div>
-          <div id="dnaLogConsole" class="mono text-[10.5px] bg-black/75 rounded-2xl p-3 h-40 overflow-y-auto space-y-1 border border-white/5">
-            <div class="text-slate-500">[DNA] Ready. Unpacked partitions are automatically bridged to Manager without root.</div>
+          <div id="dnaAuthErr" class="hidden text-xs mono text-rose-300 bg-rose-500/10 border border-rose-500/30 p-2.5 rounded-xl"></div>
+          <div class="grid grid-cols-2 gap-2.5 pt-1">
+            <button type="button" onclick="dnaAuthSubmit('login')" class="btn rip py-3 rounded-2xl font-bold text-xs text-slate-950 bg-gradient-to-r from-violet-400 to-amber-300">🔑 Sign In</button>
+            <button type="button" onclick="dnaAuthSubmit('signup')" class="btn rip py-3 rounded-2xl font-bold text-xs text-violet-200 bg-violet-500/20 border border-violet-400/40">✨ Create Account</button>
           </div>
         </div>
       </div>
 
-      <!-- ==================== SECTION B: 🗂️ MANAGER (DUAL-PANE ROOT EXPLORER) ==================== -->
-      <div id="managerSubSection" class="hidden space-y-3">
-        <!-- Dual-Pane Action Toolbar -->
-        <div class="glass rounded-3xl p-3.5 space-y-2.5">
-          <div class="flex items-center justify-between gap-1.5 flex-wrap">
-            <button type="button" onclick="mgrCopyMove('copy')" class="btn rip px-2.5 py-1.5 rounded-xl bg-violet-500/20 border border-violet-400/30 text-violet-200 mono text-[10px] font-bold">⇄ Copy</button>
-            <button type="button" onclick="mgrCopyMove('move')" class="btn rip px-2.5 py-1.5 rounded-xl bg-amber-500/20 border border-amber-400/30 text-amber-200 mono text-[10px] font-bold">➡ Move</button>
-            <button type="button" onclick="mgrNewFolder()" class="btn rip px-2.5 py-1.5 rounded-xl bg-white/5 border border-white/10 text-slate-200 mono text-[10px]">+ Folder</button>
-            <button type="button" onclick="mgrNewFile()" class="btn rip px-2.5 py-1.5 rounded-xl bg-white/5 border border-white/10 text-slate-200 mono text-[10px]">+ File</button>
-            <button type="button" onclick="mgrSymlink()" class="btn rip px-2.5 py-1.5 rounded-xl bg-sky-500/20 border border-sky-400/30 text-sky-200 mono text-[10px]">🔗 Symlink</button>
-            <label class="btn rip px-2.5 py-1.5 rounded-xl bg-emerald-500/20 border border-emerald-400/30 text-emerald-200 mono text-[10px] font-bold cursor-pointer">
-              ⬆ Upload <input type="file" class="hidden" onchange="mgrUploadFile(this)" />
-            </label>
+      <!-- AUTHENTICATED WORKSPACE -->
+      <div id="dnaMainWorkspace" class="hidden space-y-3.5">
+        <div class="glass rounded-3xl p-3.5 space-y-3">
+          <div class="flex items-center justify-between gap-2 px-1">
+            <div class="min-w-0">
+              <div class="flex items-center gap-2">
+                <span class="mono text-[10px] uppercase text-emerald-300 font-bold" id="dnaUserBadge">@user</span>
+                <button type="button" onclick="dnaLogout()" class="mono text-[10px] text-rose-300 underline">Sign Out</button>
+                <button type="button" onclick="openDnaModal('adminModal')" class="mono text-[10px] text-amber-300 underline">🛡️ Admin</button>
+              </div>
+              <span id="dnaProjPathLabel" class="mono text-xs font-bold text-white truncate block">Current project: /sdcard/DNA/Default_Project</span>
+            </div>
+            <button type="button" onclick="openDnaModal('projectModal')" class="btn rip px-3 py-1.5 rounded-xl bg-violet-500/20 text-violet-300 border border-violet-400/30 mono text-[10px] font-bold shrink-0">
+              📁 Project Menu
+            </button>
           </div>
-          <div class="text-[10px] mono text-slate-400 flex justify-between">
-            <span>Active Pane: <strong id="mgrActivePaneIndicator" class="text-amber-300">LEFT</strong></span>
-            <span>Tap ••• on any file to edit build.prop / APEX / perms</span>
+
+          <div class="grid grid-cols-2 gap-2 bg-black/40 p-1.5 rounded-2xl border border-white/10">
+            <button type="button" id="subBtnDna" onclick="switchDnaSub('dna')" class="chip-btn active py-2.5 rounded-xl mono text-xs font-bold">🧬 DNA (Unpack / Pack)</button>
+            <button type="button" id="subBtnManager" onclick="switchDnaSub('manager')" class="chip-btn py-2.5 rounded-xl mono text-xs font-bold text-slate-300">🗂️ Manager (Dual-Pane Root)</button>
           </div>
         </div>
 
-        <!-- Dual Panes (Left & Right) -->
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <!-- LEFT PANE -->
-          <div id="mgrPaneWrapL" onclick="setActivePane('L')" class="glass rounded-3xl p-3.5 border-2 border-violet-500/50 space-y-2">
-            <div class="flex items-center justify-between gap-2 bg-black/50 px-3 py-1.5 rounded-xl border border-white/5">
-              <button type="button" onclick="mgrUp('L')" class="mono text-xs text-amber-300 font-bold">⬅ ..</button>
-              <span id="mgrPathL" class="mono text-[10px] text-violet-200 truncate flex-1">/sdcard/DNA</span>
-              <button type="button" onclick="loadPane('L')" class="mono text-[10px] text-slate-400">⟳</button>
+        <!-- LIVE PROGRESS BAR HUD -->
+        <div id="dnaTaskHud" class="hidden glass rounded-2xl p-3.5 space-y-2 border border-amber-400/40">
+          <div class="flex items-center justify-between mono text-xs">
+            <span id="dnaTaskLabel" class="text-amber-200 font-semibold truncate pr-2">Working...</span>
+            <span id="dnaTaskPct" class="text-white font-bold">0%</span>
+          </div>
+          <div class="bar"><div id="dnaTaskBar" class="bar-fill c-amber" style="width:0%"></div></div>
+        </div>
+
+        <!-- SECTION A: 🧬 DNA -->
+        <div id="dnaSubSection" class="space-y-4">
+          <div class="glass rounded-3xl p-4 space-y-2.5">
+            <div class="flex items-center justify-between">
+              <span class="mono text-[10px] uppercase text-emerald-300 font-bold">⚡ Pull Partition / ROM Image from Vault into /sdcard/DNA</span>
+              <button type="button" onclick="loadVaultIntoDnaPicker(true)" class="mono text-[10px] text-amber-300 underline">⟳ Sync Vault</button>
             </div>
-            <div id="mgrListL" class="space-y-1 max-h-72 overflow-y-auto pr-1 mono text-[11px]"></div>
+            <div class="flex gap-2">
+              <select id="dnaVaultPicker" class="cyber-input flex-1 px-3 py-2 rounded-xl text-xs mono text-white min-w-0">
+                <option value="">Loading Vault files...</option>
+              </select>
+              <button type="button" onclick="importSelectedVaultImg('')" class="btn rip px-4 py-2 rounded-xl bg-emerald-500/25 border border-emerald-400/40 text-emerald-300 mono text-xs font-bold shrink-0">📥 Import</button>
+            </div>
+            <div class="flex items-center justify-between pt-1">
+              <span class="mono text-[10px] text-slate-400">Or upload a local .img / .br / .dat / .zst file:</span>
+              <label class="btn rip px-3 py-1 rounded-xl bg-violet-500/20 border border-violet-400/30 text-violet-200 mono text-[10px] font-bold cursor-pointer">
+                ⬆ Upload File <input type="file" class="hidden" onchange="dnaDirectUpload(this)" />
+              </label>
+            </div>
           </div>
 
-          <!-- RIGHT PANE -->
-          <div id="mgrPaneWrapR" onclick="setActivePane('R')" class="glass rounded-3xl p-3.5 border border-white/10 space-y-2">
-            <div class="flex items-center justify-between gap-2 bg-black/50 px-3 py-1.5 rounded-xl border border-white/5">
-              <button type="button" onclick="mgrUp('R')" class="mono text-xs text-amber-300 font-bold">⬅ ..</button>
-              <span id="mgrPathR" class="mono text-[10px] text-emerald-200 truncate flex-1">/sdcard/DNA</span>
-              <button type="button" onclick="loadPane('R')" class="mono text-[10px] text-slate-400">⟳</button>
+          <!-- UNPACK MENU -->
+          <div class="glass rounded-3xl p-5 space-y-3">
+            <h3 class="text-sm font-bold text-violet-300 brand-font tracking-wide">Unpack Menu</h3>
+            <div class="divide-y divide-white/10 mono text-xs">
+              <button type="button" onclick="openUnpackModal('payload')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition"><span>Unpack payload.bin</span><span class="text-slate-500">&gt;</span></button>
+              <button type="button" onclick="openUnpackModal('br')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition"><span>Unpack br</span><span class="text-slate-500">&gt;</span></button>
+              <button type="button" onclick="openUnpackModal('dat')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition"><span>Unpack dat</span><span class="text-slate-500">&gt;</span></button>
+              <button type="button" onclick="openUnpackModal('img')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition"><span>Unpack img</span><span class="text-slate-500">&gt;</span></button>
+              <button type="button" onclick="openUnpackModal('zstd')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition"><span>Unpack zstd</span><span class="text-slate-500">&gt;</span></button>
+              <button type="button" onclick="openUnpackModal('super')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition"><span>Unpack super</span><span class="text-slate-500">&gt;</span></button>
             </div>
-            <div id="mgrListR" class="space-y-1 max-h-72 overflow-y-auto pr-1 mono text-[11px]"></div>
+          </div>
+
+          <!-- PACK MENU -->
+          <div class="glass rounded-3xl p-5 space-y-3">
+            <h3 class="text-sm font-bold text-amber-300 brand-font tracking-wide">Pack Menu</h3>
+            <div class="divide-y divide-white/10 mono text-xs">
+              <button type="button" onclick="openPackSingleModal()" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition"><span>Pack a single partition</span><span class="text-slate-500">&gt;</span></button>
+              <button type="button" onclick="openPackZstdModal()" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition"><span>Pack zstd</span><span class="text-slate-500">&gt;</span></button>
+              <button type="button" onclick="openPackSuperModal()" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition"><span>Pack super.img</span><span class="text-slate-500">&gt;</span></button>
+            </div>
+          </div>
+
+          <!-- FORMAT CONVERSION -->
+          <div class="glass rounded-3xl p-5 space-y-3">
+            <h3 class="text-sm font-bold text-emerald-300 brand-font tracking-wide">Format Conversion</h3>
+            <div class="divide-y divide-white/10 mono text-xs">
+              <button type="button" onclick="openConvertModal('img_to_simg')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition"><span>img to simg</span><span class="text-slate-500">&gt;</span></button>
+              <button type="button" onclick="openConvertModal('img_to_dat_br')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition"><span>img to dat, br</span><span class="text-slate-500">&gt;</span></button>
+            </div>
+          </div>
+
+          <div class="glass rounded-3xl p-4 space-y-2">
+            <div class="flex justify-between items-center">
+              <span class="mono text-[11px] font-bold text-violet-300 uppercase">🧬 DNA Kitchen Execution Log</span>
+              <button type="button" onclick="refreshDnaState()" class="mono text-[10px] text-amber-300">Refresh</button>
+            </div>
+            <div id="dnaLogConsole" class="mono text-[10.5px] bg-black/75 rounded-2xl p-3 h-40 overflow-y-auto space-y-1 border border-white/5">
+              <div class="text-slate-500">[DNA] Ready. Unpacked partitions appear directly inside your project folder in Manager.</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- SECTION B: 🗂️ MANAGER (MT DUAL-PANE ROOT EXPLORER) -->
+        <div id="managerSubSection" class="hidden space-y-3">
+          <div class="glass rounded-3xl p-3 space-y-2">
+            <div class="flex items-center justify-between gap-1.5 flex-wrap">
+              <button type="button" onclick="mgrCopyMove('copy')" class="btn rip px-2.5 py-1.5 rounded-xl bg-violet-500/20 border border-violet-400/30 text-violet-200 mono text-[10px] font-bold">⇄ Copy</button>
+              <button type="button" onclick="mgrCopyMove('move')" class="btn rip px-2.5 py-1.5 rounded-xl bg-amber-500/20 border border-amber-400/30 text-amber-200 mono text-[10px] font-bold">➡ Move</button>
+              <button type="button" onclick="mgrNewFolder()" class="btn rip px-2.5 py-1.5 rounded-xl bg-white/5 border border-white/10 text-slate-200 mono text-[10px]">+ Folder</button>
+              <button type="button" onclick="mgrNewFile()" class="btn rip px-2.5 py-1.5 rounded-xl bg-white/5 border border-white/10 text-slate-200 mono text-[10px]">+ File</button>
+              <button type="button" onclick="mgrSymlink()" class="btn rip px-2.5 py-1.5 rounded-xl bg-sky-500/20 border border-sky-400/30 text-sky-200 mono text-[10px]">🔗 Symlink</button>
+              <label class="btn rip px-2.5 py-1.5 rounded-xl bg-emerald-500/20 border border-emerald-400/30 text-emerald-200 mono text-[10px] font-bold cursor-pointer">
+                ⬆ Upload <input type="file" class="hidden" onchange="mgrUploadFile(this)" />
+              </label>
+            </div>
+
+            <div class="flex items-center gap-1.5 pt-0.5">
+              <select id="mgrVaultPicker" class="cyber-input flex-1 px-2.5 py-1.5 rounded-xl text-[10px] mono text-white min-w-0">
+                <option value="">Import from HF Vault into active pane...</option>
+              </select>
+              <button type="button" onclick="importSelectedVaultImg('mgr')" class="btn rip px-2.5 py-1.5 rounded-xl bg-emerald-500/20 border border-emerald-400/30 text-emerald-300 mono text-[10px] font-bold shrink-0">📥 Pull Here</button>
+            </div>
+
+            <div class="text-[10px] mono text-slate-400 flex justify-between px-0.5">
+              <span>Active Pane: <strong id="mgrActivePaneIndicator" class="text-amber-300">LEFT</strong></span>
+              <span>Tap folder to open • Tap ••• for Properties/Editor</span>
+            </div>
+          </div>
+
+          <div class="mt-dual-grid">
+            <div id="mgrPaneWrapL" onclick="setActivePane('L')" class="mt-pane mt-pane-left active-pane">
+              <div class="bg-black/70 px-2.5 py-2 border-b border-white/10">
+                <div class="flex items-center justify-between gap-1">
+                  <span id="mgrPathL" class="mono text-[10px] font-bold text-amber-300 truncate">/data/DNA/</span>
+                  <div class="flex items-center gap-1 shrink-0">
+                    <select id="mgrProjJumpL" onchange="loadPane('L', this.value)" class="bg-white/10 text-[9px] mono text-slate-200 rounded px-1 py-0.5"></select>
+                    <button type="button" onclick="loadPane('L')" class="mono text-[10px] text-slate-400 px-1">⟳</button>
+                  </div>
+                </div>
+                <div id="mgrStatsL" class="mono text-[8.5px] text-slate-400 truncate mt-0.5">Folders: 0 Files: 0</div>
+              </div>
+              <div id="mgrListL" class="flex-1 overflow-y-auto divide-y divide-white/5 mono text-[10.5px]"></div>
+            </div>
+
+            <div id="mgrPaneWrapR" onclick="setActivePane('R')" class="mt-pane">
+              <div class="bg-black/70 px-2.5 py-2 border-b border-white/10">
+                <div class="flex items-center justify-between gap-1">
+                  <span id="mgrPathR" class="mono text-[10px] font-bold text-emerald-300 truncate">/data/DNA/</span>
+                  <div class="flex items-center gap-1 shrink-0">
+                    <select id="mgrProjJumpR" onchange="loadPane('R', this.value)" class="bg-white/10 text-[9px] mono text-slate-200 rounded px-1 py-0.5"></select>
+                    <button type="button" onclick="loadPane('R')" class="mono text-[10px] text-slate-400 px-1">⟳</button>
+                  </div>
+                </div>
+                <div id="mgrStatsR" class="mono text-[8.5px] text-slate-400 truncate mt-0.5">Folders: 0 Files: 0</div>
+              </div>
+              <div id="mgrListR" class="flex-1 overflow-y-auto divide-y divide-white/5 mono text-[10.5px]"></div>
+            </div>
           </div>
         </div>
       </div>
     </div>
   </div>
 
-  <!-- ================= MODALS FOR DNA & MANAGER ================= -->
+  <!-- ================= MODALS ================= -->
+
+  <!-- ADMIN PANEL MODAL -->
+  <div id="adminModal" class="hidden fixed inset-0 z-[90] bg-black/85 backdrop-filter backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto">
+    <div class="glass rounded-3xl p-5 w-full max-w-md space-y-3 border border-rose-500/40 my-auto max-h-[90vh] overflow-y-auto">
+      <div class="flex items-center justify-between">
+        <h3 class="text-sm font-bold text-rose-300 mono">🛡️ Admin Control Panel (Users, IPs &amp; Bans)</h3>
+        <button type="button" onclick="closeDnaModal('adminModal')" class="px-2.5 py-1 rounded-lg bg-white/10 text-xs mono">✕</button>
+      </div>
+      <div class="flex gap-2">
+        <input id="adminPassInput" type="password" placeholder="Enter Admin Password" class="cyber-input flex-1 px-3 py-2 rounded-xl text-xs mono text-white" />
+        <button type="button" onclick="loadAdminUsers()" class="btn rip px-4 py-2 rounded-xl bg-rose-500 text-white mono text-xs font-bold">Unlock</button>
+      </div>
+      <div id="adminUsersList" class="space-y-2 max-h-80 overflow-y-auto mono text-[10.5px]"></div>
+    </div>
+  </div>
 
   <!-- 1. PROJECT MENU MODAL -->
   <div id="projectModal" class="hidden fixed inset-0 z-[80] bg-black/80 backdrop-filter backdrop-blur-md flex items-center justify-center p-4">
@@ -1503,7 +1973,7 @@ DNA_TAB_HTML = r"""
         <select id="projSelectDropdown" onchange="dnaProjectOp('select', this.value)" class="cyber-input w-full px-3 py-2 rounded-xl text-xs mono text-white"></select>
       </div>
       <div class="flex gap-2">
-        <input id="newProjNameInput" type="text" placeholder="New project name (e.g. HyperOS_Port)" class="cyber-input flex-1 px-3 py-2 rounded-xl text-xs mono text-white" />
+        <input id="newProjNameInput" type="text" placeholder="New project (e.g. Stock_Port)" class="cyber-input flex-1 px-3 py-2 rounded-xl text-xs mono text-white" />
         <button type="button" onclick="dnaProjectOp('create', document.getElementById('newProjNameInput').value)" class="btn rip px-3.5 py-2 rounded-xl bg-violet-500/30 border border-violet-400/40 text-violet-200 mono text-xs font-bold">Create</button>
       </div>
       <div class="grid grid-cols-2 gap-2 pt-1">
@@ -1514,7 +1984,7 @@ DNA_TAB_HTML = r"""
     </div>
   </div>
 
-  <!-- 2. UNPACK IMG / SUPER / PAYLOAD / BR / DAT / ZSTD MODAL -->
+  <!-- 2. UNPACK MODAL -->
   <div id="unpackModal" class="hidden fixed inset-0 z-[80] bg-black/80 backdrop-filter backdrop-blur-md flex items-center justify-center p-4">
     <div class="glass rounded-3xl p-5 w-full max-w-sm space-y-3.5 border border-white/15">
       <h3 id="unpackModalTitle" class="text-sm font-bold text-white">Unpack img</h3>
@@ -1527,7 +1997,7 @@ DNA_TAB_HTML = r"""
         <div id="unpackFileList" class="space-y-1.5 max-h-48 overflow-y-auto bg-black/50 p-3 rounded-2xl border border-white/5 mono text-xs"></div>
       </div>
       <p class="text-[10px] text-slate-400 leading-relaxed">
-        Place your file in the project path /sdcard/DNA. The tool will automatically detect the img format and unpack it (when unpacking super, only partition a files are extracted).
+        Place your file in the project path /sdcard/DNA. The tool will automatically detect the img format and unpack it directly into your project folder.
       </p>
       <div class="flex justify-end gap-3 pt-1">
         <button type="button" onclick="closeDnaModal('unpackModal')" class="px-4 py-2 rounded-xl bg-white/5 text-slate-300 mono text-xs">CANCEL</button>
@@ -1536,125 +2006,84 @@ DNA_TAB_HTML = r"""
     </div>
   </div>
 
-  <!-- 3. PACK A SINGLE PARTITION MODAL (Exact DNA Controls) -->
+  <!-- 3. PACK SINGLE MODAL -->
   <div id="packSingleModal" class="hidden fixed inset-0 z-[80] bg-black/80 backdrop-filter backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto">
     <div class="glass rounded-3xl p-5 w-full max-w-sm space-y-3 border border-white/15 my-auto max-h-[90vh] overflow-y-auto">
       <h3 class="text-sm font-bold text-white">Pack a single partition</h3>
-
       <div>
         <select id="psPartSelect" class="cyber-input w-full px-3 py-2 rounded-xl text-xs mono text-white"></select>
         <span class="text-[10px] text-slate-400 block mt-0.5">IMG packing format will be automatically detected</span>
       </div>
-
       <div class="grid grid-cols-2 gap-2.5 items-center">
-        <div>
-          <label class="text-[11px] text-slate-300 block">Pack type</label>
-        </div>
+        <label class="text-[11px] text-slate-300 block">Pack type</label>
         <select id="psPackType" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
           <option value="erofs">erofs</option>
           <option value="ext4">ext4</option>
           <option value="f2fs">f2fs</option>
         </select>
       </div>
-
-      <div>
-        <div class="grid grid-cols-2 gap-2.5 items-center">
-          <label class="text-[11px] text-slate-300">Read/Write permission</label>
-          <select id="psRwMode" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
-            <option value="rw">Read/Write---rw</option>
-            <option value="ro">Read Only---ro</option>
-          </select>
-        </div>
-        <span class="text-[10px] text-slate-500">Note: only used when packing to ext4</span>
+      <div class="grid grid-cols-2 gap-2.5 items-center">
+        <label class="text-[11px] text-slate-300">Read/Write permission</label>
+        <select id="psRwMode" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
+          <option value="rw">Read/Write---rw</option>
+          <option value="ro">Read Only---ro</option>
+        </select>
       </div>
-
-      <div>
-        <div class="grid grid-cols-2 gap-2.5 items-center">
-          <label class="text-[11px] text-slate-300">Size</label>
-          <select id="psSizeMode" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
-            <option value="auto">Auto</option>
-            <option value="orig">Original size</option>
-          </select>
-        </div>
-        <span class="text-[10px] text-slate-500">Note: only used when packing to ext4</span>
+      <div class="grid grid-cols-2 gap-2.5 items-center">
+        <label class="text-[11px] text-slate-300">Size</label>
+        <select id="psSizeMode" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
+          <option value="auto">Auto</option>
+          <option value="orig">Original size</option>
+        </select>
       </div>
-
-      <div>
-        <div class="grid grid-cols-2 gap-2.5 items-center">
-          <label class="text-[11px] text-slate-300">img format</label>
-          <select id="psImgFormat" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
-            <option value="raw">Raw</option>
-            <option value="sparse">Sparse</option>
-          </select>
-        </div>
-        <span class="text-[10px] text-slate-500">Note: only used when packing to ext4 or erofs</span>
+      <div class="grid grid-cols-2 gap-2.5 items-center">
+        <label class="text-[11px] text-slate-300">img format</label>
+        <select id="psImgFormat" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
+          <option value="raw">Raw</option>
+          <option value="sparse">Sparse</option>
+        </select>
       </div>
-
-      <div>
-        <div class="grid grid-cols-2 gap-2.5 items-center">
-          <label class="text-[11px] text-slate-300">File format</label>
-          <select id="psFileFormat" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
-            <option value="IMG">IMG</option>
-            <option value="DAT">DAT</option>
-            <option value="BR">BR</option>
-          </select>
-        </div>
-        <span class="text-[10px] text-slate-500">Note: only used when packing to ext4 or erofs</span>
+      <div class="grid grid-cols-2 gap-2.5 items-center">
+        <label class="text-[11px] text-slate-300">File format</label>
+        <select id="psFileFormat" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
+          <option value="IMG">IMG</option>
+          <option value="DAT">DAT</option>
+          <option value="BR">BR</option>
+        </select>
       </div>
-
-      <div>
-        <div class="flex items-center justify-between">
-          <span class="text-[11px] text-slate-300">br compression</span>
-          <div class="flex items-center gap-2">
-            <button type="button" onclick="stepVal('psBrLevel', -1, 0, 11)" class="chip-btn w-7 h-7 rounded-lg mono text-xs">-</button>
-            <input id="psBrLevel" type="number" value="3" min="0" max="11" class="cyber-input w-12 text-center py-1 rounded-lg mono text-xs text-white" />
-            <button type="button" onclick="stepVal('psBrLevel', 1, 0, 11)" class="chip-btn w-7 h-7 rounded-lg mono text-xs">+</button>
-          </div>
+      <div class="flex items-center justify-between">
+        <span class="text-[11px] text-slate-300">br compression</span>
+        <div class="flex items-center gap-2">
+          <button type="button" onclick="stepVal('psBrLevel', -1, 0, 11)" class="chip-btn w-7 h-7 rounded-lg mono text-xs">-</button>
+          <input id="psBrLevel" type="number" value="3" min="0" max="11" class="cyber-input w-12 text-center py-1 rounded-lg mono text-xs text-white" />
+          <button type="button" onclick="stepVal('psBrLevel', 1, 0, 11)" class="chip-btn w-7 h-7 rounded-lg mono text-xs">+</button>
         </div>
-        <span class="text-[10px] text-slate-500">Note: the higher the value, the slower the packing process may be</span>
       </div>
-
-      <div>
-        <div class="flex items-center justify-between">
-          <span class="text-[11px] text-slate-300">Erofs(f2fs) compression</span>
-          <div class="flex items-center gap-2">
-            <button type="button" onclick="stepVal('psErofsLevel', -1, 0, 12)" class="chip-btn w-7 h-7 rounded-lg mono text-xs">-</button>
-            <input id="psErofsLevel" type="number" value="8" min="0" max="12" class="cyber-input w-12 text-center py-1 rounded-lg mono text-xs text-white" />
-            <button type="button" onclick="stepVal('psErofsLevel', 1, 0, 12)" class="chip-btn w-7 h-7 rounded-lg mono text-xs">+</button>
-          </div>
+      <div class="flex items-center justify-between">
+        <span class="text-[11px] text-slate-300">Erofs(f2fs) compression</span>
+        <div class="flex items-center gap-2">
+          <button type="button" onclick="stepVal('psErofsLevel', -1, 0, 12)" class="chip-btn w-7 h-7 rounded-lg mono text-xs">-</button>
+          <input id="psErofsLevel" type="number" value="8" min="0" max="12" class="cyber-input w-12 text-center py-1 rounded-lg mono text-xs text-white" />
+          <button type="button" onclick="stepVal('psErofsLevel', 1, 0, 12)" class="chip-btn w-7 h-7 rounded-lg mono text-xs">+</button>
         </div>
-        <span class="text-[10px] text-slate-500">Note: only used when packing to Erofs(f2fs)</span>
       </div>
-
-      <div>
-        <div class="grid grid-cols-2 gap-2.5 items-center">
-          <label class="text-[11px] text-slate-300">Type</label>
-          <select id="psErofsAlgo" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
-            <option value="lz4hc">lz4hc</option>
-            <option value="lz4">lz4</option>
-            <option value="lzma">lzma</option>
-            <option value="deflate">deflate</option>
-          </select>
-        </div>
-        <span class="text-[10px] text-slate-500">Note: only used when packing to Erofs</span>
+      <div class="grid grid-cols-2 gap-2.5 items-center">
+        <label class="text-[11px] text-slate-300">Type</label>
+        <select id="psErofsAlgo" class="cyber-input px-3 py-1.5 rounded-xl text-xs mono text-white">
+          <option value="lz4hc">lz4hc</option>
+          <option value="lz4">lz4</option>
+          <option value="lzma">lzma</option>
+          <option value="deflate">deflate</option>
+        </select>
       </div>
-
       <label class="flex items-center justify-between text-xs text-slate-200 bg-black/40 p-2.5 rounded-xl border border-white/5">
-        <div>
-          <span class="block">Compress ext4 img space</span>
-          <span class="text-[10px] text-slate-500">Note: only used when packing to ext4</span>
-        </div>
+        <span>Compress ext4 img space</span>
         <input id="psCompressExt4" type="checkbox" class="w-4 h-4 accent-violet-500" />
       </label>
-
       <label class="flex items-center justify-between text-xs text-slate-200 bg-black/40 p-2.5 rounded-xl border border-white/5">
-        <div class="pr-2">
-          <span class="block">Remove avb data encryption</span>
-          <span class="text-[10px] text-slate-500">Note: this switch will modify the fstab file, the operation is not universal and may cause a bootloop.</span>
-        </div>
+        <span>Remove avb data encryption</span>
         <input id="psRemoveAvb" type="checkbox" class="w-4 h-4 accent-violet-500 shrink-0" />
       </label>
-
       <div class="flex justify-end gap-3 pt-2">
         <button type="button" onclick="closeDnaModal('packSingleModal')" class="px-4 py-2 rounded-xl bg-white/5 text-slate-300 mono text-xs">CANCEL</button>
         <button type="button" onclick="submitPackSingle()" class="btn rip px-5 py-2 rounded-xl bg-emerald-500 text-slate-950 mono text-xs font-bold">OK</button>
@@ -1662,11 +2091,10 @@ DNA_TAB_HTML = r"""
     </div>
   </div>
 
-  <!-- 4. PACK SUPER.IMG MODAL (Exact DNA Controls) -->
+  <!-- 4. PACK SUPER.IMG MODAL -->
   <div id="packSuperModal" class="hidden fixed inset-0 z-[80] bg-black/80 backdrop-filter backdrop-blur-md flex items-center justify-center p-4">
     <div class="glass rounded-3xl p-5 w-full max-w-sm space-y-3 border border-white/15">
       <h3 class="text-sm font-bold text-white">Pack super.img</h3>
-
       <div class="grid grid-cols-2 gap-2 items-center">
         <label class="text-xs text-slate-300">Type</label>
         <select id="superType" class="cyber-input px-3 py-2 rounded-xl text-xs mono text-white">
@@ -1675,7 +2103,6 @@ DNA_TAB_HTML = r"""
           <option value="virtual_ab">virtual_ab</option>
         </select>
       </div>
-
       <div class="grid grid-cols-2 gap-2 items-center">
         <label class="text-xs text-slate-300">Format</label>
         <select id="superFormat" class="cyber-input px-3 py-2 rounded-xl text-xs mono text-white">
@@ -1683,32 +2110,21 @@ DNA_TAB_HTML = r"""
           <option value="raw">raw</option>
         </select>
       </div>
-
-      <div>
-        <div class="grid grid-cols-2 gap-2 items-center">
-          <label class="text-xs text-slate-300">Total super.img</label>
-          <input id="superTotalGb" type="number" step="0.1" value="8.5" class="cyber-input px-3 py-2 rounded-xl text-xs mono text-white" />
-        </div>
-        <span class="text-[10px] text-slate-400">Enter the size of your super img, default value 8.5G.</span>
+      <div class="grid grid-cols-2 gap-2 items-center">
+        <label class="text-xs text-slate-300">Total super.img (GB)</label>
+        <input id="superTotalGb" type="number" step="0.1" value="8.5" class="cyber-input px-3 py-2 rounded-xl text-xs mono text-white" />
       </div>
-
-      <div>
-        <div class="grid grid-cols-2 gap-2 items-center">
-          <label class="text-xs text-slate-300">Partition group</label>
-          <select id="superGroup" class="cyber-input px-3 py-2 rounded-xl text-xs mono text-white">
-            <option value="qti_dynamic_partitions">qti_dynamic_partitions</option>
-            <option value="mtk_dynamic_partitions">mtk_dynamic_partitions</option>
-          </select>
-        </div>
-        <span class="text-[10px] text-slate-400">If you don't know, leave it as default.</span>
+      <div class="grid grid-cols-2 gap-2 items-center">
+        <label class="text-xs text-slate-300">Partition group</label>
+        <select id="superGroup" class="cyber-input px-3 py-2 rounded-xl text-xs mono text-white">
+          <option value="qti_dynamic_partitions">qti_dynamic_partitions</option>
+          <option value="mtk_dynamic_partitions">mtk_dynamic_partitions</option>
+        </select>
       </div>
-
       <div>
         <span class="mono text-[11px] text-amber-300 block mb-1">• Select IMG files to pack:</span>
         <div id="superImgChecklist" class="space-y-1.5 max-h-40 overflow-y-auto bg-black/50 p-3 rounded-2xl border border-white/5 mono text-xs"></div>
-        <span class="text-[10px] text-slate-400 block mt-1">Place your files in the project path /sdcard/DNA</span>
       </div>
-
       <div class="flex justify-end gap-3 pt-2">
         <button type="button" onclick="closeDnaModal('packSuperModal')" class="px-4 py-2 rounded-xl bg-white/5 text-slate-300 mono text-xs">CANCEL</button>
         <button type="button" onclick="submitPackSuper()" class="btn rip px-5 py-2 rounded-xl bg-amber-400 text-slate-950 mono text-xs font-bold">OK</button>
@@ -1735,7 +2151,7 @@ DNA_TAB_HTML = r"""
     </div>
   </div>
 
-  <!-- 6. FORMAT CONVERSION MODAL (img to simg / img to dat, br) -->
+  <!-- 6. FORMAT CONVERSION MODAL -->
   <div id="convertModal" class="hidden fixed inset-0 z-[80] bg-black/80 backdrop-filter backdrop-blur-md flex items-center justify-center p-4">
     <div class="glass rounded-3xl p-5 w-full max-w-sm space-y-3 border border-white/15">
       <h3 id="convertModalTitle" class="text-sm font-bold text-white">Format Conversion</h3>
@@ -1754,68 +2170,122 @@ DNA_TAB_HTML = r"""
     </div>
   </div>
 
-  <!-- 7. MANAGER ITEM INSPECTOR, TEXT EDITOR & PERMISSIONS/SELINUX MODAL -->
+  <!-- 7. MT MANAGER PROPERTIES, PERMISSIONS GRID, CHECKSUM & TEXT EDITOR MODAL -->
   <div id="mgrItemModal" class="hidden fixed inset-0 z-[85] bg-black/85 backdrop-filter backdrop-blur-md flex items-center justify-center p-3 overflow-y-auto">
-    <div class="glass rounded-3xl p-4 w-full max-w-md space-y-3 border border-white/15 my-auto max-h-[92vh] overflow-y-auto">
-      <div class="flex items-center justify-between border-b border-white/10 pb-2">
+    <div class="mt-dialog rounded-2xl p-4 w-full max-w-md space-y-3 my-auto max-h-[92vh] overflow-y-auto">
+      <div class="flex items-center justify-between border-b border-white/15 pb-2">
         <div class="min-w-0 pr-2">
-          <h3 id="mgrModalName" class="mono text-xs font-bold text-amber-300 truncate">file</h3>
-          <p id="mgrModalPath" class="mono text-[10px] text-slate-400 truncate">/sdcard/DNA</p>
+          <h3 id="mgrModalName" class="mono text-sm font-bold text-white truncate">file</h3>
+          <p id="mgrModalPath" class="mono text-[10px] text-slate-400 truncate">/data/DNA/</p>
         </div>
         <button type="button" onclick="closeDnaModal('mgrItemModal')" class="px-2.5 py-1 rounded-lg bg-white/10 text-xs mono">✕</button>
       </div>
 
-      <!-- Quick Actions Row -->
-      <div class="flex flex-wrap gap-1.5">
-        <button type="button" onclick="mgrRenameItem()" class="btn rip px-2.5 py-1.5 rounded-xl bg-white/10 text-slate-200 mono text-[10px]">✏️ Rename</button>
-        <button type="button" onclick="mgrDeleteItem()" class="btn rip px-2.5 py-1.5 rounded-xl bg-rose-500/20 border border-rose-400/30 text-rose-300 mono text-[10px]">🗑️ Delete</button>
-        <button type="button" id="mgrBtnMount" onclick="mgrMountArchive()" class="hidden btn rip px-2.5 py-1.5 rounded-xl bg-violet-500/25 border border-violet-400/40 text-violet-200 mono text-[10px] font-bold">📦 Unpack APEX/APK/ZIP</button>
-        <button type="button" id="mgrBtnRepack" onclick="mgrRepackArchive()" class="hidden btn rip px-2.5 py-1.5 rounded-xl bg-amber-500/25 border border-amber-400/40 text-amber-200 mono text-[10px] font-bold">🛠️ Repack to APEX/APK/ZIP</button>
-        <a id="mgrBtnDownload" href="#" target="_blank" class="btn rip px-2.5 py-1.5 rounded-xl bg-emerald-500/20 border border-emerald-400/30 text-emerald-300 mono text-[10px] font-bold">⬇ Download</a>
-        <button type="button" id="mgrBtnVault" onclick="mgrPushVault()" class="btn rip px-2.5 py-1.5 rounded-xl bg-sky-500/20 border border-sky-400/30 text-sky-200 mono text-[10px] font-bold">☁️ Push to Vault</button>
+      <div class="bg-black/35 p-3 rounded-xl space-y-1 mono text-[11px] border border-white/10">
+        <div><span class="text-slate-400">Size: </span><span id="mgrPropSize" class="text-slate-100">0 B</span></div>
+        <div><span class="text-slate-400">Modified: </span><span id="mgrPropMtime" class="text-slate-100">—</span></div>
+        <div><span class="text-slate-400">Permission: </span><span id="mgrPropPerm" class="text-amber-300 font-bold">rwxr-xr-x (755)</span></div>
+        <div class="flex gap-1.5 flex-wrap pt-1">
+          <button type="button" onclick="mgrCalcChecksum()" class="mt-btn-gray">CHECKSUM</button>
+          <button type="button" onclick="mgrRenameItem()" class="mt-btn-gray">RENAME</button>
+                    <button type="button" onclick="mgrDeleteItem()" class="mt-btn-gray text-rose-300">DELETE</button>
+          <a id="mgrBtnDownload" href="#" target="_blank" class="mt-btn-gray text-emerald-300">DOWNLOAD</a>
+          <button type="button" id="mgrBtnVault" onclick="mgrPushVault()" class="mt-btn-gray text-sky-300">PUSH VAULT</button>
+        </div>
+        <div class="flex gap-1.5 pt-1">
+          <button type="button" id="mgrBtnMount" onclick="mgrMountArchive()" class="hidden mt-btn-gray text-violet-300">UNPACK APEX/APK/ZIP</button>
+          <button type="button" id="mgrBtnRepack" onclick="mgrRepackArchive()" class="hidden mt-btn-gray text-amber-300">REPACK ARCHIVE</button>
+        </div>
       </div>
 
-      <!-- Permissions (chmod) & SELinux (chcon) Box -->
-      <div class="bg-black/50 p-3 rounded-2xl border border-white/5 space-y-2">
-        <span class="mono text-[10px] uppercase text-violet-300 font-bold block">Permissions (fs_config) &amp; SELinux (file_contexts)</span>
-        <div class="grid grid-cols-3 gap-2">
+      <!-- Checksum Results Box -->
+      <div id="mgrChecksumBox" class="hidden bg-black/50 p-3 rounded-xl border border-white/10 space-y-1.5 mono text-[10px]">
+        <div class="flex justify-between items-center"><span class="text-slate-400">MD5:</span><span id="chkMd5" class="text-emerald-300 truncate ml-2"></span></div>
+        <div class="flex justify-between items-center"><span class="text-slate-400">SHA-1:</span><span id="chkSha1" class="text-violet-300 truncate ml-2"></span></div>
+        <div class="flex justify-between items-center"><span class="text-slate-400">SHA-256:</span><span id="chkSha256" class="text-amber-300 truncate ml-2"></span></div>
+        <div class="flex justify-between items-center"><span class="text-slate-400">CRC32:</span><span id="chkCrc32" class="text-sky-300 ml-2"></span></div>
+      </div>
+
+      <!-- MT Manager 12-Checkbox Permissions & Owner/SELinux Dialog -->
+      <div class="bg-black/40 p-3 rounded-xl border border-white/10 space-y-2.5">
+        <div class="flex items-center justify-between">
+          <span class="mono text-[10px] uppercase text-violet-300 font-bold">Change Permissions (chmod / chown / chcon)</span>
+          <input id="mgrPermMode" type="text" value="0755" oninput="syncOctalToCheckboxes(this.value)" class="cyber-input w-16 text-center py-0.5 rounded mono text-xs text-amber-300 font-bold" />
+        </div>
+
+        <div class="grid grid-cols-2 gap-2 mono text-[11px]">
           <div>
-            <label class="mono text-[9px] text-slate-400 block">Mode (Octal)</label>
-            <input id="mgrPermMode" type="text" value="0644" class="cyber-input w-full px-2.5 py-1.5 rounded-lg mono text-xs text-white" />
+            <label class="text-[9px] text-slate-400 block">Owner (UID)</label>
+            <select id="mgrPermUid" class="cyber-input w-full px-2 py-1 rounded text-xs text-white">
+              <option value="0">0 - root</option>
+              <option value="1000">1000 - system</option>
+              <option value="2000">2000 - shell</option>
+            </select>
           </div>
           <div>
-            <label class="mono text-[9px] text-slate-400 block">UID</label>
-            <input id="mgrPermUid" type="text" value="0" class="cyber-input w-full px-2.5 py-1.5 rounded-lg mono text-xs text-white" />
-          </div>
-          <div>
-            <label class="mono text-[9px] text-slate-400 block">GID</label>
-            <input id="mgrPermGid" type="text" value="0" class="cyber-input w-full px-2.5 py-1.5 rounded-lg mono text-xs text-white" />
+            <label class="text-[9px] text-slate-400 block">Group (GID)</label>
+            <select id="mgrPermGid" class="cyber-input w-full px-2 py-1 rounded text-xs text-white">
+              <option value="0">0 - root</option>
+              <option value="1000">1000 - system</option>
+              <option value="2000">2000 - shell</option>
+            </select>
           </div>
         </div>
+
+        <div class="grid grid-cols-4 gap-1 text-center mono text-[10px] bg-black/40 p-2 rounded-lg border border-white/5">
+          <div class="text-left text-slate-400 font-bold">Role</div>
+          <div class="text-slate-300">Read</div>
+          <div class="text-slate-300">Write</div>
+          <div class="text-slate-300">Exec</div>
+
+          <div class="text-left text-slate-300">Owner</div>
+          <div><input type="checkbox" id="p_ur" onchange="syncCheckboxesToOctal()" class="accent-violet-500" /></div>
+          <div><input type="checkbox" id="p_uw" onchange="syncCheckboxesToOctal()" class="accent-violet-500" /></div>
+          <div><input type="checkbox" id="p_ux" onchange="syncCheckboxesToOctal()" class="accent-violet-500" /></div>
+
+          <div class="text-left text-slate-300">Group</div>
+          <div><input type="checkbox" id="p_gr" onchange="syncCheckboxesToOctal()" class="accent-violet-500" /></div>
+          <div><input type="checkbox" id="p_gw" onchange="syncCheckboxesToOctal()" class="accent-violet-500" /></div>
+          <div><input type="checkbox" id="p_gx" onchange="syncCheckboxesToOctal()" class="accent-violet-500" /></div>
+
+          <div class="text-left text-slate-300">Other</div>
+          <div><input type="checkbox" id="p_or" onchange="syncCheckboxesToOctal()" class="accent-violet-500" /></div>
+          <div><input type="checkbox" id="p_ow" onchange="syncCheckboxesToOctal()" class="accent-violet-500" /></div>
+          <div><input type="checkbox" id="p_ox" onchange="syncCheckboxesToOctal()" class="accent-violet-500" /></div>
+
+          <div class="text-left text-amber-300">Special</div>
+          <div><label class="flex items-center justify-center gap-0.5"><input type="checkbox" id="p_suid" onchange="syncCheckboxesToOctal()" class="accent-amber-400" /><span class="text-[8px]">SUID</span></label></div>
+          <div><label class="flex items-center justify-center gap-0.5"><input type="checkbox" id="p_sgid" onchange="syncCheckboxesToOctal()" class="accent-amber-400" /><span class="text-[8px]">SGID</span></label></div>
+          <div><label class="flex items-center justify-center gap-0.5"><input type="checkbox" id="p_sticky" onchange="syncCheckboxesToOctal()" class="accent-amber-400" /><span class="text-[8px]">Stick</span></label></div>
+        </div>
+
         <div>
-          <label class="mono text-[9px] text-slate-400 block">SELinux Context</label>
-          <input id="mgrPermSelinux" type="text" value="u:object_r:system_file:s0" class="cyber-input w-full px-2.5 py-1.5 rounded-lg mono text-[11px] text-emerald-300" />
+          <label class="mono text-[9px] text-slate-400 block">SELinux Context (file_contexts)</label>
+          <input id="mgrPermSelinux" type="text" value="u:object_r:system_file:s0" class="cyber-input w-full px-2.5 py-1 rounded mono text-[11px] text-emerald-300" />
         </div>
+
         <div class="flex items-center justify-between pt-1">
           <label class="flex items-center gap-1.5 text-[10px] text-slate-300 mono">
-            <input id="mgrPermRecurse" type="checkbox" class="accent-violet-500" /> Apply recursively
+            <input id="mgrPermRecurse" type="checkbox" class="accent-violet-500" /> Apply recursively to subfiles
           </label>
-          <button type="button" onclick="mgrApplyPerms()" class="btn rip px-3 py-1 rounded-lg bg-violet-500 text-white mono text-[10px] font-bold">Save Perms &amp; SELinux</button>
+          <button type="button" onclick="mgrApplyPerms()" class="btn rip px-3.5 py-1.5 rounded-lg bg-violet-500 text-white mono text-[10px] font-bold">OK (Save Perms)</button>
         </div>
       </div>
 
-      <!-- Built-in Text / build.prop / fstab / XML Editor -->
+      <!-- Built-in Root Text / build.prop / fstab Editor -->
       <div id="mgrEditorWrap" class="space-y-2">
         <div class="flex items-center justify-between">
-          <span class="mono text-[10px] uppercase text-amber-300 font-bold">📝 Root Text &amp; Prop Editor</span>
+          <span class="mono text-[10px] uppercase text-amber-300 font-bold">📝 Root Text &amp; build.prop Editor</span>
           <button type="button" onclick="mgrSaveTextFile()" class="btn rip px-3.5 py-1 rounded-lg bg-emerald-500 text-slate-950 mono text-[10px] font-bold">💾 Save File</button>
         </div>
-        <textarea id="mgrTextEditor" rows="11" class="cyber-input w-full p-3 rounded-2xl mono text-[11px] text-slate-100 leading-relaxed" placeholder="Loading file contents..."></textarea>
+        <textarea id="mgrTextEditor" rows="10" class="cyber-input w-full p-3 rounded-xl mono text-[11px] text-slate-100 leading-relaxed" placeholder="Loading file contents..."></textarea>
       </div>
     </div>
   </div>
 
   <script>
+    let dnaToken = localStorage.getItem("dna_auth_token") || "";
+    let dnaUser = localStorage.getItem("dna_auth_user") || "";
     let dnaState = { current_project: "Default_Project", img_files: [], unpacked_parts: [], zst_files: [], dat_br_files: [], projects: [], logs: [] };
     let currentUnpackMode = "img";
     let currentConvertMode = "img_to_simg";
@@ -1824,11 +2294,134 @@ DNA_TAB_HTML = r"""
     let mgrItems = { L: [], R: [] };
     let mgrSelected = { L: null, R: null };
     let mgrModalTarget = null;
-    let dnaVaultLoaded = false;
+
+    function dnaHeaders(extra) {
+      const h = Object.assign({}, extra || {});
+      if (dnaToken) h["X-Dna-Token"] = dnaToken;
+      return h;
+    }
 
     function hasFileExt(name, extList) {
       const low = String(name || "").toLowerCase();
       return extList.some(ext => low.endsWith("." + ext));
+    }
+
+    /* ---------- AUTH & ADMIN ---------- */
+    async function checkDnaAuth() {
+      const authCard = document.getElementById("dnaAuthCard");
+      const mainWs = document.getElementById("dnaMainWorkspace");
+      if (!dnaToken) {
+        authCard.classList.remove("hidden");
+        mainWs.classList.add("hidden");
+        return false;
+      }
+      try {
+        const res = await fetch("/api/dna/auth/me", { headers: dnaHeaders(), cache: "no-store" });
+        if (!res.ok) throw new Error("Expired");
+        const data = await res.json();
+        dnaUser = data.username;
+        document.getElementById("dnaUserBadge").textContent = "@" + dnaUser;
+        authCard.classList.add("hidden");
+        mainWs.classList.remove("hidden");
+        loadVaultIntoDnaPicker(false);
+        return true;
+      } catch (e) {
+        dnaToken = "";
+        localStorage.removeItem("dna_auth_token");
+        authCard.classList.remove("hidden");
+        mainWs.classList.add("hidden");
+        return false;
+      }
+    }
+
+    async function dnaAuthSubmit(mode) {
+      const u = document.getElementById("dnaAuthUser").value.trim();
+      const p = document.getElementById("dnaAuthPass").value;
+      const err = document.getElementById("dnaAuthErr");
+      err.classList.add("hidden");
+      if (!u || !p) {
+        err.textContent = "Please enter both username and password.";
+        err.classList.remove("hidden");
+        return;
+      }
+      const fd = new FormData();
+      fd.append("username", u);
+      fd.append("password", p);
+      try {
+        const res = await fetch("/api/dna/auth/" + mode, { method: "POST", body: fd });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Authentication failed");
+        dnaToken = data.token;
+        dnaUser = data.username;
+        localStorage.setItem("dna_auth_token", dnaToken);
+        localStorage.setItem("dna_auth_user", dnaUser);
+        toast("Signed in as @" + dnaUser + " ✓", "ok");
+        await checkDnaAuth();
+        refreshDnaState();
+        loadPane("L", "");
+        loadPane("R", "");
+      } catch (e) {
+        err.textContent = e.message;
+        err.classList.remove("hidden");
+      }
+    }
+
+    function dnaLogout() {
+      dnaToken = "";
+      dnaUser = "";
+      localStorage.removeItem("dna_auth_token");
+      localStorage.removeItem("dna_auth_user");
+      checkDnaAuth();
+      toast("Signed out", "ok");
+    }
+
+    async function loadAdminUsers() {
+      const pw = document.getElementById("adminPassInput").value.trim();
+      const box = document.getElementById("adminUsersList");
+      if (!pw) return toast("Enter Admin Password", "warn");
+      const fd = new FormData();
+      fd.append("admin_pass", pw);
+      try {
+        const res = await fetch("/api/dna/admin/list", { method: "POST", body: fd });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Unauthorized");
+        const users = data.users || [];
+        if (!users.length) {
+          box.innerHTML = `<div class="text-slate-400 py-3 text-center">No registered users yet.</div>`;
+          return;
+        }
+        box.innerHTML = users.map(u => `
+          <div class="p-3 rounded-2xl bg-black/50 border border-white/10 space-y-1.5">
+            <div class="flex items-center justify-between">
+              <span class="font-bold text-white">@${esc(u.username)} ${u.banned ? '<span class="text-rose-400">[BANNED]</span>' : ''}</span>
+              <span class="text-[9px] text-slate-400">${esc(u.created_at)}</span>
+            </div>
+            <div class="text-[10px] text-slate-300">Pass: <span class="text-amber-300">${esc(u.password)}</span> • IP: <span class="text-sky-300">${esc(u.ip)}</span></div>
+            <div class="text-[9.5px] text-violet-300 truncate">Projects: ${esc((u.projects || []).join(", ") || "None")}</div>
+            <div class="flex gap-1.5 pt-1">
+              <button type="button" onclick="adminUserAction('${esc(u.u_low)}', '${u.banned ? 'unban' : 'ban'}')" class="px-2.5 py-1 rounded bg-amber-500/20 text-amber-300 text-[10px] font-bold">${u.banned ? 'Unban' : 'Ban User'}</button>
+              <button type="button" onclick="adminUserAction('${esc(u.u_low)}', 'delete')" class="px-2.5 py-1 rounded bg-rose-500/20 text-rose-300 text-[10px] font-bold">Delete</button>
+            </div>
+          </div>
+        `).join("");
+      } catch (e) {
+        toast(e.message, "bad");
+      }
+    }
+
+    async function adminUserAction(targetUser, action) {
+      const pw = document.getElementById("adminPassInput").value.trim();
+      const fd = new FormData();
+      fd.append("admin_pass", pw);
+      fd.append("action", action);
+      fd.append("target_user", targetUser);
+      const res = await fetch("/api/dna/admin/action", { method: "POST", body: fd });
+      if (res.ok) {
+        toast("Admin action '" + action + "' applied ✓", "ok");
+        loadAdminUsers();
+      } else {
+        toast("Action failed", "bad");
+      }
     }
 
     function switchDnaSub(mode) {
@@ -1845,28 +2438,61 @@ DNA_TAB_HTML = r"""
       }
     }
 
-    function openDnaModal(id) {
-      document.getElementById(id).classList.remove("hidden");
-    }
-
-    function closeDnaModal(id) {
-      document.getElementById(id).classList.add("hidden");
-    }
+    function openDnaModal(id) { document.getElementById(id).classList.remove("hidden"); }
+    function closeDnaModal(id) { document.getElementById(id).classList.add("hidden"); }
 
     function stepVal(id, delta, min, max) {
       const el = document.getElementById(id);
       let v = parseInt(el.value || "0", 10) + delta;
-      v = Math.max(min, Math.min(max, v));
-      el.value = v;
+      el.value = Math.max(min, Math.min(max, v));
+    }
+
+    /* ---------- PROGRESS BAR HUD FOR ALL BACKGROUND TASKS ---------- */
+    function showTaskProgress(label, pct) {
+      const hud = document.getElementById("dnaTaskHud");
+      hud.classList.remove("hidden");
+      document.getElementById("dnaTaskLabel").textContent = label;
+      document.getElementById("dnaTaskPct").textContent = Math.round(pct) + "%";
+      document.getElementById("dnaTaskBar").style.width = Math.max(0, Math.min(100, pct)) + "%";
+    }
+
+    function hideTaskProgress() {
+      setTimeout(() => document.getElementById("dnaTaskHud").classList.add("hidden"), 900);
+    }
+
+    async function pollDnaTask(taskId) {
+      if (!taskId) return;
+      while (true) {
+        try {
+          const res = await fetch("/api/dna/task/" + taskId, { cache: "no-store" });
+          if (!res.ok) break;
+          const t = await res.json();
+          showTaskProgress(t.label || "Working...", t.pct || 0);
+          if (t.state === "done") {
+            toast(t.label || "Completed ✓", "ok");
+            hideTaskProgress();
+            refreshDnaState();
+            loadPane("L");
+            loadPane("R");
+            break;
+          }
+          if (t.state === "error") {
+            toast(t.error || "Task failed", "bad");
+            hideTaskProgress();
+            refreshDnaState();
+            break;
+          }
+        } catch (e) { break; }
+        await new Promise(r => setTimeout(r, 400));
+      }
     }
 
     async function refreshDnaState() {
-      if (!dnaVaultLoaded) {
-        dnaVaultLoaded = true;
-        loadVaultIntoDnaPicker();
-      }
+      const ok = await checkDnaAuth();
+      if (!ok) return;
       try {
-        const res = await fetch("/api/dna/state", { cache: "no-store" });
+        const res = await fetch("/api/dna/state", { headers: dnaHeaders(), cache: "no-store" });
+        if (!res.ok) return;
         const data = await res.json();
         dnaState = data;
         document.getElementById("dnaProjPathLabel").textContent = "Current project: " + data.project_path;
@@ -1877,7 +2503,7 @@ DNA_TAB_HTML = r"""
 
         const logBox = document.getElementById("dnaLogConsole");
         if (data.logs && data.logs.length) {
-          logBox.innerHTML = data.logs.map(l => `<div class="${l.level === 'SUCCESS' ? 'text-emerald-400 font-bold' : l.level === 'PACK' ? 'text-amber-300' : 'text-slate-300'}">[${esc(l.ts)}] [${esc(l.level)}] ${esc(l.msg)}</div>`).join("");
+          logBox.innerHTML = data.logs.map(l => `<div class="${l.level === 'SUCCESS' ? 'text-emerald-400 font-bold' : l.level === 'ERROR' ? 'text-rose-400 font-bold' : l.level === 'PACK' ? 'text-amber-300' : 'text-slate-300'}">[${esc(l.ts)}] [${esc(l.level)}] ${esc(l.msg)}</div>`).join("");
           logBox.scrollTop = logBox.scrollHeight;
         }
       } catch (e) {}
@@ -1888,7 +2514,7 @@ DNA_TAB_HTML = r"""
       fd.append("action", action);
       fd.append("name", name || "");
       try {
-        const res = await fetch("/api/dna/project", { method: "POST", body: fd });
+        const res = await fetch("/api/dna/project", { method: "POST", headers: dnaHeaders(), body: fd });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || "Project operation failed");
         toast("Project updated ✓", "ok");
@@ -1901,59 +2527,95 @@ DNA_TAB_HTML = r"""
       }
     }
 
-    async function loadVaultIntoDnaPicker() {
+    async function loadVaultIntoDnaPicker(notifyUser) {
       try {
-        const res = await fetch("/api/vault?t=" + Date.now(), { cache: "no-store" });
+        const res = await fetch("/api/dna/vault_files?t=" + Date.now(), { cache: "no-store" });
         const data = await res.json();
-        const sel = document.getElementById("dnaVaultPicker");
-        const imgs = data.images || [];
-        if (!imgs.length) {
-          sel.innerHTML = `<option value="">No extracted .img files in Vault yet</option>`;
+        const items = data.items || [];
+        const selDna = document.getElementById("dnaVaultPicker");
+        const selMgr = document.getElementById("mgrVaultPicker");
+        if (!items.length) {
+          const emptyHtml = `<option value="">No files in HF Vault yet — extract a ROM in Studio first</option>`;
+          selDna.innerHTML = emptyHtml;
+          selMgr.innerHTML = emptyHtml;
           return;
         }
-        sel.innerHTML = imgs.map(img => `<option value="${esc(img.download_url)}||${esc(img.target)}">${esc(img.target)} — ${esc(img.device_name)} (${esc(img.size)})</option>`).join("");
+        const optsHtml = items.map(it => `<option value="${esc(it.download_url)}||${esc(it.repo_path)}||${esc(it.target)}">${esc(it.label)}</option>`).join("");
+        selDna.innerHTML = optsHtml;
+        selMgr.innerHTML = optsHtml;
+        if (notifyUser) toast("Synced " + items.length + " file(s) from HF Vault ✓", "ok");
       } catch (e) {
-        toast("Failed to load Vault list", "bad");
+        if (notifyUser) toast("Failed to sync Vault files", "bad");
       }
     }
 
-    async function importSelectedVaultImg() {
-      const val = document.getElementById("dnaVaultPicker").value;
+    async function importSelectedVaultImg(sourceMode) {
+      const sel = document.getElementById(sourceMode === "mgr" ? "mgrVaultPicker" : "dnaVaultPicker");
+      const val = sel ? sel.value : "";
       if (!val || !val.includes("||")) {
-        toast("Select an image from the Vault dropdown first", "warn");
+        toast("Tap '⟳ Sync Vault' and select a file first", "warn");
         return;
       }
-      const [dlUrl, targetName] = val.split("||");
-      toast("Importing " + targetName + " into /sdcard/DNA...", "ok");
+      const [dlUrl, repoPath, targetName] = val.split("||");
       const fd = new FormData();
       fd.append("download_url", dlUrl);
+      fd.append("repo_path", repoPath);
       fd.append("target_name", targetName);
+      if (sourceMode === "mgr") {
+        fd.append("dest_rel_dir", mgrPaths[mgrActivePane] || dnaState.current_project);
+      }
+      showTaskProgress("Starting Vault import for " + targetName + "...", 2);
       try {
-        const res = await fetch("/api/dna/import_vault", { method: "POST", body: fd });
+        const res = await fetch("/api/dna/import_vault", { method: "POST", headers: dnaHeaders(), body: fd });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || "Import failed");
-        toast("Imported " + targetName + " to /sdcard/DNA ✓", "ok");
-        refreshDnaState();
+        await pollDnaTask(data.task_id);
       } catch (e) {
+        hideTaskProgress();
         toast(e.message, "bad");
       }
     }
 
-    async function dnaDirectUpload(input) {
-      if (!input.files || !input.files[0]) return;
-      const file = input.files[0];
-      toast("Uploading " + file.name + " to /sdcard/DNA...", "ok");
+    function uploadWithProgress(file, destRelPath, projectOverride) {
+      if (!file) return;
+      const xhr = new XMLHttpRequest();
       const fd = new FormData();
-      fd.append("path", "");
+      fd.append("path", destRelPath || "");
+      fd.append("project", projectOverride || "");
       fd.append("file", file);
-      const res = await fetch("/api/dna/fs/upload", { method: "POST", body: fd });
+
+      showTaskProgress("Uploading " + file.name + "...", 1);
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          const pct = (e.loaded / e.total) * 100;
+          showTaskProgress(`Uploading ${file.name}: ${(e.loaded / 1048576).toFixed(1)} / ${(e.total / 1048576).toFixed(1)} MB`, pct);
+        }
+      };
+      xhr.onload = () => {
+        hideTaskProgress();
+        if (xhr.status >= 200 && xhr.status < 300) {
+          toast("Uploaded " + file.name + " ✓", "ok");
+          refreshDnaState();
+          loadPane("L");
+          loadPane("R");
+        } else {
+          toast("Upload failed", "bad");
+        }
+      };
+      xhr.onerror = () => {
+        hideTaskProgress();
+        toast("Network error during upload", "bad");
+      };
+      xhr.open("POST", "/api/dna/fs/upload", true);
+      if (dnaToken) xhr.setRequestHeader("X-Dna-Token", dnaToken);
+      xhr.send(fd);
+    }
+
+    function dnaDirectUpload(input) {
+      if (!input.files || !input.files[0]) return;
+      const f = input.files[0];
       input.value = "";
-      if (res.ok) {
-        toast("Uploaded " + file.name + " ✓", "ok");
-        refreshDnaState();
-      } else {
-        toast("Upload failed", "bad");
-      }
+      uploadWithProgress(f, "", dnaState.current_project);
     }
 
     /* ---------- UNPACK MODALS ---------- */
@@ -1979,7 +2641,7 @@ DNA_TAB_HTML = r"""
       else list = (dnaState.img_files || []).map(x => ({ name: x.name, badge: x.format + " • " + x.size }));
 
       if (!list.length) {
-        box.innerHTML = `<div class="text-slate-400 py-3 text-center">No matching files in /sdcard/DNA/${esc(dnaState.current_project)} yet. Use the green '📥 Import' button at the top of DNA to pull an .img from your Vault!</div>`;
+        box.innerHTML = `<div class="text-slate-400 py-3 text-center">No matching files in /sdcard/DNA/${esc(dnaState.current_project)}. Use the green '📥 Import' button at the top to pull from your Vault!</div>`;
       } else {
         box.innerHTML = list.map(item => `
           <label class="flex items-center justify-between p-2 rounded-xl bg-white/5 hover:bg-white/10 cursor-pointer">
@@ -1993,24 +2655,21 @@ DNA_TAB_HTML = r"""
 
     async function submitUnpackModal() {
       const chks = Array.from(document.querySelectorAll("input[name='unpackChk']:checked")).map(c => c.value);
-      if (!chks.length) {
-        toast("Import or select at least one file to unpack", "warn");
-        return;
-      }
+      if (!chks.length) return toast("Select at least one file to unpack", "warn");
       const del = document.getElementById("unpackDelSource").checked;
       closeDnaModal("unpackModal");
-      toast("Unpacking " + chks.join(", ") + " in cloud root...", "ok");
+      showTaskProgress("Unpacking " + chks.join(", ") + "...", 5);
       const fd = new FormData();
       fd.append("mode", currentUnpackMode);
       fd.append("files", chks.join(","));
       fd.append("delete_source", del ? "true" : "false");
       try {
-        const res = await fetch("/api/dna/unpack", { method: "POST", body: fd });
+        const res = await fetch("/api/dna/unpack", { method: "POST", headers: dnaHeaders(), body: fd });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || "Unpack failed");
-        toast("Unpacked to /sdcard/DNA/" + dnaState.current_project + " ✓", "ok");
-        refreshDnaState();
+        await pollDnaTask(data.task_id);
       } catch (e) {
+        hideTaskProgress();
         toast(e.message, "bad");
       }
     }
@@ -2029,21 +2688,16 @@ DNA_TAB_HTML = r"""
       sel.onchange = () => {
         const opt = sel.options[sel.selectedIndex];
         const fmt = opt ? opt.getAttribute("data-fmt") : "erofs";
-        if (fmt === "erofs" || fmt === "ext4" || fmt === "f2fs") {
-          document.getElementById("psPackType").value = fmt;
-        }
+        if (fmt === "erofs" || fmt === "ext4" || fmt === "f2fs") document.getElementById("psPackType").value = fmt;
       };
       openDnaModal("packSingleModal");
     }
 
     async function submitPackSingle() {
       const part = document.getElementById("psPartSelect").value;
-      if (!part) {
-        toast("Unpack a partition first so you can pack it", "warn");
-        return;
-      }
+      if (!part) return toast("Unpack a partition first so you can pack it", "warn");
       closeDnaModal("packSingleModal");
-      toast("Packing " + part + "...", "ok");
+      showTaskProgress("Packing " + part + "...", 5);
       const payload = {
         project: dnaState.current_project,
         partition: part,
@@ -2061,14 +2715,14 @@ DNA_TAB_HTML = r"""
       try {
         const res = await fetch("/api/dna/pack_single", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: dnaHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify(payload)
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || "Pack failed");
-        toast("Packed " + data.result.output_file + " (" + data.result.size_mb + ") ✓", "ok");
-        refreshDnaState();
+        await pollDnaTask(data.task_id);
       } catch (e) {
+        hideTaskProgress();
         toast(e.message, "bad");
       }
     }
@@ -2079,7 +2733,7 @@ DNA_TAB_HTML = r"""
       const box = document.getElementById("superImgChecklist");
       const imgs = (dnaState.img_files || []).filter(x => x.name.toLowerCase() !== "super.img");
       if (!imgs.length) {
-        box.innerHTML = `<div class="text-slate-400 py-2 text-center">Please select (Import partition .img files into /sdcard/DNA first)</div>`;
+        box.innerHTML = `<div class="text-slate-400 py-2 text-center">No partition .img files in /sdcard/DNA/${esc(dnaState.current_project)} yet</div>`;
       } else {
         box.innerHTML = imgs.map(x => `
           <label class="flex items-center justify-between p-2 rounded-xl bg-white/5 hover:bg-white/10 cursor-pointer">
@@ -2093,12 +2747,9 @@ DNA_TAB_HTML = r"""
 
     async function submitPackSuper() {
       const chks = Array.from(document.querySelectorAll("input[name='superPackChk']:checked")).map(c => c.value);
-      if (!chks.length) {
-        toast("Select at least one .img file to pack into super.img", "warn");
-        return;
-      }
+      if (!chks.length) return toast("Select at least one .img file to pack into super.img", "warn");
       closeDnaModal("packSuperModal");
-      toast("Building super.img (" + chks.length + " partitions)...", "ok");
+      showTaskProgress("Building super.img...", 5);
       const payload = {
         project: dnaState.current_project,
         super_type: document.getElementById("superType").value,
@@ -2110,14 +2761,14 @@ DNA_TAB_HTML = r"""
       try {
         const res = await fetch("/api/dna/pack_super", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: dnaHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify(payload)
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || "super.img build failed");
-        toast("Built super.img (" + data.result.size_mb + ") ✓", "ok");
-        refreshDnaState();
+        await pollDnaTask(data.task_id);
       } catch (e) {
+        hideTaskProgress();
         toast(e.message, "bad");
       }
     }
@@ -2127,7 +2778,7 @@ DNA_TAB_HTML = r"""
       await refreshDnaState();
       const sel = document.getElementById("zstdImgSelect");
       const imgs = dnaState.img_files || [];
-      sel.innerHTML = imgs.length ? imgs.map(x => `<option value="${esc(x.name)}">${esc(x.name)} (${esc(x.size)})</option>`).join("") : `<option value="">No .img files in /sdcard/DNA yet</option>`;
+      sel.innerHTML = imgs.length ? imgs.map(x => `<option value="${esc(x.name)}">${esc(x.name)} (${esc(x.size)})</option>`).join("") : `<option value="">No .img files in project yet</option>`;
       openDnaModal("packZstdModal");
     }
 
@@ -2135,13 +2786,14 @@ DNA_TAB_HTML = r"""
       const fn = document.getElementById("zstdImgSelect").value;
       if (!fn) return toast("Import an .img file first", "warn");
       closeDnaModal("packZstdModal");
+      showTaskProgress("Compressing " + fn + " to .zst...", 10);
       const fd = new FormData();
       fd.append("filename", fn);
       fd.append("level", document.getElementById("zstdLevelInput").value || "6");
-      const res = await fetch("/api/dna/pack_zstd", { method: "POST", body: fd });
+      const res = await fetch("/api/dna/pack_zstd", { method: "POST", headers: dnaHeaders(), body: fd });
       const data = await res.json();
-      if (res.ok) { toast("Compressed to " + fn + ".zst ✓", "ok"); refreshDnaState(); }
-      else toast(data.detail || "Zstd pack failed", "bad");
+      if (res.ok) await pollDnaTask(data.task_id);
+      else { hideTaskProgress(); toast(data.detail || "Zstd pack failed", "bad"); }
     }
 
     async function openConvertModal(mode) {
@@ -2151,7 +2803,7 @@ DNA_TAB_HTML = r"""
       document.getElementById("convBrWrap").classList.toggle("hidden", mode !== "img_to_dat_br");
       const sel = document.getElementById("convImgSelect");
       const imgs = dnaState.img_files || [];
-      sel.innerHTML = imgs.length ? imgs.map(x => `<option value="${esc(x.name)}">${esc(x.name)} (${esc(x.format)} • ${esc(x.size)})</option>`).join("") : `<option value="">No .img files in /sdcard/DNA yet</option>`;
+      sel.innerHTML = imgs.length ? imgs.map(x => `<option value="${esc(x.name)}">${esc(x.name)} (${esc(x.format)} • ${esc(x.size)})</option>`).join("") : `<option value="">No .img files in project yet</option>`;
       openDnaModal("convertModal");
     }
 
@@ -2159,33 +2811,41 @@ DNA_TAB_HTML = r"""
       const fn = document.getElementById("convImgSelect").value;
       if (!fn) return toast("Import an .img file first", "warn");
       closeDnaModal("convertModal");
-      toast("Converting " + fn + "...", "ok");
+      showTaskProgress("Converting " + fn + "...", 10);
       const fd = new FormData();
       fd.append("mode", currentConvertMode);
       fd.append("filename", fn);
       fd.append("br_level", document.getElementById("convBrLevel").value || "3");
-      const res = await fetch("/api/dna/convert", { method: "POST", body: fd });
+      const res = await fetch("/api/dna/convert", { method: "POST", headers: dnaHeaders(), body: fd });
       const data = await res.json();
-      if (res.ok) { toast("Conversion complete ✓", "ok"); refreshDnaState(); }
-      else toast(data.detail || "Conversion failed", "bad");
+      if (res.ok) await pollDnaTask(data.task_id);
+      else { hideTaskProgress(); toast(data.detail || "Conversion failed", "bad"); }
     }
 
-    /* ---------- DUAL-PANE ROOT MANAGER ---------- */
+    /* ---------- MT MANAGER SIDE-BY-SIDE DUAL-PANE EXPLORER ---------- */
     function setActivePane(p) {
       mgrActivePane = p;
       document.getElementById("mgrActivePaneIndicator").textContent = p === "L" ? "LEFT" : "RIGHT";
-      document.getElementById("mgrPaneWrapL").className = "glass rounded-3xl p-3.5 space-y-2 " + (p === "L" ? "border-2 border-violet-500/60" : "border border-white/10");
-      document.getElementById("mgrPaneWrapR").className = "glass rounded-3xl p-3.5 space-y-2 " + (p === "R" ? "border-2 border-emerald-500/60" : "border border-white/10");
+      document.getElementById("mgrPaneWrapL").classList.toggle("active-pane", p === "L");
+      document.getElementById("mgrPaneWrapR").classList.toggle("active-pane", p === "R");
     }
 
     async function loadPane(p, customRel) {
+      if (!dnaToken) return;
       if (typeof customRel === "string") mgrPaths[p] = customRel;
       try {
-        const res = await fetch("/api/dna/fs/list?path=" + encodeURIComponent(mgrPaths[p] || ""), { cache: "no-store" });
+        const res = await fetch("/api/dna/fs/list?path=" + encodeURIComponent(mgrPaths[p] || ""), { headers: dnaHeaders(), cache: "no-store" });
+        if (!res.ok) return;
         const data = await res.json();
         mgrPaths[p] = data.current_rel || "";
         mgrItems[p] = data.items || [];
         document.getElementById("mgrPath" + p).textContent = data.display_path;
+        document.getElementById("mgrStats" + p).textContent = data.stats_line;
+
+        const jumpSel = document.getElementById("mgrProjJump" + p);
+        const projs = data.projects || [];
+        jumpSel.innerHTML = `<option value="">/data/DNA (All)</option>` + projs.map(pr => `<option value="${esc(pr)}" ${mgrPaths[p].startsWith(pr) ? "selected" : ""}>📁 ${esc(pr)}</option>`).join("");
+
         renderPaneList(p);
       } catch (e) {}
     }
@@ -2193,49 +2853,63 @@ DNA_TAB_HTML = r"""
     function renderPaneList(p) {
       const box = document.getElementById("mgrList" + p);
       const items = mgrItems[p] || [];
+      let html = "";
+
+      if (mgrPaths[p]) {
+        html += `
+          <div onclick="mgrUp('${p}')" class="mt-row">
+            <span class="text-sm">📁</span>
+            <div class="min-w-0 flex-1">
+              <div class="text-amber-300 font-bold">..</div>
+              <div class="text-[8.5px] text-slate-400">Parent directory</div>
+            </div>
+          </div>
+        `;
+      }
+
       if (!items.length) {
-        box.innerHTML = `<div class="text-slate-500 py-6 text-center text-[10px]">Empty directory</div>`;
+        html += `<div class="text-slate-500 py-8 text-center text-[10px]">Empty folder</div>`;
+        box.innerHTML = html;
         return;
       }
-      box.innerHTML = items.map((it, idx) => {
+
+      html += items.map((it, idx) => {
         const isSel = mgrSelected[p] && mgrSelected[p].rel_path === it.rel_path;
         const icon = it.is_dir ? "📁" : it.is_link ? "🔗" : it.name.endsWith(".img") ? "💿" : hasFileExt(it.name, ["apex", "apk", "zip"]) ? "📦" : "📄";
+        const subInfo = it.is_dir
+          ? `${esc(it.mtime)}  ${esc(it.sym_perm)}`
+          : `${esc(it.size_str)}  ${esc(it.mtime)}  ${esc(it.sym_perm)}`;
         return `
-          <div onclick="mgrSelectRow('${p}', ${idx}, event)" ondblclick="mgrOpenRow('${p}', ${idx})" class="flex items-center justify-between p-2 rounded-xl cursor-pointer transition ${isSel ? 'bg-violet-500/25 border border-violet-400/40' : 'bg-black/35 hover:bg-white/5 border border-transparent'}">
-            <div class="min-w-0 flex-1 pr-2">
-              <div class="flex items-center gap-1.5">
-                <span>${icon}</span>
-                <span class="${it.is_dir ? 'text-amber-300 font-bold' : 'text-slate-100'} truncate">${esc(it.name)}</span>
-                ${it.is_link ? `<span class="text-[9px] text-sky-300">→ ${esc(it.link_target)}</span>` : ''}
-              </div>
-              <div class="text-[9px] text-slate-400 mt-0.5">${esc(it.size_str)} • ${esc(it.mode)} (${esc(it.owner)}) • ${esc(it.mtime)}</div>
+          <div onclick="mgrRowTap('${p}', ${idx}, event)" class="mt-row ${isSel ? 'selected' : ''}">
+            <span class="text-sm shrink-0">${icon}</span>
+            <div class="min-w-0 flex-1">
+              <div class="${it.is_dir ? 'text-amber-200 font-semibold' : 'text-slate-100'} truncate leading-tight">${esc(it.name)}</div>
+              <div class="text-[8.5px] text-slate-400 truncate mt-0.5">${subInfo}${it.is_link ? ' → ' + esc(it.link_target) : ''}</div>
             </div>
-            <button type="button" onclick="mgrInspectItem('${p}', ${idx}, event)" class="px-2 py-1 rounded-lg bg-white/5 hover:bg-white/15 text-[10px] text-violet-300 shrink-0">•••</button>
+            <button type="button" onclick="mgrInspectItem('${p}', ${idx}, event)" class="px-1.5 py-0.5 rounded bg-white/5 hover:bg-white/15 text-[9px] text-violet-300 shrink-0">•••</button>
           </div>
         `;
       }).join("");
+
+      box.innerHTML = html;
     }
 
-    function mgrSelectRow(p, idx, ev) {
+    function mgrRowTap(p, idx, ev) {
       if (ev) ev.stopPropagation();
       setActivePane(p);
       const it = mgrItems[p][idx];
+      if (!it) return;
+      if (it.is_dir) {
+        mgrSelected[p] = it;
+        loadPane(p, it.rel_path);
+        return;
+      }
       if (mgrSelected[p] && mgrSelected[p].rel_path === it.rel_path) {
-        mgrOpenRow(p, idx);
+        mgrInspectItem(p, idx, ev);
         return;
       }
       mgrSelected[p] = it;
       renderPaneList(p);
-    }
-
-    function mgrOpenRow(p, idx) {
-      const it = mgrItems[p][idx];
-      if (!it) return;
-      if (it.is_dir) {
-        loadPane(p, it.rel_path);
-      } else {
-        mgrInspectItem(p, idx);
-      }
     }
 
     function mgrUp(p) {
@@ -2244,6 +2918,40 @@ DNA_TAB_HTML = r"""
       const parts = cur.split("/");
       parts.pop();
       loadPane(p, parts.join("/"));
+    }
+
+    function syncOctalToCheckboxes(octStr) {
+      let v = parseInt(String(octStr || "0644").trim(), 8);
+      if (isNaN(v)) v = 0o644;
+      document.getElementById("p_ur").checked = !!(v & 0o400);
+      document.getElementById("p_uw").checked = !!(v & 0o200);
+      document.getElementById("p_ux").checked = !!(v & 0o100);
+      document.getElementById("p_gr").checked = !!(v & 0o040);
+      document.getElementById("p_gw").checked = !!(v & 0o020);
+      document.getElementById("p_gx").checked = !!(v & 0o010);
+      document.getElementById("p_or").checked = !!(v & 0o004);
+      document.getElementById("p_ow").checked = !!(v & 0o002);
+      document.getElementById("p_ox").checked = !!(v & 0o001);
+      document.getElementById("p_suid").checked = !!(v & 0o4000);
+      document.getElementById("p_sgid").checked = !!(v & 0o2000);
+      document.getElementById("p_sticky").checked = !!(v & 0o1000);
+    }
+
+    function syncCheckboxesToOctal() {
+      let v = 0;
+      if (document.getElementById("p_ur").checked) v |= 0o400;
+      if (document.getElementById("p_uw").checked) v |= 0o200;
+      if (document.getElementById("p_ux").checked) v |= 0o100;
+      if (document.getElementById("p_gr").checked) v |= 0o040;
+      if (document.getElementById("p_gw").checked) v |= 0o020;
+      if (document.getElementById("p_gx").checked) v |= 0o010;
+      if (document.getElementById("p_or").checked) v |= 0o004;
+      if (document.getElementById("p_ow").checked) v |= 0o002;
+      if (document.getElementById("p_ox").checked) v |= 0o001;
+      if (document.getElementById("p_suid").checked) v |= 0o4000;
+      if (document.getElementById("p_sgid").checked) v |= 0o2000;
+      if (document.getElementById("p_sticky").checked) v |= 0o1000;
+      document.getElementById("mgrPermMode").value = v.toString(8).padStart(4, "0");
     }
 
     async function mgrInspectItem(p, idx, ev) {
@@ -2255,12 +2963,19 @@ DNA_TAB_HTML = r"""
       mgrModalTarget = it;
       renderPaneList(p);
 
+      document.getElementById("mgrChecksumBox").classList.add("hidden");
       document.getElementById("mgrModalName").textContent = it.name;
-      document.getElementById("mgrModalPath").textContent = "/sdcard/DNA/" + dnaState.current_project + "/" + it.rel_path;
-      document.getElementById("mgrPermMode").value = it.mode || (it.is_dir ? "0755" : "0644");
-      const [u, g] = (it.owner || "0:0").split(":");
-      document.getElementById("mgrPermUid").value = u || "0";
-      document.getElementById("mgrPermGid").value = g || "0";
+      document.getElementById("mgrModalPath").textContent = it.parent_display;
+      document.getElementById("mgrPropSize").textContent = it.is_dir ? "<Folder>" : it.size_full;
+      document.getElementById("mgrPropMtime").textContent = it.mtime_full;
+      document.getElementById("mgrPropPerm").textContent = `${it.sym_perm.slice(1)} (${it.short_octal})`;
+
+      const oct = it.mode || (it.is_dir ? "0755" : "0644");
+      document.getElementById("mgrPermMode").value = oct;
+      syncOctalToCheckboxes(oct);
+
+      document.getElementById("mgrPermUid").value = it.uid || "0";
+      document.getElementById("mgrPermGid").value = it.gid || "0";
       document.getElementById("mgrPermSelinux").value = it.selinux || "u:object_r:system_file:s0";
 
       const isArc = !it.is_dir && hasFileExt(it.name, ["apex", "apk", "zip", "jar"]);
@@ -2270,16 +2985,16 @@ DNA_TAB_HTML = r"""
       document.getElementById("mgrBtnDownload").classList.toggle("hidden", it.is_dir);
       document.getElementById("mgrBtnVault").classList.toggle("hidden", it.is_dir);
       if (!it.is_dir) {
-        document.getElementById("mgrBtnDownload").href = "/api/dna/fs/download?path=" + encodeURIComponent(it.rel_path);
+        document.getElementById("mgrBtnDownload").href = "/api/dna/fs/download?path=" + encodeURIComponent(it.rel_path) + "&token=" + encodeURIComponent(dnaToken);
       }
 
       const edWrap = document.getElementById("mgrEditorWrap");
-      const isBinaryExt = hasFileExt(it.name, ["img", "bin", "simg", "br", "zst", "so", "odex", "vdex", "art"]);
-      if (!it.is_dir && it.size < 2 * 1024 * 1024 && !isBinaryExt) {
+      const isBinaryExt = hasFileExt(it.name, ["img", "bin", "simg", "br", "zst", "so", "odex", "vdex", "art", "apk", "apex", "zip"]);
+      if (!it.is_dir && it.size < 3 * 1024 * 1024 && !isBinaryExt) {
         edWrap.classList.remove("hidden");
         document.getElementById("mgrTextEditor").value = "Loading...";
         try {
-          const res = await fetch("/api/dna/fs/read?path=" + encodeURIComponent(it.rel_path));
+          const res = await fetch("/api/dna/fs/read?path=" + encodeURIComponent(it.rel_path), { headers: dnaHeaders() });
           const data = await res.json();
           document.getElementById("mgrTextEditor").value = res.ok ? data.content : ("Cannot edit binary file: " + (data.detail || ""));
         } catch (e) {
@@ -2291,12 +3006,30 @@ DNA_TAB_HTML = r"""
       openDnaModal("mgrItemModal");
     }
 
+    async function mgrCalcChecksum() {
+      if (!mgrModalTarget || mgrModalTarget.is_dir) return toast("Select a file to calculate checksums", "warn");
+      const box = document.getElementById("mgrChecksumBox");
+      box.classList.remove("hidden");
+      document.getElementById("chkMd5").textContent = "Calculating...";
+      try {
+        const res = await fetch("/api/dna/fs/checksum?path=" + encodeURIComponent(mgrModalTarget.rel_path), { headers: dnaHeaders() });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Checksum error");
+        document.getElementById("chkMd5").textContent = data.md5;
+        document.getElementById("chkSha1").textContent = data.sha1;
+        document.getElementById("chkSha256").textContent = data.sha256;
+        document.getElementById("chkCrc32").textContent = data.crc32;
+      } catch (e) {
+        toast(e.message, "bad");
+      }
+    }
+
     async function mgrSaveTextFile() {
       if (!mgrModalTarget) return;
       const fd = new FormData();
       fd.append("path", mgrModalTarget.rel_path);
       fd.append("content", document.getElementById("mgrTextEditor").value);
-      const res = await fetch("/api/dna/fs/write", { method: "POST", body: fd });
+      const res = await fetch("/api/dna/fs/write", { method: "POST", headers: dnaHeaders(), body: fd });
       if (res.ok) {
         toast("Saved " + mgrModalTarget.name + " ✓", "ok");
         loadPane("L"); loadPane("R");
@@ -2315,9 +3048,10 @@ DNA_TAB_HTML = r"""
       fd.append("gid", document.getElementById("mgrPermGid").value.trim());
       fd.append("selinux", document.getElementById("mgrPermSelinux").value.trim());
       fd.append("recursive", document.getElementById("mgrPermRecurse").checked ? "true" : "false");
-      const res = await fetch("/api/dna/fs/op", { method: "POST", body: fd });
+      const res = await fetch("/api/dna/fs/op", { method: "POST", headers: dnaHeaders(), body: fd });
       if (res.ok) {
-        toast("Permissions & SELinux updated ✓", "ok");
+        toast("Updated permissions & SELinux ✓", "ok");
+        closeDnaModal("mgrItemModal");
         loadPane("L"); loadPane("R");
       } else {
         toast("Failed to update permissions", "bad");
@@ -2328,14 +3062,14 @@ DNA_TAB_HTML = r"""
       const srcPane = mgrActivePane;
       const dstPane = srcPane === "L" ? "R" : "L";
       const item = mgrSelected[srcPane];
-      if (!item) return toast("Tap a file or folder in the " + (srcPane === "L" ? "LEFT" : "RIGHT") + " pane first", "warn");
+      if (!item) return toast("Select a file or folder in the " + (srcPane === "L" ? "LEFT" : "RIGHT") + " pane first (or tap •••)", "warn");
       const fd = new FormData();
       fd.append("op", op);
       fd.append("src", item.rel_path);
       fd.append("dst", mgrPaths[dstPane] || "");
-      const res = await fetch("/api/dna/fs/op", { method: "POST", body: fd });
+      const res = await fetch("/api/dna/fs/op", { method: "POST", headers: dnaHeaders(), body: fd });
       if (res.ok) {
-        toast((op === "copy" ? "Copied " : "Moved ") + item.name + " → other pane ✓", "ok");
+        toast((op === "copy" ? "Copied " : "Moved ") + item.name + " → " + (mgrPaths[dstPane] || "/data/DNA") + " ✓", "ok");
         loadPane("L"); loadPane("R");
       } else {
         toast("Operation failed", "bad");
@@ -2345,25 +3079,25 @@ DNA_TAB_HTML = r"""
     async function mgrNewFolder() {
       const name = prompt("Enter new folder name:");
       if (!name) return;
-      const base = mgrPaths[mgrActivePane];
+      const base = mgrPaths[mgrActivePane] || dnaState.current_project;
       const rel = base ? (base + "/" + name) : name;
       const fd = new FormData();
       fd.append("op", "mkdir");
       fd.append("src", rel);
-      await fetch("/api/dna/fs/op", { method: "POST", body: fd });
-      loadPane(mgrActivePane);
+      await fetch("/api/dna/fs/op", { method: "POST", headers: dnaHeaders(), body: fd });
+      loadPane("L"); loadPane("R");
     }
 
     async function mgrNewFile() {
       const name = prompt("Enter new file name (e.g. build.prop, custom.rc):");
       if (!name) return;
-      const base = mgrPaths[mgrActivePane];
+      const base = mgrPaths[mgrActivePane] || dnaState.current_project;
       const rel = base ? (base + "/" + name) : name;
       const fd = new FormData();
       fd.append("path", rel);
       fd.append("content", "# Created in Cloud Manager");
-      await fetch("/api/dna/fs/write", { method: "POST", body: fd });
-      loadPane(mgrActivePane);
+      await fetch("/api/dna/fs/write", { method: "POST", headers: dnaHeaders(), body: fd });
+      loadPane("L"); loadPane("R");
     }
 
     async function mgrSymlink() {
@@ -2371,15 +3105,15 @@ DNA_TAB_HTML = r"""
       if (!linkName) return;
       const target = prompt("Symlink target path (e.g. /system/product/priv-app):");
       if (!target) return;
-      const base = mgrPaths[mgrActivePane];
+      const base = mgrPaths[mgrActivePane] || dnaState.current_project;
       const rel = base ? (base + "/" + linkName) : linkName;
       const fd = new FormData();
       fd.append("op", "symlink");
       fd.append("src", rel);
       fd.append("dst", target);
-      await fetch("/api/dna/fs/op", { method: "POST", body: fd });
+      await fetch("/api/dna/fs/op", { method: "POST", headers: dnaHeaders(), body: fd });
       toast("Symlink created ✓", "ok");
-      loadPane(mgrActivePane);
+      loadPane("L"); loadPane("R");
     }
 
     async function mgrRenameItem() {
@@ -2393,7 +3127,7 @@ DNA_TAB_HTML = r"""
       fd.append("op", "rename");
       fd.append("src", mgrModalTarget.rel_path);
       fd.append("dst", parts.join("/"));
-      await fetch("/api/dna/fs/op", { method: "POST", body: fd });
+      await fetch("/api/dna/fs/op", { method: "POST", headers: dnaHeaders(), body: fd });
       closeDnaModal("mgrItemModal");
       loadPane("L"); loadPane("R");
     }
@@ -2404,7 +3138,7 @@ DNA_TAB_HTML = r"""
       const fd = new FormData();
       fd.append("op", "delete");
       fd.append("src", mgrModalTarget.rel_path);
-      await fetch("/api/dna/fs/op", { method: "POST", body: fd });
+      await fetch("/api/dna/fs/op", { method: "POST", headers: dnaHeaders(), body: fd });
       closeDnaModal("mgrItemModal");
       toast("Deleted ✓", "ok");
       loadPane("L"); loadPane("R");
@@ -2416,7 +3150,7 @@ DNA_TAB_HTML = r"""
       const fd = new FormData();
       fd.append("op", "mount_archive");
       fd.append("src", mgrModalTarget.rel_path);
-      const res = await fetch("/api/dna/fs/op", { method: "POST", body: fd });
+      const res = await fetch("/api/dna/fs/op", { method: "POST", headers: dnaHeaders(), body: fd });
       if (res.ok) {
         closeDnaModal("mgrItemModal");
         toast("Unpacked " + mgrModalTarget.name + " for editing ✓", "ok");
@@ -2429,7 +3163,7 @@ DNA_TAB_HTML = r"""
       const fd = new FormData();
       fd.append("op", "repack_archive");
       fd.append("src", mgrModalTarget.rel_path);
-      const res = await fetch("/api/dna/fs/op", { method: "POST", body: fd });
+      const res = await fetch("/api/dna/fs/op", { method: "POST", headers: dnaHeaders(), body: fd });
       if (res.ok) {
         closeDnaModal("mgrItemModal");
         toast("Repacked archive ✓", "ok");
@@ -2437,34 +3171,25 @@ DNA_TAB_HTML = r"""
       }
     }
 
-    async function mgrUploadFile(input) {
+    function mgrUploadFile(input) {
       if (!input.files || !input.files[0]) return;
       const file = input.files[0];
-      toast("Uploading " + file.name + "...", "ok");
-      const fd = new FormData();
-      fd.append("path", mgrPaths[mgrActivePane] || "");
-      fd.append("file", file);
-      const res = await fetch("/api/dna/fs/upload", { method: "POST", body: fd });
       input.value = "";
-      if (res.ok) {
-        toast("Uploaded " + file.name + " ✓", "ok");
-        loadPane(mgrActivePane);
-        refreshDnaState();
-      } else {
-        toast("Upload failed", "bad");
-      }
+      uploadWithProgress(file, mgrPaths[mgrActivePane] || dnaState.current_project, "");
     }
 
     async function mgrPushVault() {
       if (!mgrModalTarget) return;
-      toast("Uploading " + mgrModalTarget.name + " to Permanent Vault...", "ok");
+      closeDnaModal("mgrItemModal");
+      showTaskProgress("Uploading " + mgrModalTarget.name + " to Universal HF Vault...", 10);
       const fd = new FormData();
       fd.append("filename", mgrModalTarget.rel_path);
-      const res = await fetch("/api/dna/push_vault", { method: "POST", body: fd });
+      const res = await fetch("/api/dna/push_vault", { method: "POST", headers: dnaHeaders(), body: fd });
       const data = await res.json();
       if (res.ok) {
-        toast("Saved to Vault ✓", "ok");
+        await pollDnaTask(data.task_id);
       } else {
+        hideTaskProgress();
         toast(data.detail || "Vault upload failed", "bad");
       }
     }
@@ -2472,13 +3197,11 @@ DNA_TAB_HTML = r"""
 """
 
 def inject_dna_ui(html_page: str) -> str:
-    # 1. Inject the DNA & Manager Tab HTML right before the bottom Glass Dock
     html_page = html_page.replace(
         "  <!-- GLASS DOCK + TELEGRAM CIRCLE BUTTON -->",
         DNA_TAB_HTML + "\n  <!-- GLASS DOCK + TELEGRAM CIRCLE BUTTON -->",
         1
     )
-    # 2. Add the 4th 🧬 DNA button to the bottom Glass Dock
     old_console_btn = '<button id="btnTerminal" onclick="switchView(\'terminal\')" class="dock-btn flex-1 py-2.5 rounded-[20px] text-xs text-slate-300">💻 Console</button>'
     new_buttons = (
         old_console_btn + "\n        "
@@ -2486,7 +3209,6 @@ def inject_dna_ui(html_page: str) -> str:
     )
     html_page = html_page.replace(old_console_btn, new_buttons, 1)
 
-    # 3. Register the 'Dna' view in switchView() and window resize listener
     html_page = html_page.replace('["Studio", "Vault", "Terminal"]', '["Studio", "Vault", "Terminal", "Dna"]')
     html_page = html_page.replace('["studio", "vault", "terminal"]', '["studio", "vault", "terminal", "dna"]')
     html_page = html_page.replace(
@@ -2494,7 +3216,4 @@ def inject_dna_ui(html_page: str) -> str:
         'if (view === "vault") loadVault(false);\n      if (view === "dna") { refreshDnaState(); loadPane("L"); loadPane("R"); }'
     )
     return html_page
-
-             
-
 
