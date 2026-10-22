@@ -370,7 +370,7 @@ def sdat2img_convert(transfer_path: str, dat_path: str, out_img: str):
     with open(transfer_path, "r", encoding="utf-8", errors="ignore") as f:
         lines = [l.strip() for l in f.readlines() if l.strip()]
     version = int(lines[0])
-        idx = 4 if version >= 2 else 2
+    idx = 4 if version >= 2 else 2
     commands = []
     max_block = 0
     for line in lines[idx:]:
