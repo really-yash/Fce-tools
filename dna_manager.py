@@ -7,6 +7,9 @@ import zlib
 import shutil
 import struct
 import zipfile
+import gc
+import ctypes
+import tempfile
 import hashlib
 import threading
 import subprocess
@@ -26,7 +29,7 @@ except ImportError:
 
 router = APIRouter(prefix="/api/dna")
 
-DNA_BASE_DIR = "/tmp/sdcard_DNA"
+DNA_BASE_DIR = os.environ.get("DNA_BASE_DIR", "/tmp/sdcard_DNA")
 USERS_ROOT_DIR = os.path.join(DNA_BASE_DIR, "users")
 TASKS_TMP_DIR = os.path.join(DNA_BASE_DIR, "_tasks")
 USERS_DB_FILE = os.path.join(DNA_BASE_DIR, "users_db.json")
@@ -185,6 +188,9 @@ def safe_join(base: str, rel: str) -> str:
     return full
 
 def create_bg_task(initial_label: str) -> str:
+    if len(BG_TASKS) > 60:
+        for k in [k for k, v in BG_TASKS.items() if v.get("state") != "running"][:30]:
+            BG_TASKS.pop(k, None)
     tid = uuid.uuid4().hex[:10]
     BG_TASKS[tid] = {"state": "running", "pct": 2, "label": initial_label, "error": None}
     return tid
@@ -194,6 +200,301 @@ def set_bg_task(tid: str, pct: int, label: str = None):
         BG_TASKS[tid]["pct"] = max(1, min(99, int(pct)))
         if label:
             BG_TASKS[tid]["label"] = label
+
+# ---------------- LOW-RAM / ATOMIC-WRITE / HF-SAVE HELPERS ---------------- #
+
+HEAVY = threading.Semaphore(1)          # only ONE heavy job at a time (512 MB RAM safe)
+HF_UP_LOCK = threading.Lock()           # only ONE HF upload at a time
+AUTO_HF = os.environ.get("DNA_AUTO_HF", "1") == "1"                    # auto-save packed outputs to HF dataset
+FREE_AFTER_PUSH = os.environ.get("DNA_FREE_AFTER_PUSH", "0") == "1"    # delete local copy after HF save (optional)
+ZERO_BLOCK = b"\x00" * (4 * MB)
+
+def free_ram():
+    try:
+        gc.collect()
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+def safe_remove(p):
+    try:
+        if p and os.path.lexists(p):
+            os.remove(p)
+    except Exception:
+        pass
+
+def drop_cache(path):
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
+class Flusher:
+    """Every 64 MB written: flush + fsync + drop page-cache so RAM never fills up."""
+    def __init__(self, f, step=64 * MB):
+        self.f, self.step, self.n = f, step, 0
+    def add(self, k):
+        self.n += k
+        if self.n >= self.step:
+            self.n = 0
+            try:
+                self.f.flush()
+                os.fsync(self.f.fileno())
+                os.posix_fadvise(self.f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+            except Exception:
+                pass
+
+def copy_lowram(fin, fout, length=4 * MB):
+    fl = Flusher(fout)
+    while True:
+        b = fin.read(length)
+        if not b:
+            break
+        fout.write(b)
+        fl.add(len(b))
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(4 * MB)
+            if not b:
+                break
+            h.update(b)
+        try:
+            os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        except Exception:
+            pass
+    return h.hexdigest()
+
+def run_quiet(cmd):
+    """Run a tool without capturing its stdout in RAM. Returns (returncode, last 1.5KB of stderr)."""
+    with tempfile.TemporaryFile() as ef:
+        r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=ef)
+        sz = ef.seek(0, 2)
+        ef.seek(max(0, sz - 1500))
+        err = ef.read().decode("utf-8", "ignore")
+    if r.returncode in (-9, 137):
+        err = "KILLED BY OS: out of memory (try lz4 / lower compression level, or a smaller partition). " + err
+    return r.returncode, err
+
+def brotli_compress_file(src, dst, lvl):
+    tmp = dst + ".part"
+    safe_remove(tmp)
+    try:
+        if shutil.which("brotli"):
+            rc, err = run_quiet(["brotli", f"-q{lvl}", "-f", "-o", tmp, src])
+            if rc != 0:
+                raise Exception(f"brotli failed: {err}")
+        elif BROTLI_AVAILABLE:
+            c = brotli.Compressor(quality=lvl)
+            proc = getattr(c, "process", None) or c.compress
+            with open(src, "rb") as fi, open(tmp, "wb") as fo:
+                fl = Flusher(fo)
+                while True:
+                    b = fi.read(4 * MB)
+                    if not b:
+                        break
+                    o = proc(b)
+                    fo.write(o)
+                    fl.add(len(o))
+                fo.write(c.finish())
+        else:
+            raise Exception("brotli is not installed.")
+        if not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+            raise Exception("Brotli output is empty.")
+        os.replace(tmp, dst)
+    finally:
+        safe_remove(tmp)
+        free_ram()
+
+def brotli_decompress_file(src, dst):
+    tmp = dst + ".part"
+    safe_remove(tmp)
+    try:
+        if shutil.which("brotli"):
+            rc, err = run_quiet(["brotli", "-d", "-f", "-o", tmp, src])
+            if rc != 0:
+                raise Exception(f"brotli -d failed: {err}")
+        elif BROTLI_AVAILABLE:
+            d = brotli.Decompressor()
+            proc = getattr(d, "process", None) or d.decompress
+            with open(src, "rb") as fi, open(tmp, "wb") as fo:
+                fl = Flusher(fo)
+                while True:
+                    b = fi.read(1 * MB)
+                    if not b:
+                        break
+                    o = proc(b)
+                    fo.write(o)
+                    fl.add(len(o))
+        else:
+            raise Exception("brotli is not installed.")
+        if not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+            raise Exception("Brotli output is empty (corrupt .br?).")
+        os.replace(tmp, dst)
+    finally:
+        safe_remove(tmp)
+        free_ram()
+
+def hf_autosave(username: str, proj_dir: str, fname: str):
+    """Background, one-at-a-time, streamed upload of a finished output to the HF dataset."""
+    if not (AUTO_HF and HF_API_REF and DATASET_REPO_REF and HF_TOKEN_REF):
+        return
+    fp = os.path.join(proj_dir, fname)
+    if not os.path.isfile(fp):
+        return
+    repo_path = f"dna_ported/{username}/{os.path.basename(proj_dir)}/{fname}"
+
+    def _w():
+        with HF_UP_LOCK:
+            try:
+                HF_API_REF.upload_file(path_or_fileobj=fp, path_in_repo=repo_path, repo_id=DATASET_REPO_REF,
+                                       repo_type="dataset", commit_message=f"DNA autosave {fname}")
+                dna_log(username, "SUCCESS", f"Saved '{fname}' to HF dataset ✓")
+                if FREE_AFTER_PUSH:
+                    safe_remove(fp)
+            except Exception as e:
+                dna_log(username, "ERROR", f"HF autosave failed for '{fname}': {e}")
+            finally:
+                drop_cache(fp)
+                free_ram()
+    threading.Thread(target=_w, daemon=True).start()
+
+def _spawn(fn, tid=None, heavy=True):
+    """Run a worker thread: one heavy job at a time, always free RAM at the end, never leave a task stuck."""
+    def _run():
+        got = False
+        try:
+            if heavy:
+                if not HEAVY.acquire(blocking=False):
+                    if tid:
+                        set_bg_task(tid, 1, "Waiting for previous job to finish (saves RAM)...")
+                    HEAVY.acquire()
+                got = True
+            fn()
+        except Exception as e:
+            if tid in BG_TASKS:
+                BG_TASKS[tid].update({"state": "error", "error": str(e)})
+        finally:
+            if tid in BG_TASKS and BG_TASKS[tid].get("state") == "running":
+                BG_TASKS[tid].update({"state": "error", "error": "Task ended unexpectedly."})
+            if got:
+                HEAVY.release()
+            free_ram()
+    threading.Thread(target=_run, daemon=True).start()
+
+# ---------------- SUPER.IMG SELF-VERIFY (independent liblp-spec parser) ---------------- #
+
+def copy_hash(fin, fout, length=4 * MB) -> str:
+    h = hashlib.sha256()
+    fl = Flusher(fout)
+    while True:
+        b = fin.read(length)
+        if not b:
+            break
+        fout.write(b)
+        h.update(b)
+        fl.add(len(b))
+    return h.hexdigest()
+
+def fs_verify_image(path: str, ptype: str, username: str = ""):
+    """Full filesystem check (not just the header). A failing image is NOT saved."""
+    tool = {"ext4": ["e2fsck", "-fn", path], "erofs": ["fsck.erofs", path], "f2fs": ["fsck.f2fs", "-f", path]}.get(ptype)
+    if not tool or not shutil.which(tool[0]):
+        if username:
+            dna_log(username, "WARN", f"{tool[0] if tool else ptype} not installed: filesystem NOT fully verified.")
+        return
+    rc, err = run_quiet(tool)
+    if rc != 0:
+        raise Exception(f"Anti-Corrupt Guard: {tool[0]} found problems (rc={rc}). Image not saved. {err[-250:].strip()}")
+    if username:
+        dna_log(username, "SUCCESS", f"{tool[0]} full filesystem check passed ✓")
+
+def lp_lpdump_check(path: str):
+    if shutil.which("lpdump"):
+        rc, err = run_quiet(["lpdump", path])
+        if rc != 0:
+            raise Exception(f"lpdump rejected the super image: {err[-200:]}")
+
+def lp_verify_raw_super(path: str, expect: list, total_bytes: int):
+    """Re-reads a RAW super image: checks geometry/header/tables checksums, table layout,
+    extent bounds & overlaps, then compares every partition's data hash with its source."""
+    z32 = b"\x00" * 32
+    with open(path, "rb") as f:
+        f.seek(4096)
+        g = f.read(52)
+        magic, ssz, _ck, _maxsz, slots, lbs = struct.unpack("<II32sIII", g)
+        if magic != LP_GEOMETRY_MAGIC or ssz != 52:
+            raise Exception("Verify failed: bad LP geometry.")
+        if hashlib.sha256(g[:8] + z32 + g[40:]).digest() != g[8:40]:
+            raise Exception("Verify failed: geometry checksum mismatch.")
+        f.seek(12288)
+        h = f.read(256)
+        hm, _maj, _min, hsz = struct.unpack_from("<IHHI", h, 0)
+        if hm != LP_HEADER_MAGIC or hsz not in (128, 256):
+            raise Exception("Verify failed: bad LP header.")
+        h = h[:hsz]
+        if hashlib.sha256(h[:12] + z32 + h[44:]).digest() != h[12:44]:
+            raise Exception("Verify failed: header checksum mismatch.")
+        tsz = struct.unpack_from("<I", h, 44)[0]
+        f.seek(12288 + hsz)
+        tables = f.read(tsz)
+        if len(tables) != tsz or hashlib.sha256(tables).digest() != h[48:80]:
+            raise Exception("Verify failed: tables checksum mismatch.")
+        (p_off, p_n, p_sz, e_off, e_n, e_sz, g_off, g_n, g_sz, b_off, b_n, b_sz) = struct.unpack_from("<12I", h, 80)
+        if (p_sz, e_sz, g_sz, b_sz) != (52, 24, 48, 64):
+            raise Exception("Verify failed: wrong LP table entry sizes.")
+        if b_n < 1:
+            raise Exception("Verify failed: no block device in metadata.")
+        first_sec, _al, _ao, dev_size = struct.unpack_from("<QIIQ", tables, b_off)
+        if dev_size != total_bytes:
+            raise Exception("Verify failed: block device size mismatch.")
+        exts = []
+        for i in range(e_n):
+            n_sec, _tt, t_data, _ts = struct.unpack_from("<QIQI", tables, e_off + i * e_sz)
+            if t_data < first_sec or (t_data + n_sec) * 512 > dev_size:
+                raise Exception("Verify failed: extent outside super bounds.")
+            exts.append((t_data, n_sec))
+        for a in range(len(exts)):
+            for b in range(a + 1, len(exts)):
+                if exts[a][0] < exts[b][0] + exts[b][1] and exts[b][0] < exts[a][0] + exts[a][1]:
+                    raise Exception("Verify failed: overlapping extents.")
+        parts = {}
+        for i in range(p_n):
+            ent = tables[p_off + i * p_sz: p_off + (i + 1) * p_sz]
+            name = ent[:36].split(b"\x00")[0].decode("utf-8", "ignore")
+            _at, first_e, num_e, grp = struct.unpack_from("<IIII", ent, 36)
+            if grp >= g_n or first_e + num_e > e_n:
+                raise Exception(f"Verify failed: bad table indexes for '{name}'.")
+            parts[name] = [exts[first_e + k] for k in range(num_e)]
+        for name, size, want in expect:
+            if name not in parts or not parts[name]:
+                raise Exception(f"Verify failed: partition '{name}' missing in metadata.")
+            if sum(n for _s, n in parts[name]) * 512 < size:
+                raise Exception(f"Verify failed: partition '{name}' extent too small.")
+            hh, left = hashlib.sha256(), size
+            for s, n in parts[name]:
+                f.seek(s * 512)
+                take = min(left, n * 512)
+                while take > 0:
+                    b = f.read(min(take, 4 * MB))
+                    if not b:
+                        raise Exception(f"Verify failed: '{name}' data truncated.")
+                    hh.update(b)
+                    take -= len(b)
+                    left -= len(b)
+            if hh.hexdigest() != want:
+                raise Exception(f"Verify failed: data of '{name}' does not match its source image.")
+        try:
+            os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        except Exception:
+            pass
+    free_ram()
 
 # ---------------- PERMISSIONS OCTAL <-> SYMBOLIC HELPERS ---------------- #
 
@@ -282,27 +583,19 @@ def detect_img_type(path: str) -> str:
 
 # ---------------- ZERO-COPY SPARSE <-> RAW CONVERTERS ---------------- #
 
-def sparse_to_raw(src_path: str, dst_path: str):
-    """Converts sparse image to raw. Caller checks is_sparse_file() first to avoid duplicating raw images."""
-    if not is_sparse_file(src_path):
-        if os.path.abspath(src_path) != os.path.abspath(dst_path):
-            shutil.copyfile(src_path, dst_path)
-        return
-    if shutil.which("simg2img"):
-        r = subprocess.run(["simg2img", src_path, dst_path], capture_output=True, text=True)
-        if r.returncode == 0 and os.path.exists(dst_path) and os.path.getsize(dst_path) > 0:
-            return
+def _py_sparse_to_raw(src_path: str, dst_path: str):
     with open(src_path, "rb") as src, open(dst_path, "wb") as dst:
         hdr = src.read(28)
         (_m, _maj, _min, fhs, chs, blk, tblks, tchunks, _crc) = struct.unpack("<IHHHHIIII", hdr)
         if fhs > 28:
             src.seek(fhs - 28, os.SEEK_CUR)
         dst.truncate(tblks * blk)
+        fl = Flusher(dst)
         out_off = 0
         for _ in range(tchunks):
             ch = src.read(chs)
             if len(ch) < 12:
-                break
+                raise Exception("Corrupt sparse image (truncated chunk header).")
             ctype, _r, csz, tsz = struct.unpack("<HHII", ch[:12])
             nbytes = csz * blk
             if ctype == 0xCAC1:
@@ -311,9 +604,10 @@ def sparse_to_raw(src_path: str, dst_path: str):
                 while left > 0:
                     buf = src.read(min(left, 4 * MB))
                     if not buf:
-                        break
+                        raise Exception("Corrupt sparse image (truncated data).")
                     dst.write(buf)
                     left -= len(buf)
+                    fl.add(len(buf))
             elif ctype == 0xCAC2:
                 fill = src.read(4)
                 if fill != b"\x00\x00\x00\x00":
@@ -324,51 +618,93 @@ def sparse_to_raw(src_path: str, dst_path: str):
                         take = min(left, len(pat))
                         dst.write(pat[:take])
                         left -= take
+                        fl.add(take)
             elif ctype == 0xCAC3:
                 pass
             elif ctype == 0xCAC4:
                 src.seek(max(0, tsz - chs), os.SEEK_CUR)
+            else:
+                raise Exception(f"Corrupt sparse image (unknown chunk 0x{ctype:04x}).")
             out_off += nbytes
+        if out_off != tblks * blk:
+            raise Exception("Corrupt sparse image (size mismatch).")
+
+def sparse_to_raw(src_path: str, dst_path: str):
+    """Sparse -> raw, written to .part then atomically renamed (never leaves a half-written image)."""
+    tmp = dst_path + ".part"
+    safe_remove(tmp)
+    try:
+        if not is_sparse_file(src_path):
+            if os.path.abspath(src_path) == os.path.abspath(dst_path):
+                return
+            with open(src_path, "rb") as a, open(tmp, "wb") as b:
+                copy_lowram(a, b)
+        else:
+            ok = False
+            if shutil.which("simg2img"):
+                rc, _e = run_quiet(["simg2img", src_path, tmp])
+                ok = rc == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 0
+            if not ok:
+                _py_sparse_to_raw(src_path, tmp)
+        os.replace(tmp, dst_path)
+    finally:
+        safe_remove(tmp)
+        free_ram()
 
 def raw_to_sparse(src_path: str, dst_path: str, block_size: int = 4096):
-    if shutil.which("img2simg"):
-        r = subprocess.run(["img2simg", src_path, dst_path, str(block_size)], capture_output=True, text=True)
-        if r.returncode == 0 and os.path.exists(dst_path) and os.path.getsize(dst_path) > 0:
-            return
-    total_size = os.path.getsize(src_path)
-    total_blocks = (total_size + block_size - 1) // block_size
-    # Two-pass streaming sparse writer so we NEVER hold gigabytes of chunks in RAM!
-    chunk_meta = []
-    with open(src_path, "rb") as src:
-        b_idx = 0
-        while b_idx < total_blocks:
-            buf = src.read(block_size * 1024)
-            if not buf:
-                break
-            n_blks = (len(buf) + block_size - 1) // block_size
-            is_zero = (buf == b"\x00" * len(buf))
-            chunk_meta.append((0xCAC3 if is_zero else 0xCAC1, n_blks))
-            b_idx += n_blks
-
-    with open(src_path, "rb") as src, open(dst_path, "wb") as dst:
-        dst.write(struct.pack("<IHHHHIIII", SPARSE_MAGIC, 1, 0, 28, 12, block_size, total_blocks, len(chunk_meta), 0))
-        for ctype, n_blks in chunk_meta:
-            raw_bytes = n_blks * block_size
-            buf = src.read(raw_bytes)
-            if ctype == 0xCAC3:
-                dst.write(struct.pack("<HHII", 0xCAC3, 0, n_blks, 12))
-            else:
-                if len(buf) < raw_bytes:
-                    buf += b"\x00" * (raw_bytes - len(buf))
-                dst.write(struct.pack("<HHII", 0xCAC1, 0, n_blks, 12 + raw_bytes))
-                dst.write(buf)
+    tmp = dst_path + ".part"
+    safe_remove(tmp)
+    try:
+        ok = False
+        if shutil.which("img2simg"):
+            rc, _e = run_quiet(["img2simg", src_path, tmp, str(block_size)])
+            ok = rc == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 0
+        if not ok:
+            total_size = os.path.getsize(src_path)
+            total_blocks = (total_size + block_size - 1) // block_size
+            step = block_size * 1024
+            chunk_meta = []
+            with open(src_path, "rb") as src:
+                b_idx = 0
+                while b_idx < total_blocks:
+                    buf = src.read(step)
+                    if not buf:
+                        break
+                    n_blks = (len(buf) + block_size - 1) // block_size
+                    chunk_meta.append((0xCAC3 if buf == ZERO_BLOCK[:len(buf)] else 0xCAC1, n_blks))
+                    b_idx += n_blks
+                try:
+                    os.posix_fadvise(src.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+                except Exception:
+                    pass
+            with open(src_path, "rb") as src, open(tmp, "wb") as dst:
+                fl = Flusher(dst)
+                dst.write(struct.pack("<IHHHHIIII", SPARSE_MAGIC, 1, 0, 28, 12, block_size, total_blocks, len(chunk_meta), 0))
+                for ctype, n_blks in chunk_meta:
+                    raw_bytes = n_blks * block_size
+                    buf = src.read(raw_bytes)
+                    if ctype == 0xCAC3:
+                        dst.write(struct.pack("<HHII", 0xCAC3, 0, n_blks, 12))
+                    else:
+                        if len(buf) < raw_bytes:
+                            buf += b"\x00" * (raw_bytes - len(buf))
+                        dst.write(struct.pack("<HHII", 0xCAC1, 0, n_blks, 12 + raw_bytes))
+                        dst.write(buf)
+                        fl.add(len(buf))
+                    del buf
+        if not is_sparse_file(tmp):
+            raise Exception("Sparse conversion produced an invalid file.")
+        os.replace(tmp, dst_path)
+    finally:
+        safe_remove(tmp)
+        free_ram()
 
 # ---------------- SDAT2IMG & IMG2SDAT ---------------- #
 
 def sdat2img_convert(transfer_path: str, dat_path: str, out_img: str):
     BLOCK_SIZE = 4096
     with open(transfer_path, "r", encoding="utf-8", errors="ignore") as f:
-        lines = [l.strip() for l in f.readlines() if l.strip()]
+        lines = [l.strip() for l in f if l.strip()]
     version = int(lines[0])
     idx = 4 if version >= 2 else 2
     commands = []
@@ -385,68 +721,86 @@ def sdat2img_convert(transfer_path: str, dat_path: str, out_img: str):
                     max_block = e
             if cmd == "new":
                 commands.append(pairs)
+    del lines
 
-    with open(dat_path, "rb") as dat, open(out_img, "wb") as out:
-        out.truncate(max_block * BLOCK_SIZE)
-        for pairs in commands:
-            for s, e in pairs:
-                bcount = e - s
-                out.seek(s * BLOCK_SIZE)
-                left = bcount * BLOCK_SIZE
-                while left > 0:
-                    chunk = dat.read(min(left, 4 * MB))
-                    if not chunk:
-                        break
-                    out.write(chunk)
-                    left -= len(chunk)
+    tmp = out_img + ".part"
+    safe_remove(tmp)
+    try:
+        with open(dat_path, "rb") as dat, open(tmp, "wb") as out:
+            out.truncate(max_block * BLOCK_SIZE)
+            fl = Flusher(out)
+            for pairs in commands:
+                for s, e in pairs:
+                    out.seek(s * BLOCK_SIZE)
+                    left = (e - s) * BLOCK_SIZE
+                    while left > 0:
+                        chunk = dat.read(min(left, 4 * MB))
+                        if not chunk:
+                            raise Exception("Corrupt .new.dat (ended early).")
+                        out.write(chunk)
+                        left -= len(chunk)
+                        fl.add(len(chunk))
+        os.replace(tmp, out_img)
+    finally:
+        safe_remove(tmp)
+        free_ram()
 
 def img2sdat_convert(src_img: str, out_dir: str, prefix: str) -> tuple:
     need_tmp = is_sparse_file(src_img)
     raw_tmp = src_img + ".raw_tmp" if need_tmp else src_img
-    if need_tmp:
-        sparse_to_raw(src_img, raw_tmp)
-    src_use = raw_tmp if os.path.exists(raw_tmp) else src_img
-
-    BLOCK_SIZE = 4096
-    total_size = os.path.getsize(src_use)
-    total_blocks = (total_size + BLOCK_SIZE - 1) // BLOCK_SIZE
     dat_path = os.path.join(out_dir, f"{prefix}.new.dat")
     tl_path = os.path.join(out_dir, f"{prefix}.transfer.list")
     patch_path = os.path.join(out_dir, f"{prefix}.patch.dat")
-    open(patch_path, "wb").close()
+    try:
+        if need_tmp:
+            sparse_to_raw(src_img, raw_tmp)
+        src_use = raw_tmp if os.path.exists(raw_tmp) else src_img
+        BLOCK_SIZE = 4096
+        total_size = os.path.getsize(src_use)
+        total_blocks = (total_size + BLOCK_SIZE - 1) // BLOCK_SIZE
+        open(patch_path, "wb").close()
 
-    new_ranges = []
-    with open(src_use, "rb") as src, open(dat_path, "wb") as dat:
-        b = 0
-        while b < total_blocks:
-            chunk = src.read(BLOCK_SIZE * 512)
-            if not chunk:
-                break
-            if len(chunk) % BLOCK_SIZE != 0:
-                chunk += b"\x00" * (BLOCK_SIZE - (len(chunk) % BLOCK_SIZE))
-            n = len(chunk) // BLOCK_SIZE
-            if chunk != b"\x00" * len(chunk):
-                dat.write(chunk)
-                if new_ranges and new_ranges[-1][1] == b:
-                    new_ranges[-1] = (new_ranges[-1][0], b + n)
-                else:
-                    new_ranges.append((b, b + n))
-            b += n
+        new_ranges = []
+        with open(src_use, "rb") as src, open(dat_path + ".part", "wb") as dat:
+            fl = Flusher(dat)
+            b = 0
+            while b < total_blocks:
+                chunk = src.read(BLOCK_SIZE * 512)
+                if not chunk:
+                    break
+                if len(chunk) % BLOCK_SIZE != 0:
+                    chunk += b"\x00" * (BLOCK_SIZE - (len(chunk) % BLOCK_SIZE))
+                n = len(chunk) // BLOCK_SIZE
+                if chunk != ZERO_BLOCK[:len(chunk)] if len(chunk) <= len(ZERO_BLOCK) else any(chunk):
+                    dat.write(chunk)
+                    fl.add(len(chunk))
+                    if new_ranges and new_ranges[-1][1] == b:
+                        new_ranges[-1] = (new_ranges[-1][0], b + n)
+                    else:
+                        new_ranges.append((b, b + n))
+                b += n
+            try:
+                os.posix_fadvise(src.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+            except Exception:
+                pass
+        os.replace(dat_path + ".part", dat_path)
 
-    flat = []
-    for s, e in new_ranges:
-        flat.extend([str(s), str(e)])
-    with open(tl_path, "w", encoding="utf-8") as tl:
-        tl.write("4\n")
-        tl.write(f"{total_blocks}\n")
-        tl.write("0\n0\n")
-        if flat:
-            tl.write(f"erase 2,0,{total_blocks}\n")
-            tl.write(f"new {len(flat)},{','.join(flat)}\n")
-
-    if need_tmp and os.path.exists(raw_tmp):
-        os.remove(raw_tmp)
-    return dat_path, tl_path
+        flat = []
+        for s, e in new_ranges:
+            flat.extend([str(s), str(e)])
+        with open(tl_path, "w", encoding="utf-8") as tl:
+            tl.write("4\n")
+            tl.write(f"{total_blocks}\n")
+            tl.write("0\n0\n")
+            if flat:
+                tl.write(f"erase 2,0,{total_blocks}\n")
+                tl.write(f"new {len(flat)},{','.join(flat)}\n")
+        return dat_path, tl_path
+    finally:
+        safe_remove(dat_path + ".part")
+        if need_tmp:
+            safe_remove(raw_tmp)
+        free_ram()
 
 # ---------------- FS_CONFIG & FILE_CONTEXTS GENERATOR ---------------- #
 
@@ -517,49 +871,54 @@ def unpack_single_img_file(username: str, proj_dir: str, img_filename: str, dele
     orig_size = os.path.getsize(src_path)
     need_unsparse = is_sparse_file(src_path)
     raw_tmp = src_path + ".raw_unpack" if need_unsparse else src_path
+    was_empty = not os.listdir(out_dir)
 
-    if need_unsparse:
+    try:
+        if need_unsparse:
+            if tid:
+                set_bg_task(tid, 18, f"Unsparsing {img_filename} ({orig_size / MB:.1f} MB)...")
+            sparse_to_raw(src_path, raw_tmp)
+            free_ram()
+
+        work_img = raw_tmp if os.path.exists(raw_tmp) else src_path
+        fmt = detect_img_type(work_img)
+        dna_log(username, "UNPACK", f"Auto-detected '{img_filename}' format: {fmt.upper()} ({orig_size / MB:.1f} MB)")
         if tid:
-            set_bg_task(tid, 18, f"Unsparsing {img_filename} ({orig_size / MB:.1f} MB)...")
-        sparse_to_raw(src_path, raw_tmp)
+            set_bg_task(tid, 42, f"Extracting {fmt.upper()} filesystem tree for '{part_name}'...")
 
-    work_img = raw_tmp if os.path.exists(raw_tmp) else src_path
-    fmt = detect_img_type(work_img)
-    dna_log(username, "UNPACK", f"Auto-detected '{img_filename}' format: {fmt.upper()} ({orig_size / MB:.1f} MB)")
-    if tid:
-        set_bg_task(tid, 42, f"Extracting {fmt.upper()} filesystem tree for '{part_name}'...")
+        attempts = []
+        if fmt == "erofs" and shutil.which("fsck.erofs"):
+            attempts.append(("fsck.erofs", ["fsck.erofs", f"--extract={out_dir}", "--overwrite", work_img], True))
+        if fmt == "ext4" and shutil.which("debugfs"):
+            attempts.append(("debugfs", ["debugfs", "-R", f"rdump / \"{out_dir}\"", work_img], True))
+        if shutil.which("7z"):
+            attempts.append(("7z", ["7z", "x", "-y", f"-o{out_dir}", work_img], False))
 
-    extracted_ok = False
-    if fmt == "erofs" and shutil.which("fsck.erofs"):
-        r = subprocess.run(["fsck.erofs", f"--extract={out_dir}", "--overwrite", work_img], capture_output=True, text=True)
-        if r.returncode == 0 and os.listdir(out_dir):
-            extracted_ok = True
-            dna_log(username, "UNPACK", f"fsck.erofs unpacked '{part_name}' directly into '{part_name}/'")
+        extracted_ok, last_err = False, ""
+        for tool, cmd, accept_partial in attempts:
+            rc, err = run_quiet(cmd)
+            has_files = bool(os.listdir(out_dir))
+            if has_files and (rc == 0 or accept_partial):
+                extracted_ok = True
+                if rc != 0:
+                    dna_log(username, "WARN", f"{tool} finished with warnings (rc={rc}): {err[-200:].strip()}")
+                dna_log(username, "UNPACK", f"{tool} unpacked '{part_name}' directly into '{part_name}/'")
+                break
+            last_err = err
+            if was_empty:
+                shutil.rmtree(out_dir, ignore_errors=True)
+                os.makedirs(out_dir, exist_ok=True)
+            free_ram()
 
-    if not extracted_ok and fmt == "ext4" and shutil.which("debugfs"):
-        r = subprocess.run(["debugfs", "-R", f"rdump / \"{out_dir}\"", work_img], capture_output=True, text=True)
-        if r.returncode == 0 and os.listdir(out_dir):
-            extracted_ok = True
-            dna_log(username, "UNPACK", f"debugfs unpacked ext4 '{part_name}' directly into '{part_name}/'")
-
-    if not extracted_ok and shutil.which("7z"):
-        subprocess.run(["7z", "x", "-y", f"-o{out_dir}", work_img], capture_output=True, text=True)
-        if os.listdir(out_dir):
-            extracted_ok = True
-            dna_log(username, "UNPACK", f"7z unpacked '{part_name}' directly into '{part_name}/'")
-
-    if not os.listdir(out_dir):
-        os.makedirs(os.path.join(out_dir, "etc"), exist_ok=True)
-        bp = os.path.join(out_dir, "build.prop")
-        with open(bp, "w", encoding="utf-8") as f:
-            f.write(
-                f"# Unpacked from {img_filename} ({fmt})\n"
-                f"ro.product.{part_name}.name={part_name}\n"
-                f"ro.{part_name}.build.date={datetime.now().strftime('%a %b %d %H:%M:%S UTC %Y')}\n"
-            )
-
-    if need_unsparse and os.path.exists(raw_tmp):
-        os.remove(raw_tmp)
+        if not extracted_ok:
+            if was_empty:
+                shutil.rmtree(out_dir, ignore_errors=True)
+            raise Exception(f"Could not extract '{img_filename}' (format: {fmt}). {last_err[-250:].strip()}")
+    finally:
+        if need_unsparse:
+            safe_remove(raw_tmp)
+        drop_cache(src_path)
+        free_ram()
 
     if tid:
         set_bg_task(tid, 85, f"Generating fs_config & file_contexts for '{part_name}'...")
@@ -574,6 +933,7 @@ def unpack_single_img_file(username: str, proj_dir: str, img_filename: str, dele
         os.remove(src_path)
         dna_log(username, "UNPACK", f"Deleted source file '{img_filename}' after unpacking.")
 
+    free_ram()
     return {"partition": part_name, "format": fmt, "path": f"/sdcard/DNA/{os.path.basename(proj_dir)}/{part_name}"}
 
 # ---------------- REMOVE AVB / ENCRYPTION FSTAB PATCHER ---------------- #
@@ -629,7 +989,7 @@ def dir_size_bytes(path: str) -> int:
                 total += os.path.getsize(fp)
     return total
 
-def pack_single_partition_worker(username: str, req: PackSingleRequest, tid: str = None) -> dict:
+def _pack_single_inner(username: str, req: PackSingleRequest, tid: str = None) -> dict:
     proj_dir = get_proj_dir(username, req.project)
     part_name = re.sub(r"[^a-zA-Z0-9._-]", "", req.partition)
     part_dir = safe_join(proj_dir, part_name)
@@ -665,11 +1025,12 @@ def pack_single_partition_worker(username: str, req: PackSingleRequest, tid: str
         algo = req.erofs_algo if req.erofs_algo in ("lz4hc", "lz4", "lzma", "deflate") else "lz4hc"
         z_arg = f"-z{algo},{lvl}" if algo in ("lz4hc", "lzma", "deflate") else f"-z{algo}"
         cmd = ["mkfs.erofs", z_arg, "--mount-point", f"/{part_name}", "--fs-config-file", fs_cfg, "--file-contexts", fc_file, out_img_raw, part_dir]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0 or not os.path.exists(out_img_raw):
-            r2 = subprocess.run(["mkfs.erofs", z_arg, "--mount-point", f"/{part_name}", out_img_raw, part_dir], capture_output=True, text=True)
-            if r2.returncode != 0 or not os.path.exists(out_img_raw):
-                raise Exception(f"mkfs.erofs failed: {r2.stderr or r.stderr}")
+        rc, err = run_quiet(cmd)
+        if rc != 0 or not os.path.exists(out_img_raw):
+            safe_remove(out_img_raw)
+            rc2, err2 = run_quiet(["mkfs.erofs", z_arg, "--mount-point", f"/{part_name}", out_img_raw, part_dir])
+            if rc2 != 0 or not os.path.exists(out_img_raw):
+                raise Exception(f"mkfs.erofs failed: {err2 or err}")
 
     elif ptype == "ext4":
         if not shutil.which("mke2fs"):
@@ -678,7 +1039,8 @@ def pack_single_partition_worker(username: str, req: PackSingleRequest, tid: str
         orig_sz = 0
         if os.path.exists(info_path):
             try:
-                orig_sz = int(json.load(open(info_path)).get("orig_size", 0))
+                with open(info_path) as jf:
+                    orig_sz = int(json.load(jf).get("orig_size", 0))
             except Exception:
                 pass
         used_sz = dir_size_bytes(part_dir)
@@ -690,28 +1052,42 @@ def pack_single_partition_worker(username: str, req: PackSingleRequest, tid: str
         if opts:
             cmd.extend(["-O", ",".join(opts)])
         cmd.extend([out_img_raw, str(target_blks)])
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0 or not os.path.exists(out_img_raw):
-            raise Exception(f"mke2fs failed: {r.stderr}")
+        rc, err = run_quiet(cmd)
+        if rc != 0 or not os.path.exists(out_img_raw):
+            raise Exception(f"mke2fs failed: {err}")
 
         if req.compress_ext4 and shutil.which("resize2fs"):
-            subprocess.run(["e2fsck", "-f", "-y", out_img_raw], capture_output=True)
-            subprocess.run(["resize2fs", "-M", out_img_raw], capture_output=True)
+            run_quiet(["e2fsck", "-f", "-y", out_img_raw])
+            run_quiet(["resize2fs", "-M", out_img_raw])
 
     elif ptype == "f2fs":
+        if not shutil.which("mkfs.f2fs"):
+            raise Exception("mkfs.f2fs not installed.")
         used_sz = dir_size_bytes(part_dir)
         target_sz = max(64 * MB, int(used_sz * 1.35) + 48 * MB)
         with open(out_img_raw, "wb") as f:
             f.truncate((target_sz // 4096) * 4096)
-        if shutil.which("mkfs.f2fs"):
-            subprocess.run(["mkfs.f2fs", "-f", "-l", part_name, out_img_raw], capture_output=True)
-            if shutil.which("sload.f2fs"):
-                subprocess.run(["sload.f2fs", "-f", part_dir, "-t", f"/{part_name}", out_img_raw], capture_output=True)
-        else:
-            raise Exception("mkfs.f2fs not installed.")
+        rc, err = run_quiet(["mkfs.f2fs", "-f", "-l", part_name, out_img_raw])
+        if rc != 0:
+            raise Exception(f"mkfs.f2fs failed: {err}")
+        if shutil.which("sload.f2fs"):
+            rc, err = run_quiet(["sload.f2fs", "-f", part_dir, "-t", f"/{part_name}", out_img_raw])
+            if rc != 0:
+                raise Exception(f"sload.f2fs failed: {err}")
+    else:
+        raise Exception(f"Unknown pack type '{req.pack_type}'.")
+    free_ram()
 
     if not os.path.exists(out_img_raw) or os.path.getsize(out_img_raw) < 4096:
         raise Exception("Anti-Corrupt Guard: Packed image is empty or invalid.")
+    chk = detect_img_type(out_img_raw)
+    if chk != ptype:
+        raise Exception(f"Anti-Corrupt Guard: packed image magic is '{chk}', expected '{ptype}'. Not saved.")
+
+    if tid:
+        set_bg_task(tid, 68, f"Checking every block of the {ptype.upper()} filesystem...")
+    fs_verify_image(out_img_raw, ptype, username)
+    free_ram()
 
     if req.img_format.lower() == "sparse":
         if tid:
@@ -719,29 +1095,42 @@ def pack_single_partition_worker(username: str, req: PackSingleRequest, tid: str
         raw_to_sparse(out_img_raw, out_img_final)
         os.remove(out_img_raw)
     else:
-        shutil.move(out_img_raw, out_img_final)
+        os.replace(out_img_raw, out_img_final)
 
     output_file = f"{part_name}.img"
+    extra_save = []
 
     if req.file_format.upper() in ("DAT", "BR"):
         if tid:
             set_bg_task(tid, 85, f"Converting '{part_name}.img' to {req.file_format.upper()}...")
         dat_p, _tl_p = img2sdat_convert(out_img_final, proj_dir, part_name)
         output_file = os.path.basename(dat_p)
+        extra_save.append(f"{part_name}.transfer.list")
         if req.file_format.upper() == "BR":
             br_p = f"{dat_p}.br"
-            lvl = max(0, min(11, int(req.br_level)))
-            if shutil.which("brotli"):
-                subprocess.run(["brotli", f"-q{lvl}", "-f", "-o", br_p, dat_p], check=True)
-            elif BROTLI_AVAILABLE:
-                with open(dat_p, "rb") as fin, open(br_p, "wb") as fout:
-                    fout.write(brotli.compress(fin.read(), quality=lvl))
+            brotli_compress_file(dat_p, br_p, max(0, min(11, int(req.br_level))))
+            safe_remove(dat_p)  # intermediate .new.dat no longer needed -> saves disk
             output_file = os.path.basename(br_p)
 
     final_p = os.path.join(proj_dir, output_file)
     sz_mb = os.path.getsize(final_p) / MB if os.path.exists(final_p) else 0
     dna_log(username, "SUCCESS", f"Packed & verified '{output_file}' ({sz_mb:.2f} MB) in /sdcard/DNA/{os.path.basename(proj_dir)}")
+    hf_autosave(username, proj_dir, output_file)
+    for x in extra_save:
+        hf_autosave(username, proj_dir, x)
     return {"output_file": output_file, "size_mb": f"{sz_mb:.2f} MB"}
+
+def pack_single_partition_worker(username: str, req: PackSingleRequest, tid: str = None) -> dict:
+    part = re.sub(r"[^a-zA-Z0-9._-]", "", req.partition)
+    pdir = get_proj_dir(username, req.project)
+    try:
+        return _pack_single_inner(username, req, tid)
+    except Exception:
+        for suf in (".raw.img", ".img.part", ".new.dat.part"):
+            safe_remove(os.path.join(pdir, part + suf))
+        raise
+    finally:
+        free_ram()
 
 # ---------------- PURE-PYTHON LPMAKE SUPER.IMG BUILDER ---------------- #
 
@@ -753,7 +1142,7 @@ class PackSuperRequest(BaseModel):
     group_name: str = "qti_dynamic_partitions"
     selected_imgs: List[str]
 
-def build_super_image(username: str, req: PackSuperRequest, tid: str = None) -> dict:
+def _build_super_inner(username: str, req: PackSuperRequest, tid: str = None) -> dict:
     proj_dir = get_proj_dir(username, req.project)
     if not req.selected_imgs:
         raise Exception("Please select at least one .img file to pack into super.img.")
@@ -764,6 +1153,7 @@ def build_super_image(username: str, req: PackSuperRequest, tid: str = None) -> 
     final_super = os.path.join(proj_dir, "super.img")
 
     part_entries = []
+    expect = []
     data_cursor = 1024 * 1024
 
     with open(raw_super, "wb") as out:
@@ -788,28 +1178,34 @@ def build_super_image(username: str, req: PackSuperRequest, tid: str = None) -> 
             p_size = os.path.getsize(use_p)
             p_size_aligned = ((p_size + 4095) // 4096) * 4096
 
-            if data_cursor + p_size_aligned > total_bytes:
+            if data_cursor + p_size_aligned > total_bytes - (2 * MB):
                 if need_unsparse and os.path.exists(tmp_raw):
                     os.remove(tmp_raw)
                 raise Exception(f"Total partition size exceeds super.img limit ({req.total_size_gb} GB).")
 
             out.seek(data_cursor)
             with open(use_p, "rb") as pf:
-                shutil.copyfileobj(pf, out, length=4 * MB)
+                src_hash = copy_hash(pf, out)
+            free_ram()
             if need_unsparse and os.path.exists(tmp_raw):
                 os.remove(tmp_raw)
 
             start_sector = data_cursor // 512
             num_sectors = (p_size + 511) // 512
             part_entries.append((p_name, start_sector, num_sectors))
+            expect.append((p_name, p_size, src_hash))
             data_cursor += p_size_aligned
 
             if req.super_type in ("ab", "virtual_ab"):
                 part_entries.append((f"{base_stem}_b", 0, 0))
 
+        ab = req.super_type in ("ab", "virtual_ab")
+        gmax = ((total_bytes - 4 * MB) // 2) // MB * MB if ab else total_bytes - (2 * MB)
+        if ab and (data_cursor - 1024 * 1024) > gmax:
+            raise Exception(f"Partitions ({(data_cursor - MB) / MB:.0f} MB) do not fit in one A/B slot group ({gmax / MB:.0f} MB). Increase super size.")
         geom_body = struct.pack("<II32sIII", LP_GEOMETRY_MAGIC, 52, b"\x00" * 32, 65536, 2 if req.super_type != "a_only" else 1, 4096)
         geom_crc = hashlib.sha256(geom_body).digest()
-        geom = geom_body[:4] + struct.pack("<I", 52) + geom_crc + geom_body[36:]
+        geom = geom_body[:8] + geom_crc + geom_body[40:]
         geom_padded = geom.ljust(4096, b"\x00")
 
         p_table = bytearray()
@@ -817,17 +1213,25 @@ def build_super_image(username: str, req: PackSuperRequest, tid: str = None) -> 
         extent_idx = 0
         for p_name, s_sec, n_sec in part_entries:
             name_b = p_name.encode("utf-8")[:36].ljust(36, b"\x00")
+            p_attr = 3 if ab else 1                      # readonly (+ slot-suffixed on A/B)
+            p_grp = (2 if p_name.endswith("_b") else 1) if ab else 1
             if n_sec > 0:
-                p_table += name_b + struct.pack("<IIII", 1, extent_idx, 1, 1)
+                p_table += name_b + struct.pack("<IIII", p_attr, extent_idx, 1, p_grp)
                 e_table += struct.pack("<QIQI", n_sec, 0, s_sec, 0)
                 extent_idx += 1
             else:
-                p_table += name_b + struct.pack("<IIII", 1, 0, 0, 1)
+                p_table += name_b + struct.pack("<IIII", p_attr, 0, 0, p_grp)
 
-        grp_default = b"default".ljust(36, b"\x00") + struct.pack("<IIQ", 0, 0, 0)
-        grp_main_name = (req.group_name or "qti_dynamic_partitions").encode("utf-8")[:36].ljust(36, b"\x00")
-        grp_flag = 2 if req.super_type == "virtual_ab" else 0
-        grp_table = grp_default + grp_main_name + struct.pack("<IIQ", grp_flag, 0, total_bytes - (2 * MB))
+        grp_default = b"default".ljust(36, b"\x00") + struct.pack("<IQ", 0, 0)
+        gname = (req.group_name or "qti_dynamic_partitions").strip()
+        if ab:   # real A/B phones: <group>_a and <group>_b, both flagged slot-suffixed
+            grp_table = grp_default
+            for suf in ("_a", "_b"):
+                grp_table += (gname + suf).encode("utf-8")[:36].ljust(36, b"\x00") + struct.pack("<IQ", 1, gmax)
+            g_count = 3
+        else:
+            grp_table = grp_default + gname.encode("utf-8")[:36].ljust(36, b"\x00") + struct.pack("<IQ", 0, gmax)
+            g_count = 2
         bdev_table = struct.pack("<QIIQ36sI", 2048, 4096, 0, total_bytes, b"super".ljust(36, b"\x00"), 0)
 
         p_off = 0
@@ -837,13 +1241,15 @@ def build_super_image(username: str, req: PackSuperRequest, tid: str = None) -> 
         tables_blob = bytes(p_table + e_table + grp_table + bdev_table)
         tables_sha = hashlib.sha256(tables_blob).digest()
 
-        header_size = 128
+        vab = req.super_type == "virtual_ab"
+        header_size = 256 if vab else 128
         hdr_without_crc = (
-            struct.pack("<IHHI", LP_HEADER_MAGIC, 10, 2 if req.super_type == "virtual_ab" else 0, header_size)
+            struct.pack("<IHHI", LP_HEADER_MAGIC, 10, 2 if vab else 0, header_size)
             + b"\x00" * 32
             + struct.pack("<I", len(tables_blob))
             + tables_sha
-            + struct.pack("<12I", p_off, len(part_entries), 52, e_off, extent_idx, 24, g_off, 2, 48, b_off, 1, 64)
+            + struct.pack("<12I", p_off, len(part_entries), 52, e_off, extent_idx, 24, g_off, g_count, 48, b_off, 1, 64)
+            + ((struct.pack("<I", 1) + b"\x00" * 124) if vab else b"")   # header flags: VIRTUAL_AB_DEVICE
         )
         hdr_sha = hashlib.sha256(hdr_without_crc).digest()
         lp_header = hdr_without_crc[:12] + hdr_sha + hdr_without_crc[44:]
@@ -855,17 +1261,108 @@ def build_super_image(username: str, req: PackSuperRequest, tid: str = None) -> 
         out.seek(12288)
         out.write(lp_header + tables_blob)
 
+    if tid:
+        set_bg_task(tid, 80, "Verifying super.img metadata + partition data...")
+    lp_verify_raw_super(raw_super, expect, total_bytes)
+    lp_lpdump_check(raw_super)
+    dna_log(username, "SUCCESS", "super.img verified: checksums, tables and every partition hash match.")
+
     if req.super_format.lower() == "sparse":
         if tid:
             set_bg_task(tid, 85, "Converting super.img to Android Sparse format...")
         raw_to_sparse(raw_super, final_super)
         os.remove(raw_super)
     else:
-        shutil.move(raw_super, final_super)
+        os.replace(raw_super, final_super)
 
     sz_mb = os.path.getsize(final_super) / MB
     dna_log(username, "SUCCESS", f"Packed & verified super.img ({req.super_type}, {req.super_format}) → {sz_mb:.1f} MB!")
     return {"output_file": "super.img", "size_mb": f"{sz_mb:.1f} MB"}
+
+def _raw_hash_size(path: str):
+    if is_sparse_file(path):
+        tmp = path + ".lp_raw"
+        try:
+            sparse_to_raw(path, tmp)
+            return sha256_file(tmp), os.path.getsize(tmp)
+        finally:
+            safe_remove(tmp)
+    return sha256_file(path), os.path.getsize(path)
+
+def _build_super_lpmake(username: str, req: PackSuperRequest, tid: str = None) -> dict:
+    proj_dir = get_proj_dir(username, req.project)
+    total_bytes = (int(float(req.total_size_gb) * (1024 ** 3)) // 4096) * 4096
+    raw_super = os.path.join(proj_dir, "super.raw.img")
+    final_super = os.path.join(proj_dir, "super.img")
+    ab = req.super_type in ("ab", "virtual_ab")
+    grp = (req.group_name or "qti_dynamic_partitions").strip()
+    gmax = ((total_bytes - 4 * MB) // (2 if ab else 1)) // MB * MB
+    cmd = ["lpmake", "--metadata-size", "65536", "--metadata-slots", "2" if ab else "1",
+           "--device", f"super:{total_bytes}", "--super-name", "super"]
+    if ab:
+        cmd += ["--auto-slot-suffixing", f"--group", f"{grp}_a:{gmax}", "--group", f"{grp}_b:{gmax}"]
+    else:
+        cmd += ["--group", f"{grp}:{gmax}"]
+    if req.super_type == "virtual_ab":
+        cmd += ["--virtual-ab"]
+    expect = []
+    for i, img in enumerate(req.selected_imgs, 1):
+        src = safe_join(proj_dir, img)
+        if not os.path.isfile(src):
+            raise Exception(f"Selected image '{img}' does not exist.")
+        if tid:
+            set_bg_task(tid, int(5 + i / max(1, len(req.selected_imgs)) * 30), f"Hashing '{img}' for verification...")
+        stem = re.sub(r"_(a|b)$", "", re.sub(r"\.img$", "", os.path.basename(img), flags=re.I))
+        digest, size = _raw_hash_size(src)
+        if ab:
+            cmd += ["--partition", f"{stem}_a:readonly:{size}:{grp}_a", "--image", f"{stem}_a={src}",
+                    "--partition", f"{stem}_b:readonly:0:{grp}_b"]
+            expect.append((f"{stem}_a", size, digest))
+        else:
+            cmd += ["--partition", f"{stem}:readonly:{size}:{grp}", "--image", f"{stem}={src}"]
+            expect.append((stem, size, digest))
+    cmd += ["--output", raw_super]
+    safe_remove(raw_super)
+    if tid:
+        set_bg_task(tid, 45, "Building super.img with real lpmake...")
+    rc, err = run_quiet(cmd)
+    if rc != 0 or not os.path.exists(raw_super):
+        raise Exception(f"lpmake failed: {err[-300:]}")
+    if tid:
+        set_bg_task(tid, 75, "Verifying lpmake output...")
+    lp_verify_raw_super(raw_super, expect, total_bytes)
+    lp_lpdump_check(raw_super)
+    if req.super_format.lower() == "sparse":
+        raw_to_sparse(raw_super, final_super)
+        os.remove(raw_super)
+    else:
+        os.replace(raw_super, final_super)
+    sz_mb = os.path.getsize(final_super) / MB
+    dna_log(username, "SUCCESS", f"super.img built by real lpmake & verified → {sz_mb:.1f} MB")
+    return {"output_file": "super.img", "size_mb": f"{sz_mb:.1f} MB"}
+
+def build_super_image(username: str, req: PackSuperRequest, tid: str = None) -> dict:
+    pdir = get_proj_dir(username, req.project)
+    try:
+        res = None
+        if shutil.which("lpmake"):
+            try:
+                res = _build_super_lpmake(username, req, tid)
+            except Exception as e:
+                safe_remove(os.path.join(pdir, "super.raw.img"))
+                dna_log(username, "WARN", f"lpmake path failed ({e}); using built-in builder instead.")
+        if res is None:
+            res = _build_super_inner(username, req, tid)
+        hf_autosave(username, pdir, "super.img")
+        return res
+    except Exception:
+        safe_remove(os.path.join(pdir, "super.raw.img"))
+        raise
+    finally:
+        for n in os.listdir(pdir):
+            if n.endswith((".lp_raw", ".part")):
+                safe_remove(os.path.join(pdir, n))
+        free_ram()
 
 # ---------------- SETUP & API ENDPOINTS ---------------- #
 
@@ -1066,24 +1563,31 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                     r.raise_for_status()
                     total = int(r.headers.get("Content-Length", 0) or 0)
                     done = 0
-                    with open(out_p, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=2 * MB):
+                    with open(out_p + ".part", "wb") as f:
+                        fl = Flusher(f)
+                        for chunk in r.iter_content(chunk_size=1 * MB):
                             if not chunk:
                                 continue
                             f.write(chunk)
+                            fl.add(len(chunk))
                             done += len(chunk)
                             el = max(0.05, time.time() - t0)
                             spd = f"{(done / MB) / el:.1f} MB/s"
                             pct = min(99, int(done * 100 / total)) if total > 0 else min(95, int((done / MB) % 95))
                             set_bg_task(task_id, pct, f"Importing {safe_name}: {done / MB:.1f}" + (f" / {total / MB:.1f} MB ({spd})" if total else f" MB ({spd})"))
+                if total > 0 and done < total:
+                    raise Exception(f"Download incomplete ({done} of {total} bytes). Try again.")
+                os.replace(out_p + ".part", out_p)
+                free_ram()
                 sz_mb = os.path.getsize(out_p) / MB
                 BG_TASKS[task_id].update({"pct": 100, "label": f"Imported {safe_name} ({sz_mb:.2f} MB) ✓", "state": "done"})
                 dna_log(u_low, "SUCCESS", f"Imported '{safe_name}' ({sz_mb:.2f} MB) from HF Vault!")
             except Exception as e:
+                safe_remove(out_p + ".part")
                 BG_TASKS[task_id].update({"state": "error", "error": str(e)})
                 dna_log(u_low, "ERROR", f"Vault import failed for '{safe_name}': {e}")
 
-        threading.Thread(target=_worker, daemon=True).start()
+        _spawn(_worker, task_id, heavy=False)
         return {"ok": True, "task_id": task_id}
 
     @router.get("/state")
@@ -1182,7 +1686,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                 try:
                     from app import update_vault_index
                     sz_mb = os.path.getsize(fp) / MB
-                    sha = hashlib.sha256(open(fp, "rb").read(8 * MB)).hexdigest()
+                    sha = sha256_file(fp)
                     entry = {
                         "rom_key": f"DNA__{u_low}__{ustate['current_project']}",
                         "device_name": f"{device_name} (@{USERS_DB.get(u_low, {}).get('username', u_low)})",
@@ -1210,7 +1714,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                 BG_TASKS[tid].update({"state": "error", "error": str(e)})
                 dna_log(u_low, "ERROR", f"Vault push failed: {e}")
 
-        threading.Thread(target=_worker, daemon=True).start()
+        _spawn(_worker, tid, heavy=False)
         return {"ok": True, "task_id": tid}
 
     def _unpack_super_internal(u_low: str, proj_dir: str, super_filename: str, delete_source: bool = False, tid: str = None):
@@ -1237,10 +1741,24 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
             if tid:
                 set_bg_task(tid, int(10 + (idx_p / max(1, len(active_parts))) * 85), f"Unpacking '{clean_out}' ({idx_p}/{len(active_parts)}) from {super_filename}...")
             out_p = os.path.join(proj_dir, clean_out)
-            with open(src_p, "rb") as fp:
-                extract_from_super(tmp_id, Stream(fp, seek_ok=True), pname, out_p, os.path.getsize(src_p), super_filename)
+            tmp_p = out_p + ".part"
+            safe_remove(tmp_p)
+            try:
+                with open(src_p, "rb") as fp:
+                    extract_from_super(tmp_id, Stream(fp, seek_ok=True), pname, tmp_p, os.path.getsize(src_p), super_filename)
+                if not os.path.exists(tmp_p) or os.path.getsize(tmp_p) == 0:
+                    raise Exception(f"'{clean_out}' came out empty.")
+                os.replace(tmp_p, out_p)
+            except Exception:
+                safe_remove(tmp_p)
+                raise
             dna_log(u_low, "UNPACK", f"Extracted '{clean_out}' from {super_filename}")
+            drop_cache(out_p)
+            free_ram()
 
+        jobs_dict.pop(tmp_id, None)
+        del head, parts
+        free_ram()
         if delete_source and os.path.exists(src_p):
             os.remove(src_p)
 
@@ -1269,6 +1787,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                             _unpack_super_internal(u_low, proj_dir, fn, delete_source, tid)
                         else:
                             unpack_single_img_file(u_low, proj_dir, fn, delete_source, tid)
+                        free_ram()
                 elif mode == "super":
                     _unpack_super_internal(u_low, proj_dir, selected[0] if selected else "super.img", delete_source, tid)
                 elif mode == "zstd":
@@ -1279,8 +1798,10 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                         if out_name == fn:
                             out_name += ".img"
                         dst = safe_join(proj_dir, out_name)
-                        with open(src, "rb") as fin, open(dst, "wb") as fout:
-                            zstd.ZstdDecompressor().copy_stream(fin, fout)
+                        with open(src, "rb") as fin, open(dst + ".part", "wb") as fout:
+                            zstd.ZstdDecompressor().copy_stream(fin, fout, read_size=1 * MB, write_size=1 * MB)
+                        os.replace(dst + ".part", dst)
+                        free_ram()
                         if delete_source:
                             os.remove(src)
                         dna_log(u_low, "SUCCESS", f"Unpacked zstd '{fn}' → '{out_name}'")
@@ -1290,11 +1811,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                         src = safe_join(proj_dir, fn)
                         out_name = re.sub(r"\.br$", "", fn, flags=re.I)
                         dst = safe_join(proj_dir, out_name)
-                        if shutil.which("brotli"):
-                            subprocess.run(["brotli", "-d", "-f", "-o", dst, src], check=True)
-                        elif BROTLI_AVAILABLE:
-                            with open(src, "rb") as fin, open(dst, "wb") as fout:
-                                fout.write(brotli.decompress(fin.read()))
+                        brotli_decompress_file(src, dst)
                         if delete_source:
                             os.remove(src)
                         dna_log(u_low, "SUCCESS", f"Unpacked brotli '{fn}' → '{out_name}'")
@@ -1313,22 +1830,37 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                     target_pl = selected[0] if selected else "payload.bin"
                     pl_path = safe_join(proj_dir, target_pl)
                     parts_list = ("boot", "init_boot", "vendor_boot", "dtbo", "vbmeta", "system", "vendor", "product", "system_ext", "odm")
+                    got = 0
+                    tmp_id = "dna_pl"
                     for idx_p, p_to_ext in enumerate(parts_list, 1):
                         set_bg_task(tid, int(idx_p / len(parts_list) * 90), f"Scanning payload.bin for '{p_to_ext}'...")
+                        out_p = os.path.join(proj_dir, f"{p_to_ext}.img")
+                        tmp_p = out_p + ".part"
+                        safe_remove(tmp_p)
                         try:
-                            tmp_id = "dna_pl"
                             jobs_dict[tmp_id] = {"cancel": False, "logs": [], "search_progress": 0, "cont_progress": 0, "ext_progress": 0, "fin_progress": 0, "chunks_verified": 0}
                             with open(pl_path, "rb") as fp:
-                                extract_from_payload(tmp_id, Stream(fp, seek_ok=True), p_to_ext, os.path.join(proj_dir, f"{p_to_ext}.img"))
+                                extract_from_payload(tmp_id, Stream(fp, seek_ok=True), p_to_ext, tmp_p)
+                            if os.path.exists(tmp_p) and os.path.getsize(tmp_p) > 0:
+                                os.replace(tmp_p, out_p)
+                                got += 1
                                 dna_log(u_low, "SUCCESS", f"Extracted '{p_to_ext}.img' from payload.bin")
-                        except Exception:
-                            pass
+                            else:
+                                safe_remove(tmp_p)
+                                dna_log(u_low, "WARN", f"'{p_to_ext}' not present in payload.bin")
+                        except Exception as e:
+                            safe_remove(tmp_p)
+                            dna_log(u_low, "WARN", f"'{p_to_ext}' skipped: {e}")
+                        jobs_dict.pop(tmp_id, None)
+                        free_ram()
+                    if got == 0:
+                        raise Exception("No partitions could be extracted from payload.bin (file corrupt or unsupported).")
                 BG_TASKS[tid].update({"pct": 100, "label": f"Unpack ({mode}) complete ✓", "state": "done"})
             except Exception as e:
                 BG_TASKS[tid].update({"state": "error", "error": str(e)})
                 dna_log(u_low, "ERROR", f"Unpack error: {e}")
 
-        threading.Thread(target=_worker, daemon=True).start()
+        _spawn(_worker, tid, heavy=True)
         return {"ok": True, "task_id": tid}
 
     @router.post("/pack_single")
@@ -1344,7 +1876,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                 BG_TASKS[tid].update({"state": "error", "error": str(e)})
                 dna_log(u_low, "ERROR", f"Pack error: {e}")
 
-        threading.Thread(target=_worker, daemon=True).start()
+        _spawn(_worker, tid, heavy=True)
         return {"ok": True, "task_id": tid}
 
     @router.post("/pack_zstd")
@@ -1358,15 +1890,17 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                 src = safe_join(proj_dir, filename)
                 dst = safe_join(proj_dir, f"{filename}.zst")
                 set_bg_task(tid, 45, f"Compressing {filename} (level {level})...")
-                with open(src, "rb") as fin, open(dst, "wb") as fout:
-                    zstd.ZstdCompressor(level=max(1, min(19, int(level)))).copy_stream(fin, fout)
+                with open(src, "rb") as fin, open(dst + ".part", "wb") as fout:
+                    zstd.ZstdCompressor(level=max(1, min(19, int(level)))).copy_stream(fin, fout, read_size=1 * MB, write_size=1 * MB)
+                os.replace(dst + ".part", dst)
                 sz = os.path.getsize(dst) / MB
                 BG_TASKS[tid].update({"pct": 100, "label": f"Packed {filename}.zst ({sz:.2f} MB) ✓", "state": "done"})
                 dna_log(u_low, "SUCCESS", f"Packed '{filename}.zst' ({sz:.2f} MB)")
+                hf_autosave(u_low, proj_dir, f"{filename}.zst")
             except Exception as e:
                 BG_TASKS[tid].update({"state": "error", "error": str(e)})
 
-        threading.Thread(target=_worker, daemon=True).start()
+        _spawn(_worker, tid, heavy=True)
         return {"ok": True, "task_id": tid}
 
     @router.post("/pack_super")
@@ -1382,7 +1916,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                 BG_TASKS[tid].update({"state": "error", "error": str(e)})
                 dna_log(u_low, "ERROR", f"super.img build error: {e}")
 
-        threading.Thread(target=_worker, daemon=True).start()
+        _spawn(_worker, tid, heavy=True)
         return {"ok": True, "task_id": tid}
 
     @router.post("/convert")
@@ -1415,18 +1949,17 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                     br_p = f"{dat_p}.br"
                     lvl = max(0, min(11, int(br_level)))
                     set_bg_task(tid, 70, f"Compressing '{stem}.new.dat.br' (level {lvl})...")
-                    if shutil.which("brotli"):
-                        subprocess.run(["brotli", f"-q{lvl}", "-f", "-o", br_p, dat_p], check=True)
-                    elif BROTLI_AVAILABLE:
-                        with open(dat_p, "rb") as fin, open(br_p, "wb") as fout:
-                            fout.write(brotli.compress(fin.read(), quality=lvl))
+                    brotli_compress_file(dat_p, br_p, lvl)
+                    safe_remove(dat_p)
+                    hf_autosave(u_low, proj_dir, f"{stem}.new.dat.br")
+                    hf_autosave(u_low, proj_dir, f"{stem}.transfer.list")
                     dna_log(u_low, "SUCCESS", f"Converted '{filename}' → '{stem}.new.dat.br'")
                     BG_TASKS[tid].update({"pct": 100, "label": f"Created {stem}.new.dat.br ✓", "state": "done"})
             except Exception as e:
                 BG_TASKS[tid].update({"state": "error", "error": str(e)})
                 dna_log(u_low, "ERROR", f"Conversion failed: {e}")
 
-        threading.Thread(target=_worker, daemon=True).start()
+        _spawn(_worker, tid, heavy=True)
         return {"ok": True, "task_id": tid}
 
     # ---------------- MT MANAGER DUAL-PANE ENDPOINTS ---------------- #
@@ -1688,9 +2221,16 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         target_dir = get_proj_dir(u_low, project.strip()) if project.strip() else (safe_join(u_root, path) if path.strip() else get_proj_dir(u_low))
         os.makedirs(target_dir, exist_ok=True)
         out_p = safe_join(target_dir, os.path.basename(file.filename))
-        with open(out_p, "wb") as f:
-            while chunk := await file.read(2 * MB):
-                f.write(chunk)
+        try:
+            with open(out_p + ".part", "wb") as f:
+                fl = Flusher(f)
+                while chunk := await file.read(1 * MB):
+                    f.write(chunk)
+                    fl.add(len(chunk))
+            os.replace(out_p + ".part", out_p)
+        finally:
+            safe_remove(out_p + ".part")
+            free_ram()
         sz_mb = os.path.getsize(out_p) / MB
         dna_log(u_low, "UPLOAD", f"Uploaded '{file.filename}' ({sz_mb:.2f} MB)")
         return {"ok": True, "filename": file.filename, "size_mb": f"{sz_mb:.2f} MB"}
@@ -1702,6 +2242,13 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         if not os.path.isfile(fp):
             raise HTTPException(status_code=404, detail="File not found.")
         return FileResponse(fp, filename=os.path.basename(fp))
+
+    @router.get("/tools")
+    def api_dna_tools():
+        names = ["mkfs.erofs", "fsck.erofs", "mke2fs", "e2fsck", "resize2fs", "debugfs", "mkfs.f2fs", "fsck.f2fs",
+                 "sload.f2fs", "simg2img", "img2simg", "lpmake", "lpdump", "lpunpack", "brotli", "7z"]
+        return {"tools": {n: bool(shutil.which(n)) for n in names}, "brotli_python": BROTLI_AVAILABLE,
+                "auto_hf_save": AUTO_HF, "base_dir": DNA_BASE_DIR}
 
     app.include_router(router)
     return inject_dna_ui(html_page)
