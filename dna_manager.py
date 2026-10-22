@@ -2506,7 +2506,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
             raise HTTPException(status_code=404, detail="File not found.")
         return FileResponse(fp, filename=os.path.basename(fp))
 
-    @router.get("/tools")
+        @router.get("/tools")
     def api_dna_tools():
         names = ["mkfs.erofs", "fsck.erofs", "mke2fs", "e2fsck", "resize2fs", "debugfs", "mkfs.f2fs", "fsck.f2fs",
                  "sload.f2fs", "simg2img", "img2simg", "lpmake", "lpdump", "lpunpack", "brotli", "7z"]
@@ -2515,8 +2515,49 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                 "server_started": PROC_START.strftime("%Y-%m-%d %H:%M:%S"),
                 "uptime_s": int((datetime.now() - PROC_START).total_seconds()), "memory": mem_stats()}
 
+    @router.post("/dispatch_worker")
+    def api_dispatch_worker(
+        target_file: str = Form(...),
+        action: str = Form("unpack_img"),
+        project: str = Form("Default_Project"),
+        x_dna_token: Optional[str] = Header(None)
+    ):
+        u_low = resolve_user_from_token(x_dna_token)
+        gh_token = os.environ.get("GH_DISPATCH_TOKEN")
+        if not gh_token:
+            raise HTTPException(status_code=500, detail="Missing GH_DISPATCH_TOKEN in Render environment.")
+
+        url = "https://api.github.com/repos/really-yash/Fce-tools/actions/workflows/worker.yml/dispatches"
+        headers = {
+            "Authorization": f"Bearer {gh_token}",
+            "Accept": "application/vnd.github.v3+json",
+            "X-GitHub-Api-Version": "2022-11-28"
+        }
+        payload = {
+            "ref": "main",
+            "inputs": {
+                "action": action,
+                "project": project,
+                "target_file": target_file
+            }
+        }
+        
+        res = requests.post(url, headers=headers, json=payload, timeout=15)
+        if res.status_code != 204:
+            raise HTTPException(
+                status_code=500, 
+                detail=f"GitHub dispatch failed ({res.status_code}): {res.text}"
+            )
+
+        dna_log(u_low, "WORKER", f"Dispatched 7GB RAM runner on GitHub for '{target_file}' ✓")
+        return {
+            "ok": True, 
+            "message": f"Successfully launched heavy compute runner for {target_file}. Check your GitHub Actions tab!"
+        }
+
     app.include_router(router)
     return inject_dna_ui(html_page)
+
 
 # ---------------- UI INJECTOR (MT DUAL-PANE + AUTH + ADMIN + LIVE TASK HUD) ---------------- #
 
