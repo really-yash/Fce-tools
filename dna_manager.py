@@ -10,6 +10,7 @@ import zipfile
 import gc
 import ctypes
 import tempfile
+import tarfile
 import hashlib
 import threading
 import subprocess
@@ -203,11 +204,44 @@ def set_bg_task(tid: str, pct: int, label: str = None):
 
 # ---------------- LOW-RAM / ATOMIC-WRITE / HF-SAVE HELPERS ---------------- #
 
+PROC_START = datetime.now()
 HEAVY = threading.Semaphore(1)          # only ONE heavy job at a time (512 MB RAM safe)
 HF_UP_LOCK = threading.Lock()           # only ONE HF upload at a time
 AUTO_HF = os.environ.get("DNA_AUTO_HF", "1") == "1"                    # auto-save packed outputs to HF dataset
 FREE_AFTER_PUSH = os.environ.get("DNA_FREE_AFTER_PUSH", "0") == "1"    # delete local copy after HF save (optional)
 ZERO_BLOCK = b"\x00" * (4 * MB)
+
+def _read_first(paths):
+    for p in paths:
+        try:
+            with open(p) as f:
+                return f.read().strip()
+        except Exception:
+            pass
+    return None
+
+def mem_stats() -> dict:
+    mb = lambda v: (round(int(v) / MB, 1) if v and v.isdigit() else v)
+    ev = _read_first(["/sys/fs/cgroup/memory.events", "/sys/fs/cgroup/memory/memory.oom_control"]) or ""
+    oom = [l for l in ev.splitlines() if l.split() and l.split()[0] == "oom_kill"]
+    return {
+        "ram_now_mb": mb(_read_first(["/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"])),
+        "ram_peak_mb": mb(_read_first(["/sys/fs/cgroup/memory.peak", "/sys/fs/cgroup/memory/memory.max_usage_in_bytes"])),
+        "ram_limit_mb": mb(_read_first(["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"])),
+        "oom_kills": oom[0] if oom else "unknown",
+    }
+
+def drop_tree_cache(path: str):
+    """After a big extract: flush + release page-cache of every extracted file (keeps RAM peak low)."""
+    try:
+        os.sync()
+    except Exception:
+        pass
+    for root, _d, files in os.walk(path):
+        for fn in files:
+            fp = os.path.join(root, fn)
+            if not os.path.islink(fp):
+                drop_cache(fp)
 
 def free_ram():
     try:
@@ -341,29 +375,221 @@ def brotli_decompress_file(src, dst):
         safe_remove(tmp)
         free_ram()
 
-def hf_autosave(username: str, proj_dir: str, fname: str):
-    """Background, one-at-a-time, streamed upload of a finished output to the HF dataset."""
-    if not (AUTO_HF and HF_API_REF and DATASET_REPO_REF and HF_TOKEN_REF):
+# ---------------- PERSONAL HF "ROOM" (permanent home of every user's ROM; /tmp is only a scratch cache) ---------------- #
+# HF layout:  rooms/<user>/<project>/trees/<folder>.tar.zst   (unpacked partitions + config, symlinks & modes kept)
+#             rooms/<user>/<project>/files/<name>              (imgs, super.img, .br/.dat, ...)
+
+ROOM_LOCK = threading.Lock()
+ROOM_DIRTY = {}
+ROOM_RESTORED = set()
+ROOM_BOOTED = set()
+RESTORE_IMGS = os.environ.get("DNA_RESTORE_IMGS", "0") == "1"
+
+def _uclean(u: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", (u or "").strip().lower()) or "guest"
+
+def room_enabled() -> bool:
+    return bool(AUTO_HF and HF_API_REF and DATASET_REPO_REF and HF_TOKEN_REF)
+
+def _rp(u, proj, kind, name):
+    return f"rooms/{_uclean(u)}/{proj}/{kind}/{name}"
+
+def room_push_file(u, proj_dir, rel):
+    if not room_enabled():
         return
-    fp = os.path.join(proj_dir, fname)
-    if not os.path.isfile(fp):
+    fp = os.path.join(proj_dir, rel)
+    proj = os.path.basename(proj_dir)
+    if not os.path.isfile(fp) or fp.endswith(".part"):
         return
-    repo_path = f"dna_ported/{username}/{os.path.basename(proj_dir)}/{fname}"
 
     def _w():
         with HF_UP_LOCK:
             try:
-                HF_API_REF.upload_file(path_or_fileobj=fp, path_in_repo=repo_path, repo_id=DATASET_REPO_REF,
-                                       repo_type="dataset", commit_message=f"DNA autosave {fname}")
-                dna_log(username, "SUCCESS", f"Saved '{fname}' to HF dataset ✓")
+                if not os.path.isfile(fp):
+                    return
+                HF_API_REF.upload_file(path_or_fileobj=fp, path_in_repo=_rp(u, proj, "files", rel), repo_id=DATASET_REPO_REF,
+                                       repo_type="dataset", commit_message=f"room {_uclean(u)}/{proj}: {rel}")
+                dna_log(u, "SUCCESS", f"Saved '{rel}' to your HF room ✓")
                 if FREE_AFTER_PUSH:
                     safe_remove(fp)
             except Exception as e:
-                dna_log(username, "ERROR", f"HF autosave failed for '{fname}': {e}")
+                dna_log(u, "ERROR", f"HF room save failed for '{rel}': {e}")
             finally:
                 drop_cache(fp)
                 free_ram()
     threading.Thread(target=_w, daemon=True).start()
+
+def hf_autosave(username: str, proj_dir: str, fname: str):
+    room_push_file(username, proj_dir, fname)
+
+def room_push_tree(u, proj_dir, top):
+    if not room_enabled():
+        return
+    src = os.path.join(proj_dir, top)
+    proj = os.path.basename(proj_dir)
+
+    def _w():
+        with HF_UP_LOCK:
+            tmp = os.path.join(TASKS_TMP_DIR, f"room_{uuid.uuid4().hex[:8]}.tar.zst")
+            try:
+                if not os.path.isdir(src):
+                    return
+                with open(tmp, "wb") as fh:
+                    with zstd.ZstdCompressor(level=3).stream_writer(fh) as zw:
+                        with tarfile.open(fileobj=zw, mode="w|", format=tarfile.PAX_FORMAT) as tf:
+                            tf.add(src, arcname=top)
+                HF_API_REF.upload_file(path_or_fileobj=tmp, path_in_repo=_rp(u, proj, "trees", f"{top}.tar.zst"),
+                                       repo_id=DATASET_REPO_REF, repo_type="dataset",
+                                       commit_message=f"room {_uclean(u)}/{proj}: {top}")
+                dna_log(u, "SUCCESS", f"Saved '{top}/' to your HF room ✓")
+            except Exception as e:
+                dna_log(u, "ERROR", f"HF room save failed for '{top}/': {e}")
+            finally:
+                safe_remove(tmp)
+                free_ram()
+    threading.Thread(target=_w, daemon=True).start()
+
+def room_mark_dirty(u, proj_dir, top, delay=25):
+    """Debounced: many quick edits -> ONE upload after 25 s of quiet."""
+    if not room_enabled():
+        return
+    key = (_uclean(u), proj_dir, top)
+
+    def _fire():
+        with ROOM_LOCK:
+            ROOM_DIRTY.pop(key, None)
+        room_push_tree(u, proj_dir, top)
+    with ROOM_LOCK:
+        old = ROOM_DIRTY.pop(key, None)
+        if old:
+            old.cancel()
+        t = threading.Timer(delay, _fire)
+        t.daemon = True
+        ROOM_DIRTY[key] = t
+        t.start()
+
+def room_delete(u, proj, kind=None, name=None, whole=False):
+    if not room_enabled():
+        return
+
+    def _w():
+        with HF_UP_LOCK:
+            try:
+                if whole:
+                    HF_API_REF.delete_folder(path_in_repo=f"rooms/{_uclean(u)}/{proj}", repo_id=DATASET_REPO_REF, repo_type="dataset")
+                else:
+                    HF_API_REF.delete_file(path_in_repo=_rp(u, proj, kind, name), repo_id=DATASET_REPO_REF, repo_type="dataset")
+            except Exception:
+                pass
+    threading.Thread(target=_w, daemon=True).start()
+
+def room_note_change(u, u_root, rel, deleted_kind=None):
+    """Called after any manager edit: keeps the HF room identical to the working copy."""
+    parts = [p for p in (rel or "").replace("\\", "/").split("/") if p]
+    if len(parts) < 2:
+        return
+    proj, top = parts[0], parts[1]
+    proj_dir = os.path.join(u_root, proj)
+    full = os.path.join(proj_dir, top)
+    if len(parts) == 2:
+        if deleted_kind == "dir" or (not os.path.lexists(full) and deleted_kind is None):
+            room_delete(u, proj, "trees", top + ".tar.zst")
+        elif deleted_kind == "file":
+            room_delete(u, proj, "files", top)
+        elif os.path.isdir(full):
+            room_mark_dirty(u, proj_dir, top)
+        elif os.path.isfile(full):
+            room_push_file(u, proj_dir, top)
+    elif os.path.isdir(full):
+        room_mark_dirty(u, proj_dir, top)
+
+def room_restore_tree(u, proj_dir, top):
+    from huggingface_hub import hf_hub_download
+    proj = os.path.basename(proj_dir)
+    dst = os.path.join(proj_dir, top)
+    work = os.path.join(proj_dir, f".restore_{top}")
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=TASKS_TMP_DIR) as td:
+        p = hf_hub_download(repo_id=DATASET_REPO_REF, filename=_rp(u, proj, "trees", f"{top}.tar.zst"),
+                            repo_type="dataset", token=HF_TOKEN_REF, local_dir=td)
+        with open(p, "rb") as fh:
+            with zstd.ZstdDecompressor().stream_reader(fh) as zr:
+                with tarfile.open(fileobj=zr, mode="r|") as tf:
+                    for m in tf:
+                        if m.name.startswith("/") or ".." in m.name.split("/"):
+                            continue
+                        if m.isdir():
+                            m.mode |= 0o700
+                        tf.extract(m, work)
+        safe_remove(p)
+    got = os.path.join(work, top)
+    if not os.path.isdir(got):
+        shutil.rmtree(work, ignore_errors=True)
+        raise Exception(f"room archive for '{top}' was empty")
+    if os.path.lexists(dst):
+        shutil.rmtree(dst, ignore_errors=True)
+    os.replace(got, dst)
+    shutil.rmtree(work, ignore_errors=True)
+    free_ram()
+
+def room_bootstrap(u):
+    """Once per server start: recreate the user's project folders from their HF room."""
+    key = _uclean(u)
+    if key in ROOM_BOOTED or not room_enabled():
+        return
+    ROOM_BOOTED.add(key)
+    try:
+        pre = f"rooms/{key}/"
+        root = get_user_root(u)
+        for f in HF_API_REF.list_repo_files(repo_id=DATASET_REPO_REF, repo_type="dataset"):
+            if f.startswith(pre) and f.count("/") >= 4:
+                os.makedirs(os.path.join(root, f[len(pre):].split("/")[0], "config"), exist_ok=True)
+    except Exception:
+        pass
+
+def room_restore_async(u, proj_dir):
+    proj = os.path.basename(proj_dir)
+    key = (_uclean(u), proj)
+    if key in ROOM_RESTORED or not room_enabled():
+        return
+    ROOM_RESTORED.add(key)
+
+    def _job():
+        try:
+            from huggingface_hub import hf_hub_download
+            files = HF_API_REF.list_repo_files(repo_id=DATASET_REPO_REF, repo_type="dataset")
+            tpre = f"rooms/{key[0]}/{proj}/trees/"
+            fpre = f"rooms/{key[0]}/{proj}/files/"
+            tops = sorted([f[len(tpre):-8] for f in files if f.startswith(tpre) and f.endswith(".tar.zst")], key=lambda x: x != "config")
+            for t in tops:
+                d = os.path.join(proj_dir, t)
+                if os.path.isdir(d) and os.listdir(d):
+                    continue
+                dna_log(u, "ROOM", f"Restoring '{t}/' from your HF room...")
+                try:
+                    room_restore_tree(u, proj_dir, t)
+                    dna_log(u, "SUCCESS", f"Restored '{t}/' from your HF room ✓")
+                except Exception as e:
+                    dna_log(u, "ERROR", f"Restore of '{t}/' failed: {e}")
+            if RESTORE_IMGS:
+                for f in files:
+                    if f.startswith(fpre):
+                        rel = f[len(fpre):]
+                        out = safe_join(proj_dir, rel)
+                        if os.path.exists(out):
+                            continue
+                        dna_log(u, "ROOM", f"Restoring file '{rel}' from your HF room...")
+                        os.makedirs(os.path.dirname(out), exist_ok=True)
+                        with tempfile.TemporaryDirectory(dir=TASKS_TMP_DIR) as td:
+                            p = hf_hub_download(repo_id=DATASET_REPO_REF, filename=f, repo_type="dataset", token=HF_TOKEN_REF, local_dir=td)
+                            shutil.move(p, out + ".part")
+                        os.replace(out + ".part", out)
+                        dna_log(u, "SUCCESS", f"Restored '{rel}' ✓")
+        except Exception as e:
+            ROOM_RESTORED.discard(key)
+            dna_log(u, "ERROR", f"Room restore failed: {e}")
+    _spawn(_job, None, heavy=True)
 
 def _spawn(fn, tid=None, heavy=True):
     """Run a worker thread: one heavy job at a time, always free RAM at the end, never leave a task stuck."""
@@ -914,6 +1140,7 @@ def unpack_single_img_file(username: str, proj_dir: str, img_filename: str, dele
             if was_empty:
                 shutil.rmtree(out_dir, ignore_errors=True)
             raise Exception(f"Could not extract '{img_filename}' (format: {fmt}). {last_err[-250:].strip()}")
+        drop_tree_cache(out_dir)
     finally:
         if need_unsparse:
             safe_remove(raw_tmp)
@@ -933,6 +1160,8 @@ def unpack_single_img_file(username: str, proj_dir: str, img_filename: str, dele
         os.remove(src_path)
         dna_log(username, "UNPACK", f"Deleted source file '{img_filename}' after unpacking.")
 
+    room_push_tree(username, proj_dir, part_name)
+    room_push_tree(username, proj_dir, "config")
     free_ram()
     return {"partition": part_name, "format": fmt, "path": f"/sdcard/DNA/{os.path.basename(proj_dir)}/{part_name}"}
 
@@ -1116,6 +1345,7 @@ def _pack_single_inner(username: str, req: PackSingleRequest, tid: str = None) -
     sz_mb = os.path.getsize(final_p) / MB if os.path.exists(final_p) else 0
     dna_log(username, "SUCCESS", f"Packed & verified '{output_file}' ({sz_mb:.2f} MB) in /sdcard/DNA/{os.path.basename(proj_dir)}")
     hf_autosave(username, proj_dir, output_file)
+    room_push_tree(username, proj_dir, "config")
     for x in extra_save:
         hf_autosave(username, proj_dir, x)
     return {"output_file": output_file, "size_mb": f"{sz_mb:.2f} MB"}
@@ -1512,7 +1742,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         if hf_api and dataset_repo:
             try:
                 for rf in hf_api.list_repo_files(repo_id=dataset_repo, repo_type="dataset"):
-                    if rf in ("vault_index.json", "users_db.json", ".gitattributes") or rf.endswith("rom_info.json"):
+                    if rf in ("vault_index.json", "users_db.json", ".gitattributes") or rf.endswith("rom_info.json") or rf.startswith("rooms/"):
                         continue
                     if rf not in seen_paths:
                         seen_paths.add(rf)
@@ -1540,6 +1770,8 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         x_dna_token: Optional[str] = Header(None)
     ):
         u_low = _current_user(x_dna_token)
+        if "rooms/" in (repo_path + download_url) and f"rooms/{_uclean(u_low)}/" not in (repo_path + download_url):
+            raise HTTPException(status_code=403, detail="That room belongs to another user.")
         u_root = get_user_root(u_low)
         proj_dir = get_proj_dir(u_low, project)
         safe_name = os.path.basename(target_name.strip())
@@ -1593,9 +1825,18 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
     @router.get("/state")
     def api_dna_state(project: Optional[str] = None, x_dna_token: Optional[str] = Header(None)):
         u_low = _current_user(x_dna_token)
+        if re.sub(r"[^a-zA-Z0-9_-]", "_", u_low.strip().lower()) not in USER_STATES:
+            try:
+                made = datetime.strptime(USERS_DB.get(u_low, {}).get("created_at", ""), "%Y-%m-%d %H:%M")
+                if made < PROC_START:
+                    dna_log(u_low, "WARN", f"Server restarted at {PROC_START.strftime('%H:%M:%S')} - temporary storage was wiped. Restoring your files from your private HF room now (see log).")
+            except Exception:
+                pass
         ustate = get_user_state(u_low)
         u_root = get_user_root(u_low)
+        room_bootstrap(u_low)
         proj_dir = get_proj_dir(u_low, project)
+        room_restore_async(u_low, proj_dir)
         projects = sorted([d for d in os.listdir(u_root) if os.path.isdir(os.path.join(u_root, d))])
 
         img_files, unpacked_parts, zst_files, dat_br_files = [], [], [], []
@@ -1648,12 +1889,14 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
             dna_log(u_low, "PROJECT", f"Switched to project '/sdcard/DNA/{ustate['current_project']}'")
         elif action == "clear":
             p = get_proj_dir(u_low)
+            room_delete(u_low, ustate["current_project"], whole=True)
             shutil.rmtree(p, ignore_errors=True)
             get_proj_dir(u_low, ustate["current_project"])
             dna_log(u_low, "PROJECT", f"Cleared project '/sdcard/DNA/{ustate['current_project']}'")
         elif action == "delete":
             target = name or ustate["current_project"]
             p = os.path.join(u_root, re.sub(r"[^a-zA-Z0-9._-]", "_", target))
+            room_delete(u_low, re.sub(r"[^a-zA-Z0-9._-]", "_", target), whole=True)
             shutil.rmtree(p, ignore_errors=True)
             ustate["current_project"] = "Default_Project"
             get_proj_dir(u_low, "Default_Project")
@@ -1753,6 +1996,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                 safe_remove(tmp_p)
                 raise
             dna_log(u_low, "UNPACK", f"Extracted '{clean_out}' from {super_filename}")
+            hf_autosave(u_low, proj_dir, clean_out)
             drop_cache(out_p)
             free_ram()
 
@@ -1845,6 +2089,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                                 os.replace(tmp_p, out_p)
                                 got += 1
                                 dna_log(u_low, "SUCCESS", f"Extracted '{p_to_ext}.img' from payload.bin")
+                                hf_autosave(u_low, proj_dir, f"{p_to_ext}.img")
                             else:
                                 safe_remove(tmp_p)
                                 dna_log(u_low, "WARN", f"'{p_to_ext}' not present in payload.bin")
@@ -2096,6 +2341,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         with open(fp, "w", encoding="utf-8") as f:
             f.write(content)
         dna_log(u_low, "MANAGER", f"Saved modified file '{path}'")
+        room_note_change(u_low, get_user_root(u_low), path)
         return {"ok": True}
 
     @router.post("/fs/op")
@@ -2114,6 +2360,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         u_root = get_user_root(u_low)
         src_full = safe_join(u_root, src) if src else u_root
         dst_full = safe_join(u_root, dst) if dst else u_root
+        was_dir = os.path.isdir(src_full) and not os.path.islink(src_full)
 
         if op == "copy":
             target = os.path.join(dst_full, os.path.basename(src_full)) if os.path.isdir(dst_full) else dst_full
@@ -2207,6 +2454,21 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                         ctype = zipfile.ZIP_STORED if fn.endswith((".img", ".so", ".arsc")) else zipfile.ZIP_DEFLATED
                         zf.write(full_f, arcname, compress_type=ctype)
             dna_log(u_low, "MANAGER", f"Repacked folder '{src}' → '{os.path.basename(orig_archive)}'")
+        try:
+            if op == "delete":
+                room_note_change(u_low, u_root, src, "dir" if was_dir else "file")
+            elif op in ("move", "rename"):
+                room_note_change(u_low, u_root, src, "dir" if was_dir else "file")
+                room_note_change(u_low, u_root, os.path.relpath(target if op == "move" else dst_full, u_root))
+            elif op == "copy":
+                room_note_change(u_low, u_root, os.path.relpath(target, u_root))
+            elif op == "chmod_chcon":
+                room_note_change(u_low, u_root, src)
+                room_note_change(u_low, u_root, src.replace("\\", "/").split("/")[0] + "/config/x")
+            else:
+                room_note_change(u_low, u_root, src)
+        except Exception:
+            pass
         return {"ok": True}
 
     @router.post("/fs/upload")
@@ -2233,6 +2495,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
             free_ram()
         sz_mb = os.path.getsize(out_p) / MB
         dna_log(u_low, "UPLOAD", f"Uploaded '{file.filename}' ({sz_mb:.2f} MB)")
+        room_note_change(u_low, u_root, os.path.relpath(out_p, u_root))
         return {"ok": True, "filename": file.filename, "size_mb": f"{sz_mb:.2f} MB"}
 
     @router.get("/fs/download")
@@ -2248,7 +2511,9 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         names = ["mkfs.erofs", "fsck.erofs", "mke2fs", "e2fsck", "resize2fs", "debugfs", "mkfs.f2fs", "fsck.f2fs",
                  "sload.f2fs", "simg2img", "img2simg", "lpmake", "lpdump", "lpunpack", "brotli", "7z"]
         return {"tools": {n: bool(shutil.which(n)) for n in names}, "brotli_python": BROTLI_AVAILABLE,
-                "auto_hf_save": AUTO_HF, "base_dir": DNA_BASE_DIR}
+                "auto_hf_save": AUTO_HF, "restore_imgs_on_start": RESTORE_IMGS, "base_dir": DNA_BASE_DIR,
+                "server_started": PROC_START.strftime("%Y-%m-%d %H:%M:%S"),
+                "uptime_s": int((datetime.now() - PROC_START).total_seconds()), "memory": mem_stats()}
 
     app.include_router(router)
     return inject_dna_ui(html_page)
