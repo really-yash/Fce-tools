@@ -1,0 +1,54 @@
+name: Heavy ROM Task Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Operation (unpack_img, unpack_super, pack_single, pack_super)'
+        required: true
+        default: 'unpack_img'
+      project:
+        description: 'Target project name'
+        required: true
+        default: 'Default_Project'
+      target_file:
+        description: 'Filename to process (e.g., system_ext.img)'
+        required: true
+      options:
+        description: 'JSON encoded options or partition name'
+        required: false
+        default: '{}'
+
+jobs:
+  run-worker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install ROM Filesystem Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y erofs-utils e2fsprogs f2fs-tools p7zip-full brotli zstd curl
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python Dependencies
+        run: |
+          pip install --no-cache-dir -r requirements.txt
+          pip install huggingface_hub zstandard
+
+      - name: Execute Heavy Worker
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DATASET_REPO: ${{ secrets.DATASET_REPO }}
+          TASK_ACTION: ${{ github.event.inputs.action }}
+          TASK_PROJECT: ${{ github.event.inputs.project }}
+          TASK_FILE: ${{ github.event.inputs.target_file }}
+          TASK_OPTIONS: ${{ github.event.inputs.options }}
+        run: |
+          python worker_runner.py
