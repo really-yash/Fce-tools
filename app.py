@@ -3077,6 +3077,15 @@ HTML_PAGE = """<!DOCTYPE html>
 </html>
 """
 
+from dna_manager import setup_dna_manager
+HTML_PAGE = setup_dna_manager(app, HTML_PAGE, JOBS, hf_api, DATASET_REPO, HF_TOKEN)
+
+@app.get("/", response_class=HTMLResponse)
+def serve_ui():
+    return HTML_PAGE
+
+
+
 @app.get("/", response_class=HTMLResponse)
 def serve_ui():
     return HTML_PAGE
