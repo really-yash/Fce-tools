@@ -2695,7 +2695,7 @@ DNA_TAB_HTML = r"""
             </div>
           </div>
 
-          <!-- UNPACK MENU -->
+                    <!-- UNPACK MENU -->
           <div class="glass rounded-3xl p-5 space-y-3">
             <h3 class="text-sm font-bold text-violet-300 brand-font tracking-wide">Unpack Menu</h3>
             <div class="divide-y divide-white/10 mono text-xs">
@@ -2705,6 +2705,12 @@ DNA_TAB_HTML = r"""
               <button type="button" onclick="openUnpackModal('img')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition"><span>Unpack img</span><span class="text-slate-500">&gt;</span></button>
               <button type="button" onclick="openUnpackModal('zstd')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition"><span>Unpack zstd</span><span class="text-slate-500">&gt;</span></button>
               <button type="button" onclick="openUnpackModal('super')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition"><span>Unpack super</span><span class="text-slate-500">&gt;</span></button>
+              
+              <!-- ADD THIS NEW BUTTON HERE -->
+              <button type="button" onclick="dispatchHeavyWorker()" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition text-amber-300 font-bold">
+                <span>⚡ Unpack with 7GB Cloud Worker (GitHub)</span>
+                <span class="text-slate-500">&gt;</span>
+              </button>
             </div>
           </div>
 
