@@ -1814,7 +1814,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
             dna_log(u_low, "WARN", f"Could not fully sync before dispatch: {e}")
 
         payload = {"ref": GH_BRANCH, "inputs": {"task_id": tid, "action": action, "username": _uclean(u_low), "project": proj,
-                                                 "target_file": target_file, "options": json.dumps(options)}}
+                                                 "target_file": target_file, "options": json.dumps({**options, "dataset_repo": DATASET_REPO_REF})}}
         try:
             res = requests.post(f"{api}/workflows/{GH_WORKFLOW}/dispatches", headers=headers, json=payload, timeout=20)
         except Exception as e:
