@@ -383,6 +383,34 @@ ROOM_LOCK = threading.Lock()
 ROOM_DIRTY = {}
 ROOM_RESTORED = set()
 ROOM_BOOTED = set()
+ROOM_THREADS = []
+_HF_LIST = {"t": 0.0, "v": []}
+
+def _bg(fn):
+    ROOM_THREADS[:] = [t for t in ROOM_THREADS if t.is_alive()]
+    t = threading.Thread(target=fn, daemon=True)
+    ROOM_THREADS.append(t)
+    t.start()
+    return t
+
+def hf_list_cached(max_age=8.0, force=False):
+    if force or time.time() - _HF_LIST["t"] > max_age:
+        _HF_LIST["v"] = list(HF_API_REF.list_repo_files(repo_id=DATASET_REPO_REF, repo_type="dataset"))
+        _HF_LIST["t"] = time.time()
+    return _HF_LIST["v"]
+
+def room_flush_all(timeout=240):
+    """Push every pending edit/upload to HF NOW. The GitHub worker reads from HF, so HF must be up to date."""
+    with ROOM_LOCK:
+        pending = list(ROOM_DIRTY.items())
+        ROOM_DIRTY.clear()
+    for (u, proj_dir, top), t in pending:
+        t.cancel()
+        room_push_tree(u, proj_dir, top)
+    end = time.time() + timeout
+    for t in list(ROOM_THREADS):
+        t.join(max(0.1, end - time.time()))
+    _HF_LIST["t"] = 0.0
 RESTORE_IMGS = os.environ.get("DNA_RESTORE_IMGS", "0") == "1"
 
 def _uclean(u: str) -> str:
@@ -417,7 +445,7 @@ def room_push_file(u, proj_dir, rel):
             finally:
                 drop_cache(fp)
                 free_ram()
-    threading.Thread(target=_w, daemon=True).start()
+    _bg(_w)
 
 def hf_autosave(username: str, proj_dir: str, fname: str):
     room_push_file(username, proj_dir, fname)
@@ -447,7 +475,7 @@ def room_push_tree(u, proj_dir, top):
             finally:
                 safe_remove(tmp)
                 free_ram()
-    threading.Thread(target=_w, daemon=True).start()
+    _bg(_w)
 
 def room_mark_dirty(u, proj_dir, top, delay=25):
     """Debounced: many quick edits -> ONE upload after 25 s of quiet."""
@@ -481,7 +509,7 @@ def room_delete(u, proj, kind=None, name=None, whole=False):
                     HF_API_REF.delete_file(path_in_repo=_rp(u, proj, kind, name), repo_id=DATASET_REPO_REF, repo_type="dataset")
             except Exception:
                 pass
-    threading.Thread(target=_w, daemon=True).start()
+    _bg(_w)
 
 def room_note_change(u, u_root, rel, deleted_kind=None):
     """Called after any manager edit: keeps the HF room identical to the working copy."""
@@ -1760,69 +1788,104 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
             raise HTTPException(status_code=404, detail="Task not found")
         return t
 
+    GH_REPO = os.environ.get("GH_REPO", "really-yash/Fce-tools").strip()
+    GH_BRANCH = os.environ.get("GH_BRANCH", "main").strip()
+    GH_WORKFLOW = os.environ.get("GH_WORKFLOW", "worker.yml").strip()
+
     def _dispatch_gh_worker(u_low: str, action: str, target_file: str, options: dict, label: str) -> str:
         gh_token = (os.environ.get("GH_DISPATCH_TOKEN") or "").strip()
         if gh_token.startswith("Github_pat_"):
             gh_token = "g" + gh_token[1:]
         if not gh_token:
             raise HTTPException(status_code=500, detail="Missing GH_DISPATCH_TOKEN in Render Environment.")
+        if not room_enabled():
+            raise HTTPException(status_code=500, detail="HF dataset is not configured on Render (HF_TOKEN / DATASET_REPO), the worker needs it.")
 
         ustate = get_user_state(u_low)
         proj = ustate["current_project"]
-        url = "https://api.github.com/repos/really-yash/Fce-tools/actions/workflows/worker.yml/dispatches"
-        headers = {
-            "Authorization": f"Bearer {gh_token}",
-            "Accept": "application/vnd.github.v3+json",
-            "X-GitHub-Api-Version": "2022-11-28"
-        }
-        payload = {
-            "ref": "main",
-            "inputs": {
-                "action": action,
-                "username": _uclean(u_low),
-                "project": proj,
-                "target_file": target_file,
-                "options": json.dumps(options)
-            }
-        }
-        res = requests.post(url, headers=headers, json=payload, timeout=15)
-        if res.status_code != 204:
-            raise HTTPException(status_code=500, detail=f"GitHub dispatch failed ({res.status_code}): {res.text}")
+        api = f"https://api.github.com/repos/{GH_REPO}/actions"
+        headers = {"Authorization": f"Bearer {gh_token}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
 
         tid = create_bg_task(f"[GitHub 7GB Worker] {label}")
+        set_bg_task(tid, 5, "Syncing your latest files to HF before starting...")
+        try:
+            room_flush_all()
+        except Exception as e:
+            dna_log(u_low, "WARN", f"Could not fully sync before dispatch: {e}")
+
+        payload = {"ref": GH_BRANCH, "inputs": {"task_id": tid, "action": action, "username": _uclean(u_low), "project": proj,
+                                                 "target_file": target_file, "options": json.dumps(options)}}
+        try:
+            res = requests.post(f"{api}/workflows/{GH_WORKFLOW}/dispatches", headers=headers, json=payload, timeout=20)
+        except Exception as e:
+            BG_TASKS[tid].update({"state": "error", "error": f"Cannot reach GitHub: {e}"})
+            raise HTTPException(status_code=500, detail=f"Cannot reach GitHub: {e}")
+        if res.status_code != 204:
+            hint = {404: f"'{GH_WORKFLOW}' not found on branch '{GH_BRANCH}' of {GH_REPO} (must be .github/workflows/{GH_WORKFLOW}), or the token cannot see the repo.",
+                    401: "GH_DISPATCH_TOKEN is invalid or expired.",
+                    403: "GH_DISPATCH_TOKEN needs 'Actions: Read and write' permission on the repo.",
+                    422: "Workflow inputs mismatch: update worker.yml (it needs the 'task_id' input)."}.get(res.status_code, "")
+            msg = f"GitHub dispatch failed ({res.status_code}). {hint} {res.text[:200]}"
+            BG_TASKS[tid].update({"state": "error", "error": msg})
+            dna_log(u_low, "ERROR", msg)
+            raise HTTPException(status_code=500, detail=msg)
+
         dna_log(u_low, "WORKER", f"Dispatched '{action}' for '{target_file}' to GitHub 7GB Server ✓")
+        set_bg_task(tid, 10, f"[GitHub 7GB] Waiting for runner: {label}...")
+
+        def _fail(msg):
+            BG_TASKS[tid].update({"state": "error", "error": msg})
+            dna_log(u_low, "ERROR", msg)
 
         def _poll_gh():
-            time.sleep(5)
-            runs_url = "https://api.github.com/repos/really-yash/Fce-tools/actions/workflows/worker.yml/runs?per_page=1"
-            for step in range(1, 360):
+            t0 = time.time()
+            run_id, run_url, logged = None, "", False
+            while time.time() - t0 < 3 * 3600:
                 try:
-                    r = requests.get(runs_url, headers=headers, timeout=10)
+                    r = requests.get(f"{api}/workflows/{GH_WORKFLOW}/runs?event=workflow_dispatch&per_page=30", headers=headers, timeout=15)
                     if r.status_code == 200:
-                        runs = r.json().get("workflow_runs", [])
-                        if runs:
-                            latest = runs[0]
-                            st = latest.get("status")
-                            conc = latest.get("conclusion")
-                            if st in ("queued", "waiting", "pending"):
-                                set_bg_task(tid, 15, f"[GitHub 7GB] Queued: {label}...")
-                            elif st == "in_progress":
-                                pct = min(92, 25 + step * 2)
-                                set_bg_task(tid, pct, f"[GitHub 7GB] Running: {label}...")
-                            elif st == "completed":
-                                if conc == "success":
-                                    BG_TASKS[tid].update({"pct": 100, "label": f"Completed on GitHub: {label} ✓", "state": "done"})
-                                    dna_log(u_low, "SUCCESS", f"GitHub 7GB Worker finished: {label} ✓")
-                                else:
-                                    BG_TASKS[tid].update({"state": "error", "error": f"GitHub Worker failed ({conc}). Check GitHub Actions logs."})
-                                    dna_log(u_low, "ERROR", f"GitHub Worker failed ({conc}) for {label}")
+                        for run in r.json().get("workflow_runs", []):
+                            if tid in (run.get("display_title") or "") or tid in (run.get("name") or ""):
+                                run_id, run_url = run["id"], run.get("html_url", "")
+                                st, conc = run.get("status"), run.get("conclusion")
+                                if not logged:
+                                    logged = True
+                                    dna_log(u_low, "WORKER", f"GitHub run started: {run_url}")
+                                if st in ("queued", "waiting", "pending"):
+                                    set_bg_task(tid, 15, f"[GitHub 7GB] Queued: {label}...")
+                                elif st == "in_progress":
+                                    set_bg_task(tid, min(92, int(25 + (time.time() - t0) / 15)), f"[GitHub 7GB] Running: {label}...")
+                                elif st == "completed":
+                                    if conc == "success":
+                                        _HF_LIST["t"] = 0.0
+                                        if action == "unpack":
+                                            ROOM_RESTORED.discard((_uclean(u_low), proj))
+                                            room_restore_async(u_low, get_proj_dir(u_low, proj))
+                                        BG_TASKS[tid].update({"pct": 100, "label": f"Completed on GitHub: {label} ✓", "state": "done"})
+                                        dna_log(u_low, "SUCCESS", f"GitHub 7GB Worker finished: {label} ✓")
+                                    else:
+                                        step = ""
+                                        try:
+                                            jr = requests.get(f"{api}/runs/{run_id}/jobs", headers=headers, timeout=15).json()
+                                            for j in jr.get("jobs", []):
+                                                for s in j.get("steps", []):
+                                                    if s.get("conclusion") == "failure":
+                                                        step = f" at step '{s.get('name')}'"
+                                        except Exception:
+                                            pass
+                                        _fail(f"GitHub Worker failed ({conc}){step}. Logs: {run_url}")
+                                    return
+                                break
+                        else:
+                            if run_id is None and time.time() - t0 > 150:
+                                _fail("GitHub accepted the dispatch but no run appeared. Check worker.yml has 'run-name' and the 'task_id' input, and that Actions is enabled.")
                                 return
                 except Exception:
                     pass
-                time.sleep(4)
-            BG_TASKS[tid].update({"state": "error", "error": "Worker timed out in HUD (check GitHub Actions tab)."})
+                time.sleep(5)
+            _fail("Worker timed out in HUD (check the GitHub Actions tab).")
 
-        threading.Thread(target=_poll_gh, daemon=True).start()
+        _bg(_poll_gh)
         return tid
 
     @router.post("/import_vault")
@@ -1837,6 +1900,8 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         u_low = _current_user(x_dna_token)
         if project:
             get_proj_dir(u_low, project)
+        if "rooms/" in (repo_path + download_url) and f"rooms/{_uclean(u_low)}/" not in (repo_path + download_url):
+            raise HTTPException(status_code=403, detail="That room belongs to another user.")
         safe_name = os.path.basename(target_name.strip())
         tid = _dispatch_gh_worker(
             u_low, "import_vault", safe_name,
@@ -1864,7 +1929,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                 u_key = _uclean(u_low)
                 fpre = f"rooms/{u_key}/{proj_name}/files/"
                 tpre = f"rooms/{u_key}/{proj_name}/trees/"
-                for rf in HF_API_REF.list_repo_files(repo_id=DATASET_REPO_REF, repo_type="dataset"):
+                for rf in hf_list_cached():
                     if rf.startswith(fpre):
                         fn = rf[len(fpre):]
                         if "/" not in fn and fn not in seen_files:
