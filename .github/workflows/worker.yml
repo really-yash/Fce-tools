@@ -4,18 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: 'Operation (unpack_img, unpack_super, pack_single, pack_super)'
+        description: 'Task action (import_vault, unpack, pack_single, pack_super, pack_zstd, convert)'
         required: true
-        default: 'unpack_img'
+      username:
+        description: 'DNA Username'
+        required: true
+        default: 'guest'
       project:
         description: 'Target project name'
         required: true
         default: 'Default_Project'
       target_file:
-        description: 'Filename to process (e.g., system_ext.img)'
+        description: 'Target filename(s) or partition'
         required: true
       options:
-        description: 'JSON encoded options or partition name'
+        description: 'JSON encoded options'
         required: false
         default: '{}'
 
@@ -29,24 +32,23 @@ jobs:
       - name: Install ROM Filesystem Tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y erofs-utils e2fsprogs f2fs-tools p7zip-full brotli zstd curl
+          sudo apt-get install -y erofs-utils e2fsprogs f2fs-tools android-sdk-libsparse-utils p7zip-full brotli zstd curl
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - name: Install Python Dependencies
         run: |
-          pip install --no-cache-dir -r requirements.txt
-          pip install huggingface_hub zstandard
+          pip install --no-cache-dir fastapi uvicorn python-multipart huggingface_hub "requests[socks]" PySocks stem brotli remotezip zstandard stream-unzip
 
-      - name: Execute Heavy Worker
+      - name: Execute Heavy ROM Task on 7GB Runner
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           DATASET_REPO: ${{ secrets.DATASET_REPO }}
           TASK_ACTION: ${{ github.event.inputs.action }}
+          TASK_USER: ${{ github.event.inputs.username }}
           TASK_PROJECT: ${{ github.event.inputs.project }}
           TASK_FILE: ${{ github.event.inputs.target_file }}
           TASK_OPTIONS: ${{ github.event.inputs.options }}
