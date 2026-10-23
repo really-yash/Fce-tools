@@ -2506,7 +2506,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
             raise HTTPException(status_code=404, detail="File not found.")
         return FileResponse(fp, filename=os.path.basename(fp))
 
-            @router.get("/tools")
+    @router.get("/tools")
     def api_dna_tools():
         names = ["mkfs.erofs", "fsck.erofs", "mke2fs", "e2fsck", "resize2fs", "debugfs", "mkfs.f2fs", "fsck.f2fs",
                  "sload.f2fs", "simg2img", "img2simg", "lpmake", "lpdump", "lpunpack", "brotli", "7z"]
