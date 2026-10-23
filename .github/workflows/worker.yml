@@ -1,8 +1,14 @@
 name: Heavy ROM Task Worker
 
+run-name: "${{ github.event.inputs.task_id }} | ${{ github.event.inputs.action }} ${{ github.event.inputs.target_file }}"
+
 on:
   workflow_dispatch:
     inputs:
+      task_id:
+        description: 'Unique task id from the website (used to match this run)'
+        required: false
+        default: 'manual'
       action:
         description: 'Task action (import_vault, unpack, pack_single, pack_super, pack_zstd, convert)'
         required: true
@@ -22,9 +28,13 @@ on:
         required: false
         default: '{}'
 
+permissions:
+  contents: read
+
 jobs:
   run-worker:
     runs-on: ubuntu-latest
+    timeout-minutes: 340
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -53,4 +63,4 @@ jobs:
           TASK_FILE: ${{ github.event.inputs.target_file }}
           TASK_OPTIONS: ${{ github.event.inputs.options }}
         run: |
-          python worker_runner.py
+          python -u worker_runner.py
