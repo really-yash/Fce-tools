@@ -3165,6 +3165,34 @@ DNA_TAB_HTML = r"""
       return extList.some(ext => low.endsWith("." + ext));
     }
 
+    async function dispatchHeavyWorker() {
+  const file = prompt("Enter the exact partition filename in your project to unpack (e.g., system_ext.img):");
+  if (!file) return;
+
+  showTaskProgress("Dispatching 7GB GitHub worker for " + file + "...", 15);
+  const fd = new FormData();
+  fd.append("target_file", file.trim());
+  fd.append("action", "unpack_img");
+  fd.append("project", dnaState.current_project || "Default_Project");
+
+  try {
+    const res = await fetch("/api/dna/dispatch_worker", {
+      method: "POST",
+      headers: dnaHeaders(),
+      body: fd
+    });
+    const data = await res.json();
+    hideTaskProgress();
+    if (!res.ok) throw new Error(data.detail || "Dispatch failed");
+    toast(data.message, "ok");
+    refreshDnaState();
+  } catch (e) {
+    hideTaskProgress();
+    toast(e.message, "bad");
+  }
+}
+
+
     /* ---------- AUTH & ADMIN ---------- */
     async function checkDnaAuth() {
       const authCard = document.getElementById("dnaAuthCard");
