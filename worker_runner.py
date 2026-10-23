@@ -14,14 +14,20 @@ from huggingface_hub import HfApi, hf_hub_download, hf_hub_url
 os.environ["DNA_AUTO_HF"] = "0"  # this worker uploads to HF itself
 import dna_manager
 
-HF_TOKEN = os.environ["HF_TOKEN"].strip()
-REPO = os.environ["DATASET_REPO"].strip()
 ACTION = os.environ.get("TASK_ACTION", "").strip()
 USER = re.sub(r"[^a-zA-Z0-9_-]", "_", os.environ.get("TASK_USER", "guest").strip().lower()) or "guest"
 PROJECT = os.environ.get("TASK_PROJECT", "Default_Project").strip()
 TARGET_FILE = os.environ.get("TASK_FILE", "").strip()
 OPTIONS = json.loads(os.environ.get("TASK_OPTIONS", "{}") or "{}")
 DELETE_SOURCE = bool(OPTIONS.get("delete_source", False))
+
+HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
+REPO = (os.environ.get("DATASET_REPO", "").strip() or str(OPTIONS.pop("dataset_repo", "")).strip())
+OPTIONS.pop("dataset_repo", None)
+if not HF_TOKEN:
+    sys.exit("[✗] GitHub secret HF_TOKEN is EMPTY. Add it in the repo: Settings > Secrets and variables > Actions > New repository secret (name: HF_TOKEN, value: your Hugging Face WRITE token).")
+if not REPO:
+    sys.exit("[✗] Dataset repo is unknown. Add secret DATASET_REPO (e.g. Yash10101/xiaomi-firmware-cache) or set DATASET_REPO on Render.")
 
 api = HfApi(token=HF_TOKEN)
 PROJ_DIR = dna_manager.get_proj_dir(USER, PROJECT)
