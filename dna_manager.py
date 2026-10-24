@@ -2015,6 +2015,119 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         tid = _dispatch_gh_worker(u_low, "convert", filename, {"mode": mode, "br_level": br_level}, f"Convert {filename} ({mode})")
         return {"ok": True, "task_id": tid}
 
+    @router.post("/import_vault")
+    def api_import_from_vault(
+        download_url: str = Form(""),
+        repo_path: str = Form(""),
+        target_name: str = Form(...),
+        dest_rel_dir: str = Form(""),
+        project: Optional[str] = Form(None),
+        x_dna_token: Optional[str] = Header(None)
+    ):
+        u_low = _current_user(x_dna_token)
+        if "rooms/" in (repo_path + download_url) and f"rooms/{_uclean(u_low)}/" not in (repo_path + download_url):
+            raise HTTPException(status_code=403, detail="That room belongs to another user.")
+        u_root = get_user_root(u_low)
+        proj_dir = get_proj_dir(u_low, project)
+        safe_name = os.path.basename(target_name.strip())
+        if dest_rel_dir.strip():
+            target_folder = safe_join(u_root, dest_rel_dir.strip())
+            os.makedirs(target_folder, exist_ok=True)
+            out_p = safe_join(target_folder, safe_name)
+        else:
+            out_p = safe_join(proj_dir, safe_name)
+
+        task_id = create_bg_task(f"Connecting to HF Vault for '{safe_name}'...")
+
+        def _worker():
+            t0 = time.time()
+            try:
+                url = download_url.strip() or hf_hub_url(repo_id=dataset_repo, filename=repo_path.strip(), repo_type="dataset")
+                headers = {"User-Agent": "Mozilla/5.0"}
+                if hf_token:
+                    headers["Authorization"] = f"Bearer {hf_token}"
+                with requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=60) as r:
+                    r.raise_for_status()
+                    total = int(r.headers.get("Content-Length", 0) or 0)
+                    done = 0
+                    with open(out_p + ".part", "wb") as f:
+                        fl = Flusher(f)
+                        for chunk in r.iter_content(chunk_size=1 * MB):
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            fl.add(len(chunk))
+                            done += len(chunk)
+                            el = max(0.05, time.time() - t0)
+                            spd = f"{(done / MB) / el:.1f} MB/s"
+                            pct = min(99, int(done * 100 / total)) if total > 0 else min(95, int((done / MB) % 95))
+                            set_bg_task(task_id, pct, f"Importing {safe_name}: {done / MB:.1f}" + (f" / {total / MB:.1f} MB ({spd})" if total else f" MB ({spd})"))
+                if total > 0 and done < total:
+                    raise Exception(f"Download incomplete ({done} of {total} bytes). Try again.")
+                os.replace(out_p + ".part", out_p)
+                free_ram()
+                sz_mb = os.path.getsize(out_p) / MB
+                BG_TASKS[task_id].update({"pct": 100, "label": f"Imported {safe_name} ({sz_mb:.2f} MB) ✓", "state": "done"})
+                dna_log(u_low, "SUCCESS", f"Imported '{safe_name}' ({sz_mb:.2f} MB) from HF Vault!")
+            except Exception as e:
+                safe_remove(out_p + ".part")
+                BG_TASKS[task_id].update({"state": "error", "error": str(e)})
+                dna_log(u_low, "ERROR", f"Vault import failed for '{safe_name}': {e}")
+
+        _spawn(_worker, task_id, heavy=False)
+        return {"ok": True, "task_id": task_id}
+
+    @router.get("/state")
+    def api_dna_state(project: Optional[str] = None, x_dna_token: Optional[str] = Header(None)):
+        u_low = _current_user(x_dna_token)
+        if re.sub(r"[^a-zA-Z0-9_-]", "_", u_low.strip().lower()) not in USER_STATES:
+            try:
+                made = datetime.strptime(USERS_DB.get(u_low, {}).get("created_at", ""), "%Y-%m-%d %H:%M")
+                if made < PROC_START:
+                    dna_log(u_low, "WARN", f"Server restarted at {PROC_START.strftime('%H:%M:%S')} - temporary storage was wiped. Restoring your files from your private HF room now (see log).")
+            except Exception:
+                pass
+        ustate = get_user_state(u_low)
+        u_root = get_user_root(u_low)
+        room_bootstrap(u_low)
+        proj_dir = get_proj_dir(u_low, project)
+        room_restore_async(u_low, proj_dir)
+        projects = sorted([d for d in os.listdir(u_root) if os.path.isdir(os.path.join(u_root, d))])
+
+        img_files, unpacked_parts, zst_files, dat_br_files = [], [], [], []
+        for entry in sorted(os.listdir(proj_dir)):
+            full = os.path.join(proj_dir, entry)
+            if os.path.isfile(full):
+                low = entry.lower()
+                sz = f"{os.path.getsize(full) / MB:.2f} MB"
+                if low.endswith((".img", ".bin", ".simg")):
+                    img_files.append({"name": entry, "format": detect_img_type(full), "size": sz})
+                elif low.endswith(".zst"):
+                    zst_files.append({"name": entry, "size": sz})
+                elif low.endswith((".br", ".new.dat", ".transfer.list")):
+                    dat_br_files.append({"name": entry, "size": sz})
+            elif os.path.isdir(full) and entry != "config":
+                info_p = os.path.join(proj_dir, "config", f"{entry}_info.json")
+                det_fmt = "erofs"
+                if os.path.exists(info_p):
+                    try:
+                        det_fmt = json.load(open(info_p)).get("detected_format", "erofs")
+                    except Exception:
+                        pass
+                unpacked_parts.append({"name": entry, "format": det_fmt})
+
+        return {
+            "username": USERS_DB.get(u_low, {}).get("username", u_low),
+            "current_project": ustate["current_project"],
+            "project_path": f"/sdcard/DNA/{ustate['current_project']}",
+            "projects": projects,
+            "img_files": img_files,
+            "unpacked_parts": unpacked_parts,
+            "zst_files": zst_files,
+            "dat_br_files": dat_br_files,
+            "logs": ustate["logs"][-80:]
+        }
+
     @router.post("/project")
     def api_dna_project(action: str = Form(...), name: str = Form(""), x_dna_token: Optional[str] = Header(None)):
         u_low = _current_user(x_dna_token)
@@ -2102,6 +2215,252 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         _spawn(_worker, tid, heavy=False)
         return {"ok": True, "task_id": tid}
 
+    def _unpack_super_internal(u_low: str, proj_dir: str, super_filename: str, delete_source: bool = False, tid: str = None):
+        from app import parse_lp, ExpandedReader, Stream, extract_from_super
+        src_p = safe_join(proj_dir, super_filename)
+        if not os.path.isfile(src_p):
+            raise Exception(f"'{super_filename}' not found in project.")
+        with open(src_p, "rb") as fp:
+            reader = ExpandedReader(Stream(fp, seek_ok=True), os.path.getsize(src_p))
+            head = bytearray(HEAD_BYTES)
+            for off, d in reader.pieces():
+                if off < HEAD_BYTES:
+                    n = min(len(d), HEAD_BYTES - off)
+                    head[off:off + n] = d[:n]
+                if off + len(d) >= HEAD_BYTES:
+                    break
+            parts = parse_lp(bytes(head))
+
+        active_parts = [pname for pname, exts in parts.items() if sum(e[1] for e in exts) > 0 and not pname.endswith("_b")]
+        tmp_id = "dna_super"
+        jobs_dict[tmp_id] = {"cancel": False, "logs": [], "search_progress": 0, "cont_progress": 0, "ext_progress": 0, "fin_progress": 0, "chunks_verified": 0}
+        for idx_p, pname in enumerate(active_parts, 1):
+            clean_out = re.sub(r"_a$", "", pname) + ".img"
+            if tid:
+                set_bg_task(tid, int(10 + (idx_p / max(1, len(active_parts))) * 85), f"Unpacking '{clean_out}' ({idx_p}/{len(active_parts)}) from {super_filename}...")
+            out_p = os.path.join(proj_dir, clean_out)
+            tmp_p = out_p + ".part"
+            safe_remove(tmp_p)
+            try:
+                with open(src_p, "rb") as fp:
+                    extract_from_super(tmp_id, Stream(fp, seek_ok=True), pname, tmp_p, os.path.getsize(src_p), super_filename)
+                if not os.path.exists(tmp_p) or os.path.getsize(tmp_p) == 0:
+                    raise Exception(f"'{clean_out}' came out empty.")
+                os.replace(tmp_p, out_p)
+            except Exception:
+                safe_remove(tmp_p)
+                raise
+            dna_log(u_low, "UNPACK", f"Extracted '{clean_out}' from {super_filename}")
+            hf_autosave(u_low, proj_dir, clean_out)
+            drop_cache(out_p)
+            free_ram()
+
+        jobs_dict.pop(tmp_id, None)
+        del head, parts
+        free_ram()
+        if delete_source and os.path.exists(src_p):
+            os.remove(src_p)
+
+    @router.post("/unpack")
+    def api_dna_unpack(
+        mode: str = Form(...),
+        files: str = Form(""),
+        delete_source: bool = Form(False),
+        x_dna_token: Optional[str] = Header(None)
+    ):
+        u_low = _current_user(x_dna_token)
+        proj_dir = get_proj_dir(u_low)
+        selected = [x.strip() for x in files.split(",") if x.strip()]
+        if not selected and mode not in ("super", "payload"):
+            raise HTTPException(status_code=400, detail="Please select at least one file.")
+
+        tid = create_bg_task(f"Starting unpack ({mode})...")
+
+        def _worker():
+            try:
+                if mode == "img":
+                    for i, fn in enumerate(selected, 1):
+                        set_bg_task(tid, int((i - 0.8) / len(selected) * 90), f"Unpacking {fn} ({i}/{len(selected)})...")
+                        fmt = detect_img_type(safe_join(proj_dir, fn))
+                        if fmt.startswith("super"):
+                            _unpack_super_internal(u_low, proj_dir, fn, delete_source, tid)
+                        else:
+                            unpack_single_img_file(u_low, proj_dir, fn, delete_source, tid)
+                        free_ram()
+                elif mode == "super":
+                    _unpack_super_internal(u_low, proj_dir, selected[0] if selected else "super.img", delete_source, tid)
+                elif mode == "zstd":
+                    for fn in selected:
+                        set_bg_task(tid, 40, f"Decompressing zstd '{fn}'...")
+                        src = safe_join(proj_dir, fn)
+                        out_name = re.sub(r"\.zst$", "", fn, flags=re.I)
+                        if out_name == fn:
+                            out_name += ".img"
+                        dst = safe_join(proj_dir, out_name)
+                        with open(src, "rb") as fin, open(dst + ".part", "wb") as fout:
+                            zstd.ZstdDecompressor().copy_stream(fin, fout, read_size=1 * MB, write_size=1 * MB)
+                        os.replace(dst + ".part", dst)
+                        free_ram()
+                        if delete_source:
+                            os.remove(src)
+                        dna_log(u_low, "SUCCESS", f"Unpacked zstd '{fn}' → '{out_name}'")
+                elif mode == "br":
+                    for fn in selected:
+                        set_bg_task(tid, 40, f"Decompressing brotli '{fn}'...")
+                        src = safe_join(proj_dir, fn)
+                        out_name = re.sub(r"\.br$", "", fn, flags=re.I)
+                        dst = safe_join(proj_dir, out_name)
+                        brotli_decompress_file(src, dst)
+                        if delete_source:
+                            os.remove(src)
+                        dna_log(u_low, "SUCCESS", f"Unpacked brotli '{fn}' → '{out_name}'")
+                elif mode == "dat":
+                    for fn in selected:
+                        set_bg_task(tid, 45, f"Converting '{fn}' to raw .img...")
+                        dat_p = safe_join(proj_dir, fn)
+                        prefix = re.sub(r"\.new\.dat$", "", fn, flags=re.I)
+                        tl_p = safe_join(proj_dir, f"{prefix}.transfer.list")
+                        if not os.path.exists(tl_p):
+                            raise Exception(f"Missing {prefix}.transfer.list in project.")
+                        sdat2img_convert(tl_p, dat_p, safe_join(proj_dir, f"{prefix}.img"))
+                        dna_log(u_low, "SUCCESS", f"Converted '{fn}' → '{prefix}.img'")
+                elif mode == "payload":
+                    from app import extract_from_payload, Stream
+                    target_pl = selected[0] if selected else "payload.bin"
+                    pl_path = safe_join(proj_dir, target_pl)
+                    parts_list = ("boot", "init_boot", "vendor_boot", "dtbo", "vbmeta", "system", "vendor", "product", "system_ext", "odm")
+                    got = 0
+                    tmp_id = "dna_pl"
+                    for idx_p, p_to_ext in enumerate(parts_list, 1):
+                        set_bg_task(tid, int(idx_p / len(parts_list) * 90), f"Scanning payload.bin for '{p_to_ext}'...")
+                        out_p = os.path.join(proj_dir, f"{p_to_ext}.img")
+                        tmp_p = out_p + ".part"
+                        safe_remove(tmp_p)
+                        try:
+                            jobs_dict[tmp_id] = {"cancel": False, "logs": [], "search_progress": 0, "cont_progress": 0, "ext_progress": 0, "fin_progress": 0, "chunks_verified": 0}
+                            with open(pl_path, "rb") as fp:
+                                extract_from_payload(tmp_id, Stream(fp, seek_ok=True), p_to_ext, tmp_p)
+                            if os.path.exists(tmp_p) and os.path.getsize(tmp_p) > 0:
+                                os.replace(tmp_p, out_p)
+                                got += 1
+                                dna_log(u_low, "SUCCESS", f"Extracted '{p_to_ext}.img' from payload.bin")
+                                hf_autosave(u_low, proj_dir, f"{p_to_ext}.img")
+                            else:
+                                safe_remove(tmp_p)
+                                dna_log(u_low, "WARN", f"'{p_to_ext}' not present in payload.bin")
+                        except Exception as e:
+                            safe_remove(tmp_p)
+                            dna_log(u_low, "WARN", f"'{p_to_ext}' skipped: {e}")
+                        jobs_dict.pop(tmp_id, None)
+                        free_ram()
+                    if got == 0:
+                        raise Exception("No partitions could be extracted from payload.bin (file corrupt or unsupported).")
+                BG_TASKS[tid].update({"pct": 100, "label": f"Unpack ({mode}) complete ✓", "state": "done"})
+            except Exception as e:
+                BG_TASKS[tid].update({"state": "error", "error": str(e)})
+                dna_log(u_low, "ERROR", f"Unpack error: {e}")
+
+        _spawn(_worker, tid, heavy=True)
+        return {"ok": True, "task_id": tid}
+
+    @router.post("/pack_single")
+    def api_dna_pack_single(req: PackSingleRequest, x_dna_token: Optional[str] = Header(None)):
+        u_low = _current_user(x_dna_token)
+        tid = create_bg_task(f"Packing '{req.partition}' ({req.pack_type.upper()})...")
+
+        def _worker():
+            try:
+                res = pack_single_partition_worker(u_low, req, tid)
+                BG_TASKS[tid].update({"pct": 100, "label": f"Packed {res['output_file']} ({res['size_mb']}) ✓", "state": "done"})
+            except Exception as e:
+                BG_TASKS[tid].update({"state": "error", "error": str(e)})
+                dna_log(u_low, "ERROR", f"Pack error: {e}")
+
+        _spawn(_worker, tid, heavy=True)
+        return {"ok": True, "task_id": tid}
+
+    @router.post("/pack_zstd")
+    def api_dna_pack_zstd(filename: str = Form(...), level: int = Form(6), x_dna_token: Optional[str] = Header(None)):
+        u_low = _current_user(x_dna_token)
+        proj_dir = get_proj_dir(u_low)
+        tid = create_bg_task(f"Compressing '{filename}' to .zst...")
+
+        def _worker():
+            try:
+                src = safe_join(proj_dir, filename)
+                dst = safe_join(proj_dir, f"{filename}.zst")
+                set_bg_task(tid, 45, f"Compressing {filename} (level {level})...")
+                with open(src, "rb") as fin, open(dst + ".part", "wb") as fout:
+                    zstd.ZstdCompressor(level=max(1, min(19, int(level)))).copy_stream(fin, fout, read_size=1 * MB, write_size=1 * MB)
+                os.replace(dst + ".part", dst)
+                sz = os.path.getsize(dst) / MB
+                BG_TASKS[tid].update({"pct": 100, "label": f"Packed {filename}.zst ({sz:.2f} MB) ✓", "state": "done"})
+                dna_log(u_low, "SUCCESS", f"Packed '{filename}.zst' ({sz:.2f} MB)")
+                hf_autosave(u_low, proj_dir, f"{filename}.zst")
+            except Exception as e:
+                BG_TASKS[tid].update({"state": "error", "error": str(e)})
+
+        _spawn(_worker, tid, heavy=True)
+        return {"ok": True, "task_id": tid}
+
+    @router.post("/pack_super")
+    def api_dna_pack_super(req: PackSuperRequest, x_dna_token: Optional[str] = Header(None)):
+        u_low = _current_user(x_dna_token)
+        tid = create_bg_task("Building super.img...")
+
+        def _worker():
+            try:
+                res = build_super_image(u_low, req, tid)
+                BG_TASKS[tid].update({"pct": 100, "label": f"Built super.img ({res['size_mb']}) ✓", "state": "done"})
+            except Exception as e:
+                BG_TASKS[tid].update({"state": "error", "error": str(e)})
+                dna_log(u_low, "ERROR", f"super.img build error: {e}")
+
+        _spawn(_worker, tid, heavy=True)
+        return {"ok": True, "task_id": tid}
+
+    @router.post("/convert")
+    def api_dna_convert(mode: str = Form(...), filename: str = Form(...), br_level: int = Form(3), x_dna_token: Optional[str] = Header(None)):
+        u_low = _current_user(x_dna_token)
+        proj_dir = get_proj_dir(u_low)
+        src = safe_join(proj_dir, filename)
+        if not os.path.isfile(src):
+            raise HTTPException(status_code=404, detail="Source image not found.")
+        stem = re.sub(r"\.(img|simg)$", "", filename, flags=re.I)
+        tid = create_bg_task(f"Converting '{filename}' ({mode})...")
+
+        def _worker():
+            try:
+                if mode == "img_to_simg":
+                    if is_sparse_file(src):
+                        out_name = f"{stem}_raw.img"
+                        set_bg_task(tid, 45, f"Converting Sparse '{filename}' → Raw '{out_name}'...")
+                        sparse_to_raw(src, safe_join(proj_dir, out_name))
+                        dna_log(u_low, "SUCCESS", f"Converted Sparse '{filename}' → Raw '{out_name}'")
+                    else:
+                        out_name = f"{stem}_sparse.img"
+                        set_bg_task(tid, 45, f"Converting Raw '{filename}' → Sparse '{out_name}'...")
+                        raw_to_sparse(src, safe_join(proj_dir, out_name))
+                        dna_log(u_low, "SUCCESS", f"Converted Raw '{filename}' → Android Sparse '{out_name}'")
+                    BG_TASKS[tid].update({"pct": 100, "label": f"Created {out_name} ✓", "state": "done"})
+                elif mode == "img_to_dat_br":
+                    set_bg_task(tid, 35, f"Converting '{filename}' → '{stem}.new.dat'...")
+                    dat_p, _tl_p = img2sdat_convert(src, proj_dir, stem)
+                    br_p = f"{dat_p}.br"
+                    lvl = max(0, min(11, int(br_level)))
+                    set_bg_task(tid, 70, f"Compressing '{stem}.new.dat.br' (level {lvl})...")
+                    brotli_compress_file(dat_p, br_p, lvl)
+                    safe_remove(dat_p)
+                    hf_autosave(u_low, proj_dir, f"{stem}.new.dat.br")
+                    hf_autosave(u_low, proj_dir, f"{stem}.transfer.list")
+                    dna_log(u_low, "SUCCESS", f"Converted '{filename}' → '{stem}.new.dat.br'")
+                    BG_TASKS[tid].update({"pct": 100, "label": f"Created {stem}.new.dat.br ✓", "state": "done"})
+            except Exception as e:
+                BG_TASKS[tid].update({"state": "error", "error": str(e)})
+                dna_log(u_low, "ERROR", f"Conversion failed: {e}")
+
+        _spawn(_worker, tid, heavy=True)
+        return {"ok": True, "task_id": tid}
 
     # ---------------- MT MANAGER DUAL-PANE ENDPOINTS ---------------- #
 
@@ -2132,11 +2491,6 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
     def api_fs_list(path: str = "", x_dna_token: Optional[str] = Header(None)):
         u_low = _current_user(x_dna_token)
         u_root = get_user_root(u_low)
-        
-        parts = [p for p in path.replace("\\", "/").split("/") if p]
-        if parts:
-            proj_dir = get_proj_dir(u_low, parts[0])
-            
         target_dir = safe_join(u_root, path)
         if not os.path.exists(target_dir) or not os.path.isdir(target_dir):
             target_dir = u_root
@@ -2189,27 +2543,6 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                 "gid": meta["gid"],
                 "selinux": ctx
             })
-
-        
-        if room_enabled():
-            try:
-                u_key = _uclean(u_low)
-                parts = [p for p in rel_from_user.split("/") if p]
-                if len(parts) == 1:
-                    proj = parts[0]
-                    fpre = f"rooms/{u_key}/{proj}/files/"
-                    tpre = f"rooms/{u_key}/{proj}/trees/"
-                    for rf in hf_list_cached():
-                        if rf.startswith(fpre):
-                            fn = rf[len(fpre):]
-                            if "/" not in fn and not any(i["name"] == fn for i in items):
-                                items.append({"name": fn, "rel_path": f"{proj}/{fn}", "parent_display": f"/data/DNA/{proj}/", "is_dir": False, "is_link": False, "link_target": "", "size": 0, "size_str": "☁️ Cloud", "size_full": "Stored securely in HF Vault", "mtime": "Now", "mtime_full": "Now", "mode": "0644", "short_octal": "644", "sym_perm": "-rw-r--r--", "uid": "0", "gid": "0", "selinux": "u:object_r:system_file:s0"})
-                        elif rf.startswith(tpre) and rf.endswith(".tar.zst"):
-                            tname = rf[len(tpre):-8]
-                            if tname != "config" and not any(i["name"] == tname for i in items):
-                                items.append({"name": tname, "rel_path": f"{proj}/{tname}", "parent_display": f"/data/DNA/{proj}/", "is_dir": True, "is_link": False, "link_target": "", "size": 0, "size_str": "☁️ Cloud", "size_full": "Stored securely in HF Vault", "mtime": "Now", "mtime_full": "Now", "mode": "0755", "short_octal": "755", "sym_perm": "drwxr-xr-x", "uid": "0", "gid": "0", "selinux": "u:object_r:system_file:s0"})
-            except Exception:
-                pass
 
         total_disk, _used, free_disk = shutil.disk_usage(u_root)
         disk_str = f"Folders: {dir_count}  Files: {file_count}  Free: {free_disk / (1024**3):.2f}G/{total_disk / (1024**3):.2f}G"
@@ -2437,6 +2770,46 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                 "server_started": PROC_START.strftime("%Y-%m-%d %H:%M:%S"),
                 "uptime_s": int((datetime.now() - PROC_START).total_seconds()), "memory": mem_stats()}
 
+    @router.post("/dispatch_worker")
+    def api_dispatch_worker(
+        target_file: str = Form(...),
+        action: str = Form("unpack_img"),
+        project: str = Form("Default_Project"),
+        x_dna_token: Optional[str] = Header(None)
+    ):
+        u_low = resolve_user_from_token(x_dna_token)
+        gh_token = os.environ.get("GH_DISPATCH_TOKEN")
+        if not gh_token:
+            raise HTTPException(status_code=500, detail="Missing GH_DISPATCH_TOKEN in Render environment.")
+
+        url = "https://api.github.com/repos/really-yash/Fce-tools/actions/workflows/worker.yml/dispatches"
+        headers = {
+            "Authorization": f"Bearer {gh_token}",
+            "Accept": "application/vnd.github.v3+json",
+            "X-GitHub-Api-Version": "2022-11-28"
+        }
+        payload = {
+            "ref": "main",
+            "inputs": {
+                "action": action,
+                "project": project,
+                "target_file": target_file
+            }
+        }
+        
+        res = requests.post(url, headers=headers, json=payload, timeout=15)
+        if res.status_code != 204:
+            raise HTTPException(
+                status_code=500, 
+                detail=f"GitHub dispatch failed ({res.status_code}): {res.text}"
+            )
+
+        dna_log(u_low, "WORKER", f"Dispatched 7GB RAM runner on GitHub for '{target_file}' ✓")
+        return {
+            "ok": True, 
+            "message": f"Successfully launched heavy compute runner for {target_file}. Check your GitHub Actions tab!"
+        }
+
     app.include_router(router)
     return inject_dna_ui(html_page)
 
@@ -2520,7 +2893,6 @@ DNA_TAB_HTML = r"""
           <div id="dnaAuthErr" class="hidden text-xs mono text-rose-300 bg-rose-500/10 border border-rose-500/30 p-2.5 rounded-xl"></div>
           <div class="grid grid-cols-2 gap-2.5 pt-1">
             <button type="button" onclick="dnaAuthSubmit('login')" class="btn rip py-3 rounded-2xl font-bold text-xs text-slate-950 bg-gradient-to-r from-violet-400 to-amber-300">🔑 Sign In</button>
-            <button type="button" onclick="dnaAuthSubmit('signup')" class="btn rip py-3 rounded-2xl font-bold text-xs text-violet-200 bg-violet-500/20 border border-violet-400/40">✨ Create Account</button>
           </div>
         </div>
       </div>
@@ -2588,6 +2960,12 @@ DNA_TAB_HTML = r"""
               <button type="button" onclick="openUnpackModal('img')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition"><span>Unpack img</span><span class="text-slate-500">&gt;</span></button>
               <button type="button" onclick="openUnpackModal('zstd')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition"><span>Unpack zstd</span><span class="text-slate-500">&gt;</span></button>
               <button type="button" onclick="openUnpackModal('super')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition"><span>Unpack super</span><span class="text-slate-500">&gt;</span></button>
+              
+              <!-- ADD THIS NEW BUTTON HERE -->
+              <button type="button" onclick="dispatchHeavyWorker()" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition text-amber-300 font-bold">
+                <span>⚡ Unpack with 7GB Cloud Worker (GitHub)</span>
+                <span class="text-slate-500">&gt;</span>
+              </button>
             </div>
           </div>
 
@@ -3041,6 +3419,33 @@ DNA_TAB_HTML = r"""
       const low = String(name || "").toLowerCase();
       return extList.some(ext => low.endsWith("." + ext));
     }
+
+    async function dispatchHeavyWorker() {
+  const file = prompt("Enter the exact partition filename in your project to unpack (e.g., system_ext.img):");
+  if (!file) return;
+
+  showTaskProgress("Dispatching 7GB GitHub worker for " + file + "...", 15);
+  const fd = new FormData();
+  fd.append("target_file", file.trim());
+  fd.append("action", "unpack_img");
+  fd.append("project", dnaState.current_project || "Default_Project");
+
+  try {
+    const res = await fetch("/api/dna/dispatch_worker", {
+      method: "POST",
+      headers: dnaHeaders(),
+      body: fd
+    });
+    const data = await res.json();
+    hideTaskProgress();
+    if (!res.ok) throw new Error(data.detail || "Dispatch failed");
+    toast(data.message, "ok");
+    refreshDnaState();
+  } catch (e) {
+    hideTaskProgress();
+    toast(e.message, "bad");
+  }
+}
 
 
     /* ---------- AUTH & ADMIN ---------- */
