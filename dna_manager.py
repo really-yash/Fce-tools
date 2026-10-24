@@ -11,6 +11,7 @@ import gc
 import ctypes
 import tempfile
 import tarfile
+import traceback
 import hashlib
 import threading
 import subprocess
@@ -383,6 +384,8 @@ ROOM_LOCK = threading.Lock()
 ROOM_DIRTY = {}
 ROOM_RESTORED = set()
 ROOM_BOOTED = set()
+ROOM_TOMB = {}
+ROOM_SYNC = {"last": {}, "busy": set()}
 ROOM_THREADS = []
 _HF_LIST = {"t": 0.0, "v": []}
 
@@ -399,58 +402,101 @@ def hf_list_cached(max_age=8.0, force=False):
         _HF_LIST["t"] = time.time()
     return _HF_LIST["v"]
 
-PULL_RESULTS = os.environ.get("DNA_PULL_RESULTS", "1") == "1"
+PULL_RESULTS = os.environ.get("DNA_PULL_RESULTS", "0") == "1"   # 0 = lazy cloud mode (default)
 
-def room_pull_results(u, proj_dir, proj, since, tid=None) -> list:
-    """After a GitHub job: copy every file/folder that job created or changed from the HF room into the
-    local project, so the Manager / DNA lists show them exactly like before."""
+def _tombed(u, proj, kind, name):
+    now = time.time()
+    for k, t in list(ROOM_TOMB.items()):
+        if now - t > 180:
+            ROOM_TOMB.pop(k, None)
+    key = _uclean(u)
+    return (key, proj, kind, name) in ROOM_TOMB or (key, proj, "*", "*") in ROOM_TOMB
+
+def room_pull_results(u, proj_dir, proj, since=None, tid=None) -> list:
+    """Copy items from the HF room into the local project so Manager/DNA show them.
+    since=None  -> everything that is missing locally.
+    since=<dt>  -> also everything a GitHub job created/changed after that time (replaces stale copies)."""
     if not (PULL_RESULTS and room_enabled()):
         return []
     from huggingface_hub import hf_hub_download
     key = _uclean(u)
     base = f"rooms/{key}/{proj}/"
-    files = [f for f in hf_list_cached(force=True) if f.startswith(base)]
+    files = [f for f in hf_list_cached(force=since is not None) if f.startswith(base)]
     if not files:
         return []
-    fresh = set()
-    try:
-        for info in HF_API_REF.get_paths_info(repo_id=DATASET_REPO_REF, paths=files, repo_type="dataset", expand=True):
-            lc = getattr(info, "last_commit", None)
-            d = getattr(lc, "date", None)
-            if d is not None and d >= since:
-                fresh.add(info.path)
-    except Exception:
-        fresh = None   # fallback: only things missing locally
+    fresh = None
+    if since is not None:
+        fresh = set()
+        try:
+            for info in HF_API_REF.get_paths_info(repo_id=DATASET_REPO_REF, paths=files, repo_type="dataset", expand=True):
+                lc = getattr(info, "last_commit", None)
+                d = getattr(lc, "date", None)
+                if d is not None and d >= since:
+                    fresh.add(info.path)
+        except Exception as e:
+            print("get_paths_info failed, using 'missing only' mode:", e)
+            fresh = None
     todo = []
     for f in files:
-        rel = f[len(base):]
-        kind, _, name = rel.partition("/")
+        kind, _, name = f[len(base):].partition("/")
+        if not name or name.endswith(".part"):
+            continue
+        is_fresh = fresh is not None and f in fresh
         if kind == "trees" and name.endswith(".tar.zst"):
             top = name[:-8]
             d = os.path.join(proj_dir, top)
-            missing = not (os.path.isdir(d) and os.listdir(d))
-            if (fresh is not None and f in fresh) or (fresh is None and missing):
+            if (is_fresh or not (os.path.isdir(d) and os.listdir(d))) and not _tombed(u, proj, "trees", name):
                 todo.append(("tree", top, f))
-        elif kind == "files" and name:
-            out = os.path.join(proj_dir, name)
-            if (fresh is not None and f in fresh) or (fresh is None and not os.path.exists(out)):
+        elif kind == "files":
+            if (is_fresh or not os.path.exists(os.path.join(proj_dir, name))) and not _tombed(u, proj, "files", name):
                 todo.append(("file", name, f))
-    got = []
+    got, errs = [], []
     for i, (kind, name, f) in enumerate(todo, 1):
         if tid:
             set_bg_task(tid, min(98, 93 + i), f"Copying '{name}' into your Manager ({i}/{len(todo)})...")
-        if kind == "tree":
-            room_restore_tree(u, proj_dir, name)
-        else:
-            out = safe_join(proj_dir, name)
-            os.makedirs(os.path.dirname(out), exist_ok=True)
-            with tempfile.TemporaryDirectory(dir=TASKS_TMP_DIR) as td:
-                p = hf_hub_download(repo_id=DATASET_REPO_REF, filename=f, repo_type="dataset", token=HF_TOKEN_REF, local_dir=td)
-                shutil.move(p, out + ".part")
-            os.replace(out + ".part", out)
-        got.append(name)
+        try:
+            if kind == "tree":
+                room_restore_tree(u, proj_dir, name)
+            else:
+                out = safe_join(proj_dir, name)
+                os.makedirs(os.path.dirname(out), exist_ok=True)
+                with tempfile.TemporaryDirectory(dir=TASKS_TMP_DIR) as td:
+                    p = hf_hub_download(repo_id=DATASET_REPO_REF, filename=f, repo_type="dataset", token=HF_TOKEN_REF, local_dir=td)
+                    shutil.move(p, out + ".part")
+                os.replace(out + ".part", out)
+            got.append(name)
+        except Exception as e:
+            traceback.print_exc()
+            errs.append(f"{name}: {e}")
+            dna_log(u, "ERROR", f"Could not copy '{name}' from HF room: {e}")
         free_ram()
+    if errs and not got:
+        raise Exception("; ".join(errs)[:300])
     return got
+
+def room_sync_async(u, proj_dir, force=False, gap=20.0):
+    """Background, throttled: bring anything that exists in the HF room but not locally into the Manager."""
+    if not room_enabled():
+        return
+    proj = os.path.basename(proj_dir)
+    key = (_uclean(u), proj)
+    now = time.time()
+    if key in ROOM_SYNC["busy"] or (not force and now - ROOM_SYNC["last"].get(key, 0) < gap):
+        return
+    ROOM_SYNC["last"][key] = now
+    ROOM_SYNC["busy"].add(key)
+
+    def _job():
+        try:
+            got = room_pull_results(u, proj_dir, proj, None)
+            if got:
+                dna_log(u, "SUCCESS", "Synced from your HF room into Manager: " + ", ".join(got))
+        except Exception as e:
+            traceback.print_exc()
+            dna_log(u, "ERROR", f"Room sync failed: {e}")
+        finally:
+            ROOM_SYNC["busy"].discard(key)
+    _bg(_job)
 
 def room_flush_all(timeout=240):
     """Push every pending edit/upload to HF NOW. The GitHub worker reads from HF, so HF must be up to date."""
@@ -552,6 +598,7 @@ def room_mark_dirty(u, proj_dir, top, delay=25):
 def room_delete(u, proj, kind=None, name=None, whole=False):
     if not room_enabled():
         return
+    ROOM_TOMB[(_uclean(u), proj, "*" if whole else kind, "*" if whole else name)] = time.time()
 
     def _w():
         with HF_UP_LOCK:
@@ -630,6 +677,8 @@ def room_bootstrap(u):
         pass
 
 def room_restore_async(u, proj_dir):
+    if os.environ.get("DNA_EAGER_RESTORE", "0") != "1":
+        return   # lazy cloud mode: folders are fetched from the HF room only when you open them
     proj = os.path.basename(proj_dir)
     key = (_uclean(u), proj)
     if key in ROOM_RESTORED or not room_enabled():
@@ -671,6 +720,98 @@ def room_restore_async(u, proj_dir):
             ROOM_RESTORED.discard(key)
             dna_log(u, "ERROR", f"Room restore failed: {e}")
     _spawn(_job, None, heavy=True)
+
+# ---------------- CLOUD-FIRST MANAGER: HF room items show up instantly, downloaded only when opened ---------------- #
+
+CLOUD_WAIT = float(os.environ.get("DNA_CLOUD_WAIT", "90"))
+ROOM_FETCHING = {}
+
+def room_cloud_index(u, proj):
+    out = {"trees": set(), "files": set()}
+    if not room_enabled():
+        return out
+    try:
+        base = f"rooms/{_uclean(u)}/{proj}/"
+        for f in hf_list_cached():
+            if not f.startswith(base):
+                continue
+            kind, _, name = f[len(base):].partition("/")
+            if kind == "trees" and name.endswith(".tar.zst") and not _tombed(u, proj, "trees", name):
+                out["trees"].add(name[:-8])
+            elif kind == "files" and name and not name.endswith(".part") and not _tombed(u, proj, "files", name):
+                out["files"].add(name)
+    except Exception as e:
+        print("cloud index failed:", e)
+    return out
+
+def _fetch_item(u, proj_dir, kind, name, wait):
+    proj = os.path.basename(proj_dir)
+    key = (_uclean(u), proj, kind, name)
+
+    def _is_local():
+        p = os.path.join(proj_dir, name)
+        return (os.path.isdir(p) and bool(os.listdir(p))) if kind == "tree" else os.path.isfile(p)
+
+    with ROOM_LOCK:
+        t = ROOM_FETCHING.get(key)
+        if t is None or not t.is_alive():
+            def _job():
+                try:
+                    if kind == "tree":
+                        room_restore_tree(u, proj_dir, name)
+                    else:
+                        from huggingface_hub import hf_hub_download
+                        out = safe_join(proj_dir, name)
+                        os.makedirs(os.path.dirname(out), exist_ok=True)
+                        with tempfile.TemporaryDirectory(dir=TASKS_TMP_DIR) as td:
+                            p = hf_hub_download(repo_id=DATASET_REPO_REF, filename=_rp(u, proj, "files", name),
+                                                repo_type="dataset", token=HF_TOKEN_REF, local_dir=td)
+                            shutil.move(p, out + ".part")
+                        os.replace(out + ".part", out)
+                    dna_log(u, "SUCCESS", f"Opened '{name}' from your HF room ✓")
+                except Exception as e:
+                    traceback.print_exc()
+                    dna_log(u, "ERROR", f"Could not open '{name}' from HF room: {e}")
+                finally:
+                    free_ram()
+            t = threading.Thread(target=_job, daemon=True)
+            ROOM_FETCHING[key] = t
+            t.start()
+    t.join(CLOUD_WAIT if wait is None else wait)
+    return (not t.is_alive()) and _is_local()
+
+def ensure_local(u, u_root, rel, wait=None) -> bool:
+    """If `rel` only exists in the HF room, download it now. True when it is available locally."""
+    parts = [p for p in (rel or "").replace("\\", "/").split("/") if p]
+    if len(parts) < 2 or not room_enabled():
+        return True
+    proj, top = parts[0], parts[1]
+    proj_dir = os.path.join(u_root, proj)
+    top_dir = os.path.join(proj_dir, top)
+    full = os.path.join(proj_dir, *parts[1:])
+    top_empty_dir = os.path.isdir(top_dir) and not os.listdir(top_dir)
+    if os.path.lexists(full) and not top_empty_dir:
+        return True
+    idx = room_cloud_index(u, proj)
+    if top in idx["trees"] and (not os.path.lexists(top_dir) or top_empty_dir):
+        return _fetch_item(u, proj_dir, "tree", top, wait)
+    name = "/".join(parts[1:])
+    if not os.path.lexists(full) and name in idx["files"]:
+        return _fetch_item(u, proj_dir, "file", name, wait)
+    return True
+
+def _cloud_item(rel_item, name, is_dir):
+    return {"name": name, "rel_path": rel_item, "parent_display": f"/data/DNA/{os.path.dirname(rel_item)}/".replace("//", "/"),
+            "is_dir": is_dir, "is_link": False, "link_target": "", "size": 0, "size_str": "☁ cloud",
+            "size_full": "☁ stored in your HF room (downloads when you open it)", "mtime": "☁ HF room", "mtime_full": "☁ HF room",
+            "mode": "0755" if is_dir else "0644", "short_octal": "755" if is_dir else "644",
+            "sym_perm": "drwxr-xr-x" if is_dir else "-rw-r--r--", "uid": "0", "gid": "0", "selinux": "u:object_r:system_file:s0"}
+
+def _cloud_wait_response(u_root, path):
+    projects = sorted([d for d in os.listdir(u_root) if os.path.isdir(os.path.join(u_root, d))])
+    return {"current_rel": path, "display_path": f"/data/DNA/{path}/".replace("//", "/"),
+            "stats_line": "☁ Downloading from your HF room... tap ⟳ in a moment", "projects": projects,
+            "items": [_cloud_item(path.rstrip("/") + "/__downloading__", "⏳ downloading from HF room... tap ⟳", False)]}
 
 def _spawn(fn, tid=None, heavy=True):
     """Run a worker thread: one heavy job at a time, always free RAM at the end, never leave a task stuck."""
@@ -1942,8 +2083,9 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                             if run_id is None and time.time() - t0 > 150:
                                 _fail("GitHub accepted the dispatch but no run appeared. Check worker.yml has 'run-name' and the 'task_id' input, and that Actions is enabled.")
                                 return
-                except Exception:
-                    pass
+                except Exception as e:
+                    print("GH poll error:", e)
+                    traceback.print_exc()
                 time.sleep(5)
             _fail("Worker timed out in HUD (check the GitHub Actions tab).")
 
@@ -2154,6 +2296,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         room_bootstrap(u_low)
         proj_dir = get_proj_dir(u_low, project)
         room_restore_async(u_low, proj_dir)
+        room_sync_async(u_low, proj_dir)
         projects = sorted([d for d in os.listdir(u_root) if os.path.isdir(os.path.join(u_root, d))])
 
         img_files, unpacked_parts, zst_files, dat_br_files = [], [], [], []
@@ -2553,6 +2696,8 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
     def api_fs_list(path: str = "", x_dna_token: Optional[str] = Header(None)):
         u_low = _current_user(x_dna_token)
         u_root = get_user_root(u_low)
+        if path and not ensure_local(u_low, u_root, path):
+            return _cloud_wait_response(u_root, path)
         target_dir = safe_join(u_root, path)
         if not os.path.exists(target_dir) or not os.path.isdir(target_dir):
             target_dir = u_root
@@ -2606,6 +2751,15 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                 "selinux": ctx
             })
 
+        if rel_from_user and "/" not in rel_from_user:
+            idx = room_cloud_index(u_low, rel_from_user)
+            have = {i["name"] for i in items}
+            for t_name in sorted(idx["trees"] - have):
+                items.append(_cloud_item(f"{rel_from_user}/{t_name}", t_name, True))
+                dir_count += 1
+            for f_name in sorted(n for n in idx["files"] if "/" not in n and n not in have):
+                items.append(_cloud_item(f"{rel_from_user}/{f_name}", f_name, False))
+                file_count += 1
         total_disk, _used, free_disk = shutil.disk_usage(u_root)
         disk_str = f"Folders: {dir_count}  Files: {file_count}  Free: {free_disk / (1024**3):.2f}G/{total_disk / (1024**3):.2f}G"
         projects = sorted([d for d in os.listdir(u_root) if os.path.isdir(os.path.join(u_root, d))])
@@ -2621,6 +2775,8 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
     @router.get("/fs/checksum")
     def api_fs_checksum(path: str, x_dna_token: Optional[str] = Header(None)):
         u_low = _current_user(x_dna_token)
+        if not ensure_local(u_low, get_user_root(u_low), path):
+            raise HTTPException(status_code=409, detail="Still downloading from your HF room. Try again in a minute.")
         fp = safe_join(get_user_root(u_low), path)
         if not os.path.isfile(fp):
             raise HTTPException(status_code=404, detail="File not found.")
@@ -2642,6 +2798,8 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
     @router.get("/fs/read")
     def api_fs_read(path: str, x_dna_token: Optional[str] = Header(None)):
         u_low = _current_user(x_dna_token)
+        if not ensure_local(u_low, get_user_root(u_low), path):
+            raise HTTPException(status_code=409, detail="Still downloading from your HF room. Try again in a minute.")
         fp = safe_join(get_user_root(u_low), path)
         if not os.path.isfile(fp):
             raise HTTPException(status_code=404, detail="File not found.")
@@ -2653,6 +2811,8 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
     @router.post("/fs/write")
     def api_fs_write(path: str = Form(...), content: str = Form(...), x_dna_token: Optional[str] = Header(None)):
         u_low = _current_user(x_dna_token)
+        if not ensure_local(u_low, get_user_root(u_low), path):
+            raise HTTPException(status_code=409, detail="Still downloading from your HF room. Try again in a minute.")
         fp = safe_join(get_user_root(u_low), path)
         os.makedirs(os.path.dirname(fp), exist_ok=True)
         with open(fp, "w", encoding="utf-8") as f:
@@ -2677,6 +2837,18 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         u_root = get_user_root(u_low)
         src_full = safe_join(u_root, src) if src else u_root
         dst_full = safe_join(u_root, dst) if dst else u_root
+        if src and room_enabled():
+            _p = [x for x in src.replace("\\", "/").split("/") if x]
+            if op == "delete" and not os.path.lexists(src_full) and len(_p) == 2:
+                _idx = room_cloud_index(u_low, _p[0])
+                if _p[1] in _idx["trees"]:
+                    room_delete(u_low, _p[0], "trees", _p[1] + ".tar.zst")
+                    return {"ok": True}
+                if _p[1] in _idx["files"]:
+                    room_delete(u_low, _p[0], "files", _p[1])
+                    return {"ok": True}
+            if not ensure_local(u_low, u_root, src) or (dst and not ensure_local(u_low, u_root, dst)):
+                raise HTTPException(status_code=409, detail="Still downloading from your HF room. Try again in a minute.")
         was_dir = os.path.isdir(src_full) and not os.path.islink(src_full)
 
         if op == "copy":
@@ -2818,6 +2990,8 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
     @router.get("/fs/download")
     def api_fs_download(path: str, token: str = ""):
         u_low = resolve_user_from_token(token)
+        if not ensure_local(u_low, get_user_root(u_low), path, wait=600):
+            raise HTTPException(status_code=409, detail="Still downloading from your HF room. Try again in a minute.")
         fp = safe_join(get_user_root(u_low), path)
         if not os.path.isfile(fp):
             raise HTTPException(status_code=404, detail="File not found.")
@@ -2847,6 +3021,16 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         tid = _dispatch_gh_worker(u_low, "unpack", ",".join(names), {"mode": "img", "delete_source": False},
                                   f"Unpacking {', '.join(names)}")
         return {"ok": True, "task_id": tid}
+
+    @router.get("/room_status")
+    def api_room_status(x_dna_token: Optional[str] = Header(None)):
+        u_low = _current_user(x_dna_token)
+        proj = get_user_state(u_low)["current_project"]
+        proj_dir = get_proj_dir(u_low, proj)
+        base = f"rooms/{_uclean(u_low)}/{proj}/"
+        room = [f[len(base):] for f in (hf_list_cached(force=True) if room_enabled() else []) if f.startswith(base)]
+        return {"enabled": room_enabled(), "pull_results": PULL_RESULTS, "project": proj, "base_dir": DNA_BASE_DIR,
+                "in_room": room, "local": sorted(os.listdir(proj_dir))}
 
     app.include_router(router)
     return inject_dna_ui(html_page)
