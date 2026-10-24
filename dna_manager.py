@@ -399,6 +399,59 @@ def hf_list_cached(max_age=8.0, force=False):
         _HF_LIST["t"] = time.time()
     return _HF_LIST["v"]
 
+PULL_RESULTS = os.environ.get("DNA_PULL_RESULTS", "1") == "1"
+
+def room_pull_results(u, proj_dir, proj, since, tid=None) -> list:
+    """After a GitHub job: copy every file/folder that job created or changed from the HF room into the
+    local project, so the Manager / DNA lists show them exactly like before."""
+    if not (PULL_RESULTS and room_enabled()):
+        return []
+    from huggingface_hub import hf_hub_download
+    key = _uclean(u)
+    base = f"rooms/{key}/{proj}/"
+    files = [f for f in hf_list_cached(force=True) if f.startswith(base)]
+    if not files:
+        return []
+    fresh = set()
+    try:
+        for info in HF_API_REF.get_paths_info(repo_id=DATASET_REPO_REF, paths=files, repo_type="dataset", expand=True):
+            lc = getattr(info, "last_commit", None)
+            d = getattr(lc, "date", None)
+            if d is not None and d >= since:
+                fresh.add(info.path)
+    except Exception:
+        fresh = None   # fallback: only things missing locally
+    todo = []
+    for f in files:
+        rel = f[len(base):]
+        kind, _, name = rel.partition("/")
+        if kind == "trees" and name.endswith(".tar.zst"):
+            top = name[:-8]
+            d = os.path.join(proj_dir, top)
+            missing = not (os.path.isdir(d) and os.listdir(d))
+            if (fresh is not None and f in fresh) or (fresh is None and missing):
+                todo.append(("tree", top, f))
+        elif kind == "files" and name:
+            out = os.path.join(proj_dir, name)
+            if (fresh is not None and f in fresh) or (fresh is None and not os.path.exists(out)):
+                todo.append(("file", name, f))
+    got = []
+    for i, (kind, name, f) in enumerate(todo, 1):
+        if tid:
+            set_bg_task(tid, min(98, 93 + i), f"Copying '{name}' into your Manager ({i}/{len(todo)})...")
+        if kind == "tree":
+            room_restore_tree(u, proj_dir, name)
+        else:
+            out = safe_join(proj_dir, name)
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=TASKS_TMP_DIR) as td:
+                p = hf_hub_download(repo_id=DATASET_REPO_REF, filename=f, repo_type="dataset", token=HF_TOKEN_REF, local_dir=td)
+                shutil.move(p, out + ".part")
+            os.replace(out + ".part", out)
+        got.append(name)
+        free_ram()
+    return got
+
 def room_flush_all(timeout=240):
     """Push every pending edit/upload to HF NOW. The GitHub worker reads from HF, so HF must be up to date."""
     with ROOM_LOCK:
@@ -1813,6 +1866,8 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         except Exception as e:
             dna_log(u_low, "WARN", f"Could not fully sync before dispatch: {e}")
 
+        import datetime as _dt
+        since = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=90)
         payload = {"ref": GH_BRANCH, "inputs": {"task_id": tid, "action": action, "username": _uclean(u_low), "project": proj,
                                                  "target_file": target_file, "options": json.dumps({**options, "dataset_repo": DATASET_REPO_REF})}}
         try:
@@ -1858,10 +1913,17 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                                 elif st == "completed":
                                     if conc == "success":
                                         _HF_LIST["t"] = 0.0
-                                        if action == "unpack":
-                                            ROOM_RESTORED.discard((_uclean(u_low), proj))
-                                            room_restore_async(u_low, get_proj_dir(u_low, proj))
-                                        BG_TASKS[tid].update({"pct": 100, "label": f"Completed on GitHub: {label} ✓", "state": "done"})
+                                        note = ""
+                                        try:
+                                            set_bg_task(tid, 94, "GitHub finished. Copying results into your Manager...")
+                                            got = room_pull_results(u_low, get_proj_dir(u_low, proj), proj, since, tid)
+                                            if got:
+                                                dna_log(u_low, "SUCCESS", "Now in your Manager: " + ", ".join(got))
+                                        except Exception as e:
+                                            note = " (result saved to HF, but copying to Manager failed)"
+                                            dna_log(u_low, "ERROR", f"Could not copy result into Manager: {e}")
+                                        ROOM_RESTORED.add((_uclean(u_low), proj))
+                                        BG_TASKS[tid].update({"pct": 100, "label": f"Completed on GitHub: {label} ✓{note}", "state": "done"})
                                         dna_log(u_low, "SUCCESS", f"GitHub 7GB Worker finished: {label} ✓")
                                     else:
                                         step = ""
@@ -2778,37 +2840,13 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         x_dna_token: Optional[str] = Header(None)
     ):
         u_low = resolve_user_from_token(x_dna_token)
-        gh_token = os.environ.get("GH_DISPATCH_TOKEN")
-        if not gh_token:
-            raise HTTPException(status_code=500, detail="Missing GH_DISPATCH_TOKEN in Render environment.")
-
-        url = "https://api.github.com/repos/really-yash/Fce-tools/actions/workflows/worker.yml/dispatches"
-        headers = {
-            "Authorization": f"Bearer {gh_token}",
-            "Accept": "application/vnd.github.v3+json",
-            "X-GitHub-Api-Version": "2022-11-28"
-        }
-        payload = {
-            "ref": "main",
-            "inputs": {
-                "action": action,
-                "project": project,
-                "target_file": target_file
-            }
-        }
-        
-        res = requests.post(url, headers=headers, json=payload, timeout=15)
-        if res.status_code != 204:
-            raise HTTPException(
-                status_code=500, 
-                detail=f"GitHub dispatch failed ({res.status_code}): {res.text}"
-            )
-
-        dna_log(u_low, "WORKER", f"Dispatched 7GB RAM runner on GitHub for '{target_file}' ✓")
-        return {
-            "ok": True, 
-            "message": f"Successfully launched heavy compute runner for {target_file}. Check your GitHub Actions tab!"
-        }
+        get_proj_dir(u_low, project)
+        names = [x.strip() for x in target_file.split(",") if x.strip()]
+        if not names:
+            raise HTTPException(status_code=400, detail="No file given.")
+        tid = _dispatch_gh_worker(u_low, "unpack", ",".join(names), {"mode": "img", "delete_source": False},
+                                  f"Unpacking {', '.join(names)}")
+        return {"ok": True, "task_id": tid}
 
     app.include_router(router)
     return inject_dna_ui(html_page)
@@ -2893,6 +2931,7 @@ DNA_TAB_HTML = r"""
           <div id="dnaAuthErr" class="hidden text-xs mono text-rose-300 bg-rose-500/10 border border-rose-500/30 p-2.5 rounded-xl"></div>
           <div class="grid grid-cols-2 gap-2.5 pt-1">
             <button type="button" onclick="dnaAuthSubmit('login')" class="btn rip py-3 rounded-2xl font-bold text-xs text-slate-950 bg-gradient-to-r from-violet-400 to-amber-300">🔑 Sign In</button>
+            <button type="button" onclick="dnaAuthSubmit('signup')" class="btn rip py-3 rounded-2xl font-bold text-xs text-violet-200 bg-violet-500/20 border border-violet-400/40">✨ Create Account</button>
           </div>
         </div>
       </div>
@@ -3437,10 +3476,8 @@ DNA_TAB_HTML = r"""
       body: fd
     });
     const data = await res.json();
-    hideTaskProgress();
-    if (!res.ok) throw new Error(data.detail || "Dispatch failed");
-    toast(data.message, "ok");
-    refreshDnaState();
+    if (!res.ok) { hideTaskProgress(); throw new Error(data.detail || "Dispatch failed"); }
+    await pollDnaTask(data.task_id);
   } catch (e) {
     hideTaskProgress();
     toast(e.message, "bad");
