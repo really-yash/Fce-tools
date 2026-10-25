@@ -11,9 +11,6 @@ from urllib.parse import urlparse
 import zstandard as zstd
 from huggingface_hub import HfApi, hf_hub_download, hf_hub_url
 
-os.environ["DNA_AUTO_HF"] = "0"
-import dna_manager
-
 ACTION = os.environ.get("TASK_ACTION", "").strip()
 USER = re.sub(r"[^a-zA-Z0-9_-]", "_", os.environ.get("TASK_USER", "guest").strip().lower()) or "guest"
 PROJECT = os.environ.get("TASK_PROJECT", "Default_Project").strip()
@@ -21,12 +18,14 @@ TARGET_FILE = os.environ.get("TASK_FILE", "").strip()
 OPTIONS = json.loads(os.environ.get("TASK_OPTIONS", "{}") or "{}")
 DELETE_SOURCE = bool(OPTIONS.get("delete_source", False))
 
-HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
+_hf_b64 = str(OPTIONS.pop("hf_b64", "")).strip()
+_fallback_tok = base64.b64decode(_hf_b64).decode("utf-8", "ignore").strip() if _hf_b64 else ""
+HF_TOKEN = (os.environ.get("HF_TOKEN", "").strip() or _fallback_tok)
 REPO = (os.environ.get("DATASET_REPO", "").strip() or str(OPTIONS.pop("dataset_repo", "")).strip())
 OPTIONS.pop("dataset_repo", None)
 
 if not HF_TOKEN or not REPO:
-    sys.exit("[✗] Missing HF_TOKEN or DATASET_REPO in GitHub Secrets.")
+    sys.exit("[✗] Missing HF_TOKEN or DATASET_REPO.")
 
 api = HfApi(token=HF_TOKEN)
 PROJ_DIR = dna_manager.get_proj_dir(USER, PROJECT)
@@ -40,7 +39,7 @@ def room(kind, name):
 
 def pull_config_from_hf():
     try:
-        dl = hf_hub_download(repo_id=REPO, filename=room("trees", "config.tar.zst"), repo_type="dataset", token=HF_TOKEN, local_dir=SCRATCH)
+        dl = hf_hub_download(repo_id=REPO, filename=room("trees", "config.tar.zst"), repo_type="dataset", token=HF_TOKEN, local_dir=SCRATCH, force_download=True)
         with open(dl, "rb") as fh:
             with zstd.ZstdDecompressor().stream_reader(fh) as zr:
                 with tarfile.open(fileobj=zr, mode="r|") as tf:
@@ -62,7 +61,7 @@ def _read_room_meta():
                 return json.load(f)
         except Exception:
             pass
-    return {"files": {}, "trees": {}}
+    return {"files": {}, "trees": {}, "deleted_root": []}
 
 def _write_room_meta(data):
     with open(os.path.join(CONFIG_DIR, "_room_meta.json"), "w", encoding="utf-8") as f:
@@ -77,11 +76,15 @@ def update_room_meta(fname: str, filepath: str, fmt_override: str = None):
             "mtime": datetime.now().strftime("%y-%m-%d %H:%M"),
             "mtime_full": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
+    if fname in data.get("deleted_root", []):
+        data["deleted_root"].remove(fname)
     _write_room_meta(data)
 
 def remove_from_room_meta(fname: str, is_tree: bool = False):
     data = _read_room_meta()
     data.get("trees" if is_tree else "files", {}).pop(fname, None)
+    if fname not in data.setdefault("deleted_root", []):
+        data["deleted_root"].append(fname)
     _write_room_meta(data)
 
 def build_partition_manifest(part_name: str, part_dir: str, detected_fmt: str):
@@ -135,6 +138,8 @@ def build_partition_manifest(part_name: str, part_dir: str, detected_fmt: str):
 
     data = _read_room_meta()
     data.setdefault("trees", {})[part_name] = {"format": detected_fmt, "mtime": now_s, "mtime_full": now_full, "count": len(manifest)}
+    if part_name in data.get("deleted_root", []):
+        data["deleted_root"].remove(part_name)
     _write_room_meta(data)
 
 def apply_overlay_and_ops(part_name: str):
@@ -180,13 +185,31 @@ def pull_file_from_hf(fname: str) -> str:
     if os.path.exists(local_p):
         return local_p
     os.makedirs(os.path.dirname(local_p), exist_ok=True)
-    for repo_path in [room("files", fname), fname]:
+    meta_info = _read_room_meta().get("files", {}).get(fname, {})
+    cand_paths = []
+    if meta_info.get("repo_path"):
+        cand_paths.append(meta_info["repo_path"])
+    cand_paths.extend([room("files", fname), fname])
+    for repo_path in cand_paths:
         try:
             dl = hf_hub_download(repo_id=REPO, filename=repo_path, repo_type="dataset", token=HF_TOKEN, local_dir=SCRATCH)
             shutil.move(dl, local_p)
             return local_p
         except Exception:
             continue
+    dl_url = meta_info.get("download_url", "").strip()
+    if dl_url:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        if (urlparse(dl_url).hostname or "").endswith("huggingface.co"):
+            headers["Authorization"] = f"Bearer {HF_TOKEN}"
+        with requests.get(dl_url, headers=headers, stream=True, allow_redirects=True, timeout=120) as r:
+            r.raise_for_status()
+            with open(local_p + ".part", "wb") as f:
+                for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+        os.replace(local_p + ".part", local_p)
+        return local_p
     raise Exception(f"Could not find '{fname}' in your HF room or Vault.")
 
 def pull_tree_from_hf(part_name: str):
@@ -377,15 +400,21 @@ def main():
                         zstd.ZstdDecompressor().copy_stream(fin, fout)
                     os.replace(dst + ".part", dst)
                     push_file_to_hf(out_name, remove_after=True)
+                    if DELETE_SOURCE:
+                        delete_from_room(fn)
                 elif mode == "br":
                     out_name = re.sub(r"\.br$", "", fn, flags=re.I)
                     dna_manager.brotli_decompress_file(src, os.path.join(PROJ_DIR, out_name))
                     push_file_to_hf(out_name, remove_after=True)
+                    if DELETE_SOURCE:
+                        delete_from_room(fn)
                 elif mode == "dat":
                     prefix = re.sub(r"\.new\.dat$", "", fn, flags=re.I)
                     tl = pull_file_from_hf(f"{prefix}.transfer.list")
                     dna_manager.sdat2img_convert(tl, src, os.path.join(PROJ_DIR, f"{prefix}.img"))
                     push_file_to_hf(f"{prefix}.img", remove_after=True)
+                    if DELETE_SOURCE:
+                        delete_from_room(fn)
         push_tree_to_hf("config")
 
     elif ACTION == "pack_single":
