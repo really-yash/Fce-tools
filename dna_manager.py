@@ -19,7 +19,7 @@ import requests
 import zstandard as zstd
 from datetime import datetime
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Header, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 from typing import List, Optional
 
@@ -676,50 +676,31 @@ def room_bootstrap(u):
     except Exception:
         pass
 
-def room_restore_async(u, proj_dir):
-    if os.environ.get("DNA_EAGER_RESTORE", "0") != "1":
-        return   # lazy cloud mode: folders are fetched from the HF room only when you open them
-    proj = os.path.basename(proj_dir)
-    key = (_uclean(u), proj)
-    if key in ROOM_RESTORED or not room_enabled():
-        return
-    ROOM_RESTORED.add(key)
 
-    def _job():
-        try:
-            from huggingface_hub import hf_hub_download
-            files = HF_API_REF.list_repo_files(repo_id=DATASET_REPO_REF, repo_type="dataset")
-            tpre = f"rooms/{key[0]}/{proj}/trees/"
-            fpre = f"rooms/{key[0]}/{proj}/files/"
-            tops = sorted([f[len(tpre):-8] for f in files if f.startswith(tpre) and f.endswith(".tar.zst")], key=lambda x: x != "config")
-            for t in tops:
-                d = os.path.join(proj_dir, t)
-                if os.path.isdir(d) and os.listdir(d):
-                    continue
-                dna_log(u, "ROOM", f"Restoring '{t}/' from your HF room...")
-                try:
-                    room_restore_tree(u, proj_dir, t)
-                    dna_log(u, "SUCCESS", f"Restored '{t}/' from your HF room ✓")
-                except Exception as e:
-                    dna_log(u, "ERROR", f"Restore of '{t}/' failed: {e}")
-            if RESTORE_IMGS:
-                for f in files:
-                    if f.startswith(fpre):
-                        rel = f[len(fpre):]
-                        out = safe_join(proj_dir, rel)
-                        if os.path.exists(out):
-                            continue
-                        dna_log(u, "ROOM", f"Restoring file '{rel}' from your HF room...")
-                        os.makedirs(os.path.dirname(out), exist_ok=True)
-                        with tempfile.TemporaryDirectory(dir=TASKS_TMP_DIR) as td:
-                            p = hf_hub_download(repo_id=DATASET_REPO_REF, filename=f, repo_type="dataset", token=HF_TOKEN_REF, local_dir=td)
-                            shutil.move(p, out + ".part")
-                        os.replace(out + ".part", out)
-                        dna_log(u, "SUCCESS", f"Restored '{rel}' ✓")
-        except Exception as e:
-            ROOM_RESTORED.discard(key)
-            dna_log(u, "ERROR", f"Room restore failed: {e}")
-    _spawn(_job, None, heavy=True)
+def sync_config_only(u, proj_dir):
+    """Pulls ONLY config.tar.zst (~50KB) into proj_dir/config so Render never uses RAM or creates .restore_ folders."""
+    if not room_enabled():
+        return
+    proj = os.path.basename(proj_dir)
+    try:
+        from huggingface_hub import hf_hub_download
+        with tempfile.TemporaryDirectory(dir=TASKS_TMP_DIR) as td:
+            p = hf_hub_download(repo_id=DATASET_REPO_REF, filename=_rp(u, proj, "trees", "config.tar.zst"),
+                                repo_type="dataset", token=HF_TOKEN_REF, local_dir=td, force_download=True)
+            with open(p, "rb") as fh:
+                with zstd.ZstdDecompressor().stream_reader(fh) as zr:
+                    with tarfile.open(fileobj=zr, mode="r|") as tf:
+                        for m in tf:
+                            if m.name.startswith("/") or ".." in m.name.split("/"):
+                                continue
+                            if m.isdir():
+                                m.mode |= 0o700
+                            tf.extract(m, proj_dir)
+    except Exception:
+        pass
+
+def room_restore_async(u, proj_dir):
+    _bg(lambda: sync_config_only(u, proj_dir))
 
 # ---------------- CLOUD-FIRST MANAGER: HF room items show up instantly, downloaded only when opened ---------------- #
 
@@ -1993,101 +1974,61 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         if not gh_token:
             raise HTTPException(status_code=500, detail="Missing GH_DISPATCH_TOKEN in Render Environment.")
         if not room_enabled():
-            raise HTTPException(status_code=500, detail="HF dataset is not configured on Render (HF_TOKEN / DATASET_REPO), the worker needs it.")
+            raise HTTPException(status_code=500, detail="HF_TOKEN / DATASET_REPO not configured on Render.")
 
         ustate = get_user_state(u_low)
         proj = ustate["current_project"]
-        api = f"https://api.github.com/repos/{GH_REPO}/actions"
+        api_url = f"https://api.github.com/repos/{GH_REPO}/actions"
         headers = {"Authorization": f"Bearer {gh_token}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
 
         tid = create_bg_task(f"[GitHub 7GB Worker] {label}")
-        set_bg_task(tid, 5, "Syncing your latest files to HF before starting...")
+        set_bg_task(tid, 5, "Syncing latest changes to HF room...")
         try:
             room_flush_all()
-        except Exception as e:
-            dna_log(u_low, "WARN", f"Could not fully sync before dispatch: {e}")
+        except Exception:
+            pass
 
-        import datetime as _dt
-        since = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=90)
         payload = {"ref": GH_BRANCH, "inputs": {"task_id": tid, "action": action, "username": _uclean(u_low), "project": proj,
-                                                 "target_file": target_file, "options": json.dumps({**options, "dataset_repo": DATASET_REPO_REF})}}
-        try:
-            res = requests.post(f"{api}/workflows/{GH_WORKFLOW}/dispatches", headers=headers, json=payload, timeout=20)
-        except Exception as e:
-            BG_TASKS[tid].update({"state": "error", "error": f"Cannot reach GitHub: {e}"})
-            raise HTTPException(status_code=500, detail=f"Cannot reach GitHub: {e}")
+                                                "target_file": target_file, "options": json.dumps({**options, "dataset_repo": DATASET_REPO_REF})}}
+        res = requests.post(f"{api_url}/workflows/{GH_WORKFLOW}/dispatches", headers=headers, json=payload, timeout=20)
         if res.status_code != 204:
-            hint = {404: f"'{GH_WORKFLOW}' not found on branch '{GH_BRANCH}' of {GH_REPO} (must be .github/workflows/{GH_WORKFLOW}), or the token cannot see the repo.",
-                    401: "GH_DISPATCH_TOKEN is invalid or expired.",
-                    403: "GH_DISPATCH_TOKEN needs 'Actions: Read and write' permission on the repo.",
-                    422: "Workflow inputs mismatch: update worker.yml (it needs the 'task_id' input)."}.get(res.status_code, "")
-            msg = f"GitHub dispatch failed ({res.status_code}). {hint} {res.text[:200]}"
+            msg = f"GitHub dispatch failed ({res.status_code}): {res.text[:200]}"
             BG_TASKS[tid].update({"state": "error", "error": msg})
-            dna_log(u_low, "ERROR", msg)
             raise HTTPException(status_code=500, detail=msg)
 
         dna_log(u_low, "WORKER", f"Dispatched '{action}' for '{target_file}' to GitHub 7GB Server ✓")
-        set_bg_task(tid, 10, f"[GitHub 7GB] Waiting for runner: {label}...")
-
-        def _fail(msg):
-            BG_TASKS[tid].update({"state": "error", "error": msg})
-            dna_log(u_low, "ERROR", msg)
+        set_bg_task(tid, 12, f"[GitHub 7GB] Starting: {label}...")
 
         def _poll_gh():
             t0 = time.time()
-            run_id, run_url, logged = None, "", False
             while time.time() - t0 < 3 * 3600:
                 try:
-                    r = requests.get(f"{api}/workflows/{GH_WORKFLOW}/runs?event=workflow_dispatch&per_page=30", headers=headers, timeout=15)
+                    r = requests.get(f"{api_url}/workflows/{GH_WORKFLOW}/runs?event=workflow_dispatch&per_page=25", headers=headers, timeout=15)
                     if r.status_code == 200:
                         for run in r.json().get("workflow_runs", []):
                             if tid in (run.get("display_title") or "") or tid in (run.get("name") or ""):
-                                run_id, run_url = run["id"], run.get("html_url", "")
                                 st, conc = run.get("status"), run.get("conclusion")
-                                if not logged:
-                                    logged = True
-                                    dna_log(u_low, "WORKER", f"GitHub run started: {run_url}")
                                 if st in ("queued", "waiting", "pending"):
-                                    set_bg_task(tid, 15, f"[GitHub 7GB] Queued: {label}...")
+                                    set_bg_task(tid, 18, f"[GitHub 7GB] Queued: {label}...")
                                 elif st == "in_progress":
-                                    set_bg_task(tid, min(92, int(25 + (time.time() - t0) / 15)), f"[GitHub 7GB] Running: {label}...")
+                                    set_bg_task(tid, min(94, int(25 + (time.time() - t0) * 1.5)), f"[GitHub 7GB] Running: {label}...")
                                 elif st == "completed":
                                     if conc == "success":
+                                        set_bg_task(tid, 98, "Syncing output into Manager...")
                                         _HF_LIST["t"] = 0.0
-                                        note = ""
-                                        try:
-                                            set_bg_task(tid, 94, "GitHub finished. Copying results into your Manager...")
-                                            got = room_pull_results(u_low, get_proj_dir(u_low, proj), proj, since, tid)
-                                            if got:
-                                                dna_log(u_low, "SUCCESS", "Now in your Manager: " + ", ".join(got))
-                                        except Exception as e:
-                                            note = " (result saved to HF, but copying to Manager failed)"
-                                            dna_log(u_low, "ERROR", f"Could not copy result into Manager: {e}")
-                                        ROOM_RESTORED.add((_uclean(u_low), proj))
-                                        BG_TASKS[tid].update({"pct": 100, "label": f"Completed on GitHub: {label} ✓{note}", "state": "done"})
+                                        hf_list_cached(force=True)
+                                        sync_config_only(u_low, get_proj_dir(u_low, proj))
+                                        BG_TASKS[tid].update({"pct": 100, "label": f"Completed: {label} ✓", "state": "done"})
                                         dna_log(u_low, "SUCCESS", f"GitHub 7GB Worker finished: {label} ✓")
                                     else:
-                                        step = ""
-                                        try:
-                                            jr = requests.get(f"{api}/runs/{run_id}/jobs", headers=headers, timeout=15).json()
-                                            for j in jr.get("jobs", []):
-                                                for s in j.get("steps", []):
-                                                    if s.get("conclusion") == "failure":
-                                                        step = f" at step '{s.get('name')}'"
-                                        except Exception:
-                                            pass
-                                        _fail(f"GitHub Worker failed ({conc}){step}. Logs: {run_url}")
+                                        BG_TASKS[tid].update({"state": "error", "error": f"Worker failed ({conc}). See {run.get('html_url', '')}"})
+                                        dna_log(u_low, "ERROR", f"Worker failed ({conc}) for {label}")
                                     return
                                 break
-                        else:
-                            if run_id is None and time.time() - t0 > 150:
-                                _fail("GitHub accepted the dispatch but no run appeared. Check worker.yml has 'run-name' and the 'task_id' input, and that Actions is enabled.")
-                                return
-                except Exception as e:
-                    print("GH poll error:", e)
-                    traceback.print_exc()
-                time.sleep(5)
-            _fail("Worker timed out in HUD (check the GitHub Actions tab).")
+                except Exception:
+                    pass
+                time.sleep(4)
+            BG_TASKS[tid].update({"state": "error", "error": "Worker timed out."})
 
         _bg(_poll_gh)
         return tid
@@ -2102,17 +2043,24 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         x_dna_token: Optional[str] = Header(None)
     ):
         u_low = _current_user(x_dna_token)
-        if project:
+        if dest_rel_dir.strip():
+            first_p = [x for x in dest_rel_dir.replace("\\", "/").split("/") if x]
+            if first_p:
+                get_proj_dir(u_low, first_p[0])
+        elif project:
             get_proj_dir(u_low, project)
-        if "rooms/" in (repo_path + download_url) and f"rooms/{_uclean(u_low)}/" not in (repo_path + download_url):
-            raise HTTPException(status_code=403, detail="That room belongs to another user.")
         safe_name = os.path.basename(target_name.strip())
-        tid = _dispatch_gh_worker(
-            u_low, "import_vault", safe_name,
-            {"download_url": download_url, "repo_path": repo_path, "dest_rel_dir": dest_rel_dir},
-            f"Importing {safe_name}"
-        )
+        tid = _dispatch_gh_worker(u_low, "import_vault", safe_name, {"download_url": download_url, "repo_path": repo_path, "dest_rel_dir": dest_rel_dir}, f"Importing {safe_name}")
         return {"ok": True, "task_id": tid}
+
+    def _get_room_meta(proj_dir: str) -> dict:
+        mp = os.path.join(proj_dir, "config", "_room_meta.json")
+        if os.path.exists(mp):
+            try:
+                return json.load(open(mp, "r", encoding="utf-8"))
+            except Exception:
+                pass
+        return {"files": {}, "trees": {}}
 
     @router.get("/state")
     def api_dna_state(project: Optional[str] = None, x_dna_token: Optional[str] = Header(None)):
@@ -2122,12 +2070,31 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         room_bootstrap(u_low)
         proj_dir = get_proj_dir(u_low, project)
         proj_name = ustate["current_project"]
+        if not os.path.exists(os.path.join(proj_dir, "config", "_room_meta.json")):
+            _bg(lambda: sync_config_only(u_low, proj_dir))
+        rmeta = _get_room_meta(proj_dir)
         projects = sorted([d for d in os.listdir(u_root) if os.path.isdir(os.path.join(u_root, d))])
 
         img_files, unpacked_parts, zst_files, dat_br_files = [], [], [], []
         seen_files, seen_parts = set(), set()
 
-        # 1. Read files & unpacked trees directly from Hugging Face Room (Zero RAM used on Render!)
+        for fn, fmeta in rmeta.get("files", {}).items():
+            seen_files.add(fn)
+            sz_str = f"{fmeta.get('size', 0) / MB:.2f} MB" if fmeta.get("size") else "Cloud"
+            fmt_str = fmeta.get("format", "raw")
+            low = fn.lower()
+            if low.endswith((".img", ".bin", ".simg")):
+                img_files.append({"name": fn, "format": fmt_str, "size": sz_str})
+            elif low.endswith(".zst"):
+                zst_files.append({"name": fn, "size": sz_str})
+            elif low.endswith((".br", ".new.dat", ".transfer.list")):
+                dat_br_files.append({"name": fn, "size": sz_str})
+
+        for tname, tmeta in rmeta.get("trees", {}).items():
+            if tname != "config":
+                seen_parts.add(tname)
+                unpacked_parts.append({"name": tname, "format": tmeta.get("format", "erofs")})
+
         if room_enabled():
             try:
                 u_key = _uclean(u_low)
@@ -2140,7 +2107,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                             seen_files.add(fn)
                             low = fn.lower()
                             if low.endswith((".img", ".bin", ".simg")):
-                                img_files.append({"name": fn, "format": "cloud", "size": "HF Room"})
+                                img_files.append({"name": fn, "format": "img", "size": "HF Room"})
                             elif low.endswith(".zst"):
                                 zst_files.append({"name": fn, "size": "HF Room"})
                             elif low.endswith((".br", ".new.dat", ".transfer.list")):
@@ -2153,8 +2120,9 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
             except Exception:
                 pass
 
-        # 2. Also include any local files in proj_dir
         for entry in sorted(os.listdir(proj_dir)):
+            if entry.startswith(".restore_") or entry.endswith(".part"):
+                continue
             full = os.path.join(proj_dir, entry)
             if os.path.isfile(full) and entry not in seen_files:
                 low = entry.lower()
@@ -2165,7 +2133,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                     zst_files.append({"name": entry, "size": sz})
                 elif low.endswith((".br", ".new.dat", ".transfer.list")):
                     dat_br_files.append({"name": entry, "size": sz})
-            elif os.path.isdir(full) and entry != "config" and not entry.startswith(".restore_") and entry not in seen_parts:
+            elif os.path.isdir(full) and entry != "config" and entry not in seen_parts:
                 unpacked_parts.append({"name": entry, "format": "erofs"})
 
         return {
@@ -2181,12 +2149,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         }
 
     @router.post("/unpack")
-    def api_dna_unpack(
-        mode: str = Form(...),
-        files: str = Form(""),
-        delete_source: bool = Form(False),
-        x_dna_token: Optional[str] = Header(None)
-    ):
+    def api_dna_unpack(mode: str = Form(...), files: str = Form(""), delete_source: bool = Form(False), x_dna_token: Optional[str] = Header(None)):
         u_low = _current_user(x_dna_token)
         selected = [x.strip() for x in files.split(",") if x.strip()]
         if not selected and mode not in ("super", "payload"):
@@ -2219,120 +2182,6 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         tid = _dispatch_gh_worker(u_low, "convert", filename, {"mode": mode, "br_level": br_level}, f"Convert {filename} ({mode})")
         return {"ok": True, "task_id": tid}
 
-    @router.post("/import_vault")
-    def api_import_from_vault(
-        download_url: str = Form(""),
-        repo_path: str = Form(""),
-        target_name: str = Form(...),
-        dest_rel_dir: str = Form(""),
-        project: Optional[str] = Form(None),
-        x_dna_token: Optional[str] = Header(None)
-    ):
-        u_low = _current_user(x_dna_token)
-        if "rooms/" in (repo_path + download_url) and f"rooms/{_uclean(u_low)}/" not in (repo_path + download_url):
-            raise HTTPException(status_code=403, detail="That room belongs to another user.")
-        u_root = get_user_root(u_low)
-        proj_dir = get_proj_dir(u_low, project)
-        safe_name = os.path.basename(target_name.strip())
-        if dest_rel_dir.strip():
-            target_folder = safe_join(u_root, dest_rel_dir.strip())
-            os.makedirs(target_folder, exist_ok=True)
-            out_p = safe_join(target_folder, safe_name)
-        else:
-            out_p = safe_join(proj_dir, safe_name)
-
-        task_id = create_bg_task(f"Connecting to HF Vault for '{safe_name}'...")
-
-        def _worker():
-            t0 = time.time()
-            try:
-                url = download_url.strip() or hf_hub_url(repo_id=dataset_repo, filename=repo_path.strip(), repo_type="dataset")
-                headers = {"User-Agent": "Mozilla/5.0"}
-                if hf_token:
-                    headers["Authorization"] = f"Bearer {hf_token}"
-                with requests.get(url, headers=headers, stream=True, allow_redirects=True, timeout=60) as r:
-                    r.raise_for_status()
-                    total = int(r.headers.get("Content-Length", 0) or 0)
-                    done = 0
-                    with open(out_p + ".part", "wb") as f:
-                        fl = Flusher(f)
-                        for chunk in r.iter_content(chunk_size=1 * MB):
-                            if not chunk:
-                                continue
-                            f.write(chunk)
-                            fl.add(len(chunk))
-                            done += len(chunk)
-                            el = max(0.05, time.time() - t0)
-                            spd = f"{(done / MB) / el:.1f} MB/s"
-                            pct = min(99, int(done * 100 / total)) if total > 0 else min(95, int((done / MB) % 95))
-                            set_bg_task(task_id, pct, f"Importing {safe_name}: {done / MB:.1f}" + (f" / {total / MB:.1f} MB ({spd})" if total else f" MB ({spd})"))
-                if total > 0 and done < total:
-                    raise Exception(f"Download incomplete ({done} of {total} bytes). Try again.")
-                os.replace(out_p + ".part", out_p)
-                free_ram()
-                sz_mb = os.path.getsize(out_p) / MB
-                BG_TASKS[task_id].update({"pct": 100, "label": f"Imported {safe_name} ({sz_mb:.2f} MB) ✓", "state": "done"})
-                dna_log(u_low, "SUCCESS", f"Imported '{safe_name}' ({sz_mb:.2f} MB) from HF Vault!")
-            except Exception as e:
-                safe_remove(out_p + ".part")
-                BG_TASKS[task_id].update({"state": "error", "error": str(e)})
-                dna_log(u_low, "ERROR", f"Vault import failed for '{safe_name}': {e}")
-
-        _spawn(_worker, task_id, heavy=False)
-        return {"ok": True, "task_id": task_id}
-
-    @router.get("/state")
-    def api_dna_state(project: Optional[str] = None, x_dna_token: Optional[str] = Header(None)):
-        u_low = _current_user(x_dna_token)
-        if re.sub(r"[^a-zA-Z0-9_-]", "_", u_low.strip().lower()) not in USER_STATES:
-            try:
-                made = datetime.strptime(USERS_DB.get(u_low, {}).get("created_at", ""), "%Y-%m-%d %H:%M")
-                if made < PROC_START:
-                    dna_log(u_low, "WARN", f"Server restarted at {PROC_START.strftime('%H:%M:%S')} - temporary storage was wiped. Restoring your files from your private HF room now (see log).")
-            except Exception:
-                pass
-        ustate = get_user_state(u_low)
-        u_root = get_user_root(u_low)
-        room_bootstrap(u_low)
-        proj_dir = get_proj_dir(u_low, project)
-        room_restore_async(u_low, proj_dir)
-        room_sync_async(u_low, proj_dir)
-        projects = sorted([d for d in os.listdir(u_root) if os.path.isdir(os.path.join(u_root, d))])
-
-        img_files, unpacked_parts, zst_files, dat_br_files = [], [], [], []
-        for entry in sorted(os.listdir(proj_dir)):
-            full = os.path.join(proj_dir, entry)
-            if os.path.isfile(full):
-                low = entry.lower()
-                sz = f"{os.path.getsize(full) / MB:.2f} MB"
-                if low.endswith((".img", ".bin", ".simg")):
-                    img_files.append({"name": entry, "format": detect_img_type(full), "size": sz})
-                elif low.endswith(".zst"):
-                    zst_files.append({"name": entry, "size": sz})
-                elif low.endswith((".br", ".new.dat", ".transfer.list")):
-                    dat_br_files.append({"name": entry, "size": sz})
-            elif os.path.isdir(full) and entry != "config":
-                info_p = os.path.join(proj_dir, "config", f"{entry}_info.json")
-                det_fmt = "erofs"
-                if os.path.exists(info_p):
-                    try:
-                        det_fmt = json.load(open(info_p)).get("detected_format", "erofs")
-                    except Exception:
-                        pass
-                unpacked_parts.append({"name": entry, "format": det_fmt})
-
-        return {
-            "username": USERS_DB.get(u_low, {}).get("username", u_low),
-            "current_project": ustate["current_project"],
-            "project_path": f"/sdcard/DNA/{ustate['current_project']}",
-            "projects": projects,
-            "img_files": img_files,
-            "unpacked_parts": unpacked_parts,
-            "zst_files": zst_files,
-            "dat_br_files": dat_br_files,
-            "logs": ustate["logs"][-80:]
-        }
-
     @router.post("/project")
     def api_dna_project(action: str = Form(...), name: str = Form(""), x_dna_token: Optional[str] = Header(None)):
         u_low = _current_user(x_dna_token)
@@ -2345,7 +2194,8 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
             get_proj_dir(u_low, clean)
             dna_log(u_low, "PROJECT", f"Created & switched to project '/sdcard/DNA/{clean}'")
         elif action == "select":
-            get_proj_dir(u_low, name)
+            pdir = get_proj_dir(u_low, name)
+            _bg(lambda: sync_config_only(u_low, pdir))
             dna_log(u_low, "PROJECT", f"Switched to project '/sdcard/DNA/{ustate['current_project']}'")
         elif action == "clear":
             p = get_proj_dir(u_low)
@@ -2366,316 +2216,48 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
     @router.post("/push_vault")
     def api_push_to_vault(filename: str = Form(...), device_name: str = Form("DNA Ported Image"), x_dna_token: Optional[str] = Header(None)):
         u_low = _current_user(x_dna_token)
-        if not hf_token:
-            raise HTTPException(status_code=500, detail="Missing HF_TOKEN.")
-        u_root = get_user_root(u_low)
-        fp = safe_join(u_root, filename)
-        if not os.path.isfile(fp):
-            fp = safe_join(get_proj_dir(u_low), filename)
-        if not os.path.isfile(fp):
-            raise HTTPException(status_code=404, detail="File not found.")
-
         ustate = get_user_state(u_low)
-        base_fn = os.path.basename(fp)
-        tid = create_bg_task(f"Uploading '{base_fn}' to Universal HF Vault...")
-
-        def _worker():
-            try:
-                set_bg_task(tid, 35, f"Uploading '{base_fn}' ({os.path.getsize(fp)/MB:.1f} MB) to Hugging Face...")
-                repo_path = f"dna_ported/{u_low}/{ustate['current_project']}/{base_fn}"
-                hf_api.upload_file(path_or_fileobj=fp, path_in_repo=repo_path, repo_id=dataset_repo, repo_type="dataset")
-                dl_url = hf_hub_url(repo_id=dataset_repo, filename=repo_path, repo_type="dataset")
-                set_bg_task(tid, 85, "Updating Universal Vault index...")
-                try:
-                    from app import update_vault_index
-                    sz_mb = os.path.getsize(fp) / MB
-                    sha = sha256_file(fp)
-                    entry = {
-                        "rom_key": f"DNA__{u_low}__{ustate['current_project']}",
-                        "device_name": f"{device_name} (@{USERS_DB.get(u_low, {}).get('username', u_low)})",
-                        "codename": ustate["current_project"],
-                        "rom_version": "DNA-Port",
-                        "rom_category": "Custom ROM",
-                        "rom_format": "DNA KITCHEN",
-                        "auto_status": "Packed in DNA Cloud Kitchen",
-                        "rom_url": dl_url,
-                        "rom_filename": base_fn,
-                        "target": base_fn,
-                        "source": f"/sdcard/DNA/{ustate['current_project']}",
-                        "sha256": sha,
-                        "size": f"{sz_mb:.2f} MB",
-                        "signature": detect_img_type(fp).upper(),
-                        "download_url": dl_url,
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")
-                    }
-                    update_vault_index(TASKS_TMP_DIR, entry)
-                except Exception:
-                    pass
-                BG_TASKS[tid].update({"pct": 100, "label": f"Pushed '{base_fn}' to Universal Vault ✓", "state": "done"})
-                dna_log(u_low, "SUCCESS", f"Pushed '{base_fn}' to Universal HF Vault → {dl_url}")
-            except Exception as e:
-                BG_TASKS[tid].update({"state": "error", "error": str(e)})
-                dna_log(u_low, "ERROR", f"Vault push failed: {e}")
-
-        _spawn(_worker, tid, heavy=False)
+        proj = ustate["current_project"]
+        base_fn = os.path.basename(filename)
+        dl_url = hf_hub_url(repo_id=dataset_repo, filename=_rp(u_low, proj, "files", base_fn), repo_type="dataset")
+        dna_log(u_low, "SUCCESS", f"File available in HF Room → {dl_url}")
+        tid = create_bg_task(f"Published '{base_fn}' ✓")
+        BG_TASKS[tid].update({"pct": 100, "label": f"Published '{base_fn}' to Vault ✓", "state": "done"})
         return {"ok": True, "task_id": tid}
 
-    def _unpack_super_internal(u_low: str, proj_dir: str, super_filename: str, delete_source: bool = False, tid: str = None):
-        from app import parse_lp, ExpandedReader, Stream, extract_from_super
-        src_p = safe_join(proj_dir, super_filename)
-        if not os.path.isfile(src_p):
-            raise Exception(f"'{super_filename}' not found in project.")
-        with open(src_p, "rb") as fp:
-            reader = ExpandedReader(Stream(fp, seek_ok=True), os.path.getsize(src_p))
-            head = bytearray(HEAD_BYTES)
-            for off, d in reader.pieces():
-                if off < HEAD_BYTES:
-                    n = min(len(d), HEAD_BYTES - off)
-                    head[off:off + n] = d[:n]
-                if off + len(d) >= HEAD_BYTES:
-                    break
-            parts = parse_lp(bytes(head))
+    # ---------------- MT MANAGER DUAL-PANE ENDPOINTS (INSTANT VIRTUAL TREE) ---------------- #
 
-        active_parts = [pname for pname, exts in parts.items() if sum(e[1] for e in exts) > 0 and not pname.endswith("_b")]
-        tmp_id = "dna_super"
-        jobs_dict[tmp_id] = {"cancel": False, "logs": [], "search_progress": 0, "cont_progress": 0, "ext_progress": 0, "fin_progress": 0, "chunks_verified": 0}
-        for idx_p, pname in enumerate(active_parts, 1):
-            clean_out = re.sub(r"_a$", "", pname) + ".img"
-            if tid:
-                set_bg_task(tid, int(10 + (idx_p / max(1, len(active_parts))) * 85), f"Unpacking '{clean_out}' ({idx_p}/{len(active_parts)}) from {super_filename}...")
-            out_p = os.path.join(proj_dir, clean_out)
-            tmp_p = out_p + ".part"
-            safe_remove(tmp_p)
+    def _get_part_ops(proj_dir: str, part_name: str) -> dict:
+        op_p = os.path.join(proj_dir, "config", f"{part_name}_ops.json")
+        if os.path.exists(op_p):
             try:
-                with open(src_p, "rb") as fp:
-                    extract_from_super(tmp_id, Stream(fp, seek_ok=True), pname, tmp_p, os.path.getsize(src_p), super_filename)
-                if not os.path.exists(tmp_p) or os.path.getsize(tmp_p) == 0:
-                    raise Exception(f"'{clean_out}' came out empty.")
-                os.replace(tmp_p, out_p)
+                return json.load(open(op_p, "r", encoding="utf-8"))
             except Exception:
-                safe_remove(tmp_p)
-                raise
-            dna_log(u_low, "UNPACK", f"Extracted '{clean_out}' from {super_filename}")
-            hf_autosave(u_low, proj_dir, clean_out)
-            drop_cache(out_p)
-            free_ram()
+                pass
+        return {"deleted": [], "added": [], "history": []}
 
-        jobs_dict.pop(tmp_id, None)
-        del head, parts
-        free_ram()
-        if delete_source and os.path.exists(src_p):
-            os.remove(src_p)
+    def _save_part_ops(proj_dir: str, part_name: str, ops_data: dict):
+        cfg_d = os.path.join(proj_dir, "config")
+        os.makedirs(cfg_d, exist_ok=True)
+        with open(os.path.join(cfg_d, f"{part_name}_ops.json"), "w", encoding="utf-8") as f:
+            json.dump(ops_data, f, indent=2)
 
-    @router.post("/unpack")
-    def api_dna_unpack(
-        mode: str = Form(...),
-        files: str = Form(""),
-        delete_source: bool = Form(False),
-        x_dna_token: Optional[str] = Header(None)
-    ):
-        u_low = _current_user(x_dna_token)
-        proj_dir = get_proj_dir(u_low)
-        selected = [x.strip() for x in files.split(",") if x.strip()]
-        if not selected and mode not in ("super", "payload"):
-            raise HTTPException(status_code=400, detail="Please select at least one file.")
-
-        tid = create_bg_task(f"Starting unpack ({mode})...")
-
-        def _worker():
-            try:
-                if mode == "img":
-                    for i, fn in enumerate(selected, 1):
-                        set_bg_task(tid, int((i - 0.8) / len(selected) * 90), f"Unpacking {fn} ({i}/{len(selected)})...")
-                        fmt = detect_img_type(safe_join(proj_dir, fn))
-                        if fmt.startswith("super"):
-                            _unpack_super_internal(u_low, proj_dir, fn, delete_source, tid)
-                        else:
-                            unpack_single_img_file(u_low, proj_dir, fn, delete_source, tid)
-                        free_ram()
-                elif mode == "super":
-                    _unpack_super_internal(u_low, proj_dir, selected[0] if selected else "super.img", delete_source, tid)
-                elif mode == "zstd":
-                    for fn in selected:
-                        set_bg_task(tid, 40, f"Decompressing zstd '{fn}'...")
-                        src = safe_join(proj_dir, fn)
-                        out_name = re.sub(r"\.zst$", "", fn, flags=re.I)
-                        if out_name == fn:
-                            out_name += ".img"
-                        dst = safe_join(proj_dir, out_name)
-                        with open(src, "rb") as fin, open(dst + ".part", "wb") as fout:
-                            zstd.ZstdDecompressor().copy_stream(fin, fout, read_size=1 * MB, write_size=1 * MB)
-                        os.replace(dst + ".part", dst)
-                        free_ram()
-                        if delete_source:
-                            os.remove(src)
-                        dna_log(u_low, "SUCCESS", f"Unpacked zstd '{fn}' → '{out_name}'")
-                elif mode == "br":
-                    for fn in selected:
-                        set_bg_task(tid, 40, f"Decompressing brotli '{fn}'...")
-                        src = safe_join(proj_dir, fn)
-                        out_name = re.sub(r"\.br$", "", fn, flags=re.I)
-                        dst = safe_join(proj_dir, out_name)
-                        brotli_decompress_file(src, dst)
-                        if delete_source:
-                            os.remove(src)
-                        dna_log(u_low, "SUCCESS", f"Unpacked brotli '{fn}' → '{out_name}'")
-                elif mode == "dat":
-                    for fn in selected:
-                        set_bg_task(tid, 45, f"Converting '{fn}' to raw .img...")
-                        dat_p = safe_join(proj_dir, fn)
-                        prefix = re.sub(r"\.new\.dat$", "", fn, flags=re.I)
-                        tl_p = safe_join(proj_dir, f"{prefix}.transfer.list")
-                        if not os.path.exists(tl_p):
-                            raise Exception(f"Missing {prefix}.transfer.list in project.")
-                        sdat2img_convert(tl_p, dat_p, safe_join(proj_dir, f"{prefix}.img"))
-                        dna_log(u_low, "SUCCESS", f"Converted '{fn}' → '{prefix}.img'")
-                elif mode == "payload":
-                    from app import extract_from_payload, Stream
-                    target_pl = selected[0] if selected else "payload.bin"
-                    pl_path = safe_join(proj_dir, target_pl)
-                    parts_list = ("boot", "init_boot", "vendor_boot", "dtbo", "vbmeta", "system", "vendor", "product", "system_ext", "odm")
-                    got = 0
-                    tmp_id = "dna_pl"
-                    for idx_p, p_to_ext in enumerate(parts_list, 1):
-                        set_bg_task(tid, int(idx_p / len(parts_list) * 90), f"Scanning payload.bin for '{p_to_ext}'...")
-                        out_p = os.path.join(proj_dir, f"{p_to_ext}.img")
-                        tmp_p = out_p + ".part"
-                        safe_remove(tmp_p)
-                        try:
-                            jobs_dict[tmp_id] = {"cancel": False, "logs": [], "search_progress": 0, "cont_progress": 0, "ext_progress": 0, "fin_progress": 0, "chunks_verified": 0}
-                            with open(pl_path, "rb") as fp:
-                                extract_from_payload(tmp_id, Stream(fp, seek_ok=True), p_to_ext, tmp_p)
-                            if os.path.exists(tmp_p) and os.path.getsize(tmp_p) > 0:
-                                os.replace(tmp_p, out_p)
-                                got += 1
-                                dna_log(u_low, "SUCCESS", f"Extracted '{p_to_ext}.img' from payload.bin")
-                                hf_autosave(u_low, proj_dir, f"{p_to_ext}.img")
-                            else:
-                                safe_remove(tmp_p)
-                                dna_log(u_low, "WARN", f"'{p_to_ext}' not present in payload.bin")
-                        except Exception as e:
-                            safe_remove(tmp_p)
-                            dna_log(u_low, "WARN", f"'{p_to_ext}' skipped: {e}")
-                        jobs_dict.pop(tmp_id, None)
-                        free_ram()
-                    if got == 0:
-                        raise Exception("No partitions could be extracted from payload.bin (file corrupt or unsupported).")
-                BG_TASKS[tid].update({"pct": 100, "label": f"Unpack ({mode}) complete ✓", "state": "done"})
-            except Exception as e:
-                BG_TASKS[tid].update({"state": "error", "error": str(e)})
-                dna_log(u_low, "ERROR", f"Unpack error: {e}")
-
-        _spawn(_worker, tid, heavy=True)
-        return {"ok": True, "task_id": tid}
-
-    @router.post("/pack_single")
-    def api_dna_pack_single(req: PackSingleRequest, x_dna_token: Optional[str] = Header(None)):
-        u_low = _current_user(x_dna_token)
-        tid = create_bg_task(f"Packing '{req.partition}' ({req.pack_type.upper()})...")
-
-        def _worker():
-            try:
-                res = pack_single_partition_worker(u_low, req, tid)
-                BG_TASKS[tid].update({"pct": 100, "label": f"Packed {res['output_file']} ({res['size_mb']}) ✓", "state": "done"})
-            except Exception as e:
-                BG_TASKS[tid].update({"state": "error", "error": str(e)})
-                dna_log(u_low, "ERROR", f"Pack error: {e}")
-
-        _spawn(_worker, tid, heavy=True)
-        return {"ok": True, "task_id": tid}
-
-    @router.post("/pack_zstd")
-    def api_dna_pack_zstd(filename: str = Form(...), level: int = Form(6), x_dna_token: Optional[str] = Header(None)):
-        u_low = _current_user(x_dna_token)
-        proj_dir = get_proj_dir(u_low)
-        tid = create_bg_task(f"Compressing '{filename}' to .zst...")
-
-        def _worker():
-            try:
-                src = safe_join(proj_dir, filename)
-                dst = safe_join(proj_dir, f"{filename}.zst")
-                set_bg_task(tid, 45, f"Compressing {filename} (level {level})...")
-                with open(src, "rb") as fin, open(dst + ".part", "wb") as fout:
-                    zstd.ZstdCompressor(level=max(1, min(19, int(level)))).copy_stream(fin, fout, read_size=1 * MB, write_size=1 * MB)
-                os.replace(dst + ".part", dst)
-                sz = os.path.getsize(dst) / MB
-                BG_TASKS[tid].update({"pct": 100, "label": f"Packed {filename}.zst ({sz:.2f} MB) ✓", "state": "done"})
-                dna_log(u_low, "SUCCESS", f"Packed '{filename}.zst' ({sz:.2f} MB)")
-                hf_autosave(u_low, proj_dir, f"{filename}.zst")
-            except Exception as e:
-                BG_TASKS[tid].update({"state": "error", "error": str(e)})
-
-        _spawn(_worker, tid, heavy=True)
-        return {"ok": True, "task_id": tid}
-
-    @router.post("/pack_super")
-    def api_dna_pack_super(req: PackSuperRequest, x_dna_token: Optional[str] = Header(None)):
-        u_low = _current_user(x_dna_token)
-        tid = create_bg_task("Building super.img...")
-
-        def _worker():
-            try:
-                res = build_super_image(u_low, req, tid)
-                BG_TASKS[tid].update({"pct": 100, "label": f"Built super.img ({res['size_mb']}) ✓", "state": "done"})
-            except Exception as e:
-                BG_TASKS[tid].update({"state": "error", "error": str(e)})
-                dna_log(u_low, "ERROR", f"super.img build error: {e}")
-
-        _spawn(_worker, tid, heavy=True)
-        return {"ok": True, "task_id": tid}
-
-    @router.post("/convert")
-    def api_dna_convert(mode: str = Form(...), filename: str = Form(...), br_level: int = Form(3), x_dna_token: Optional[str] = Header(None)):
-        u_low = _current_user(x_dna_token)
-        proj_dir = get_proj_dir(u_low)
-        src = safe_join(proj_dir, filename)
-        if not os.path.isfile(src):
-            raise HTTPException(status_code=404, detail="Source image not found.")
-        stem = re.sub(r"\.(img|simg)$", "", filename, flags=re.I)
-        tid = create_bg_task(f"Converting '{filename}' ({mode})...")
-
-        def _worker():
-            try:
-                if mode == "img_to_simg":
-                    if is_sparse_file(src):
-                        out_name = f"{stem}_raw.img"
-                        set_bg_task(tid, 45, f"Converting Sparse '{filename}' → Raw '{out_name}'...")
-                        sparse_to_raw(src, safe_join(proj_dir, out_name))
-                        dna_log(u_low, "SUCCESS", f"Converted Sparse '{filename}' → Raw '{out_name}'")
-                    else:
-                        out_name = f"{stem}_sparse.img"
-                        set_bg_task(tid, 45, f"Converting Raw '{filename}' → Sparse '{out_name}'...")
-                        raw_to_sparse(src, safe_join(proj_dir, out_name))
-                        dna_log(u_low, "SUCCESS", f"Converted Raw '{filename}' → Android Sparse '{out_name}'")
-                    BG_TASKS[tid].update({"pct": 100, "label": f"Created {out_name} ✓", "state": "done"})
-                elif mode == "img_to_dat_br":
-                    set_bg_task(tid, 35, f"Converting '{filename}' → '{stem}.new.dat'...")
-                    dat_p, _tl_p = img2sdat_convert(src, proj_dir, stem)
-                    br_p = f"{dat_p}.br"
-                    lvl = max(0, min(11, int(br_level)))
-                    set_bg_task(tid, 70, f"Compressing '{stem}.new.dat.br' (level {lvl})...")
-                    brotli_compress_file(dat_p, br_p, lvl)
-                    safe_remove(dat_p)
-                    hf_autosave(u_low, proj_dir, f"{stem}.new.dat.br")
-                    hf_autosave(u_low, proj_dir, f"{stem}.transfer.list")
-                    dna_log(u_low, "SUCCESS", f"Converted '{filename}' → '{stem}.new.dat.br'")
-                    BG_TASKS[tid].update({"pct": 100, "label": f"Created {stem}.new.dat.br ✓", "state": "done"})
-            except Exception as e:
-                BG_TASKS[tid].update({"state": "error", "error": str(e)})
-                dna_log(u_low, "ERROR", f"Conversion failed: {e}")
-
-        _spawn(_worker, tid, heavy=True)
-        return {"ok": True, "task_id": tid}
-
-    # ---------------- MT MANAGER DUAL-PANE ENDPOINTS ---------------- #
-
-    def _load_fs_maps_for_dir(u_root: str, target_dir: str):
-        rel = os.path.relpath(target_dir, u_root).replace("\\", "/")
-        parts = [] if rel == "." else rel.split("/")
+    def _load_fs_maps_for_dir(u_root: str, rel_from_user: str):
+        parts = [p for p in rel_from_user.split("/") if p]
         fs_map, fc_map = {}, {}
         proj_dir, top_part = None, ""
-        if len(parts) >= 2:
+        if len(parts) >= 1:
             proj_dir = os.path.join(u_root, parts[0])
+            cp = os.path.join(proj_dir, "config", "_custom_perms.json")
+            if os.path.exists(cp):
+                try:
+                    for k, v in json.load(open(cp, "r", encoding="utf-8")).items():
+                        fs_map[k] = {"uid": str(v.get("uid", "0")), "gid": str(v.get("gid", "0")), "mode": str(v.get("mode", "0755"))}
+                        if v.get("selinux"):
+                            fc_map[k] = v["selinux"]
+                except Exception:
+                    pass
+        if len(parts) >= 2:
             top_part = parts[1]
             if top_part != "config":
                 cfg_f = os.path.join(proj_dir, "config", f"{top_part}_fs_config")
@@ -2683,83 +2265,161 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                 if os.path.exists(cfg_f):
                     for line in open(cfg_f, encoding="utf-8", errors="ignore"):
                         sp = line.strip().split()
-                        if len(sp) >= 4:
+                        if len(sp) >= 4 and sp[0] not in fs_map:
                             fs_map[sp[0]] = {"uid": sp[1], "gid": sp[2], "mode": sp[3]}
                 if os.path.exists(fc_f):
                     for line in open(fc_f, encoding="utf-8", errors="ignore"):
                         sp = line.strip().split()
                         if len(sp) >= 2:
-                            fc_map[sp[0].lstrip("/").replace("\\", "")] = sp[1]
+                            ck = sp[0].lstrip("/").replace("\\", "")
+                            if ck not in fc_map:
+                                fc_map[ck] = sp[1]
         return proj_dir, top_part, fs_map, fc_map
+
+    def _virtual_part_items(proj_dir: str, top_part: str, sub_rel: str) -> list:
+        ops = _get_part_ops(proj_dir, top_part)
+        deleted_set = set(ops.get("deleted", []))
+        man_p = os.path.join(proj_dir, "config", f"{top_part}_manifest.json")
+        out = []
+
+        def _is_del(rel_in_part: str) -> bool:
+            full_rel = f"{top_part}/{rel_in_part}".strip("/")
+            return full_rel in deleted_set or any(full_rel.startswith(d.rstrip("/") + "/") for d in deleted_set)
+
+        if os.path.exists(man_p):
+            try:
+                man = json.load(open(man_p, "r", encoding="utf-8"))
+                for it in man.get("items", []):
+                    if it.get("parent", "") == sub_rel and not _is_del(it.get("rel", "")):
+                        out.append(it)
+            except Exception:
+                pass
+        else:
+            cfg_f = os.path.join(proj_dir, "config", f"{top_part}_fs_config")
+            if os.path.exists(cfg_f):
+                prefix = f"{top_part}/{sub_rel}/".replace("//", "/") if sub_rel else f"{top_part}/"
+                seen_ch = {}
+                for line in open(cfg_f, encoding="utf-8", errors="ignore"):
+                    sp = line.strip().split()
+                    if len(sp) < 4 or not sp[0].startswith(prefix):
+                        continue
+                    rem = sp[0][len(prefix):].strip("/")
+                    if not rem:
+                        continue
+                    cname = rem.split("/")[0]
+                    crel = f"{sub_rel}/{cname}".strip("/")
+                    if _is_del(crel):
+                        continue
+                    is_sub = "/" in rem
+                    is_lnk = len(sp) >= 5 and not is_sub
+                    is_d = is_sub or (sp[3].endswith("755") and not is_lnk and "." not in cname)
+                    if cname not in seen_ch or is_sub:
+                        seen_ch[cname] = {"rel": crel, "name": cname, "parent": sub_rel, "is_dir": is_d, "is_link": is_lnk, "link_target": sp[4] if is_lnk else "", "size": 0, "mtime": "26-10-24 12:00", "mtime_full": "2026-10-24 12:00:00"}
+                out = list(seen_ch.values())
+
+        for add_it in ops.get("added", []):
+            if add_it.get("parent", "") == sub_rel and not _is_del(add_it.get("rel", "")):
+                if not any(x["name"] == add_it["name"] for x in out):
+                    out.append(add_it)
+        return out
 
     @router.get("/fs/list")
     def api_fs_list(path: str = "", x_dna_token: Optional[str] = Header(None)):
         u_low = _current_user(x_dna_token)
         u_root = get_user_root(u_low)
-        if path and not ensure_local(u_low, u_root, path):
-            return _cloud_wait_response(u_root, path)
-        target_dir = safe_join(u_root, path)
-        if not os.path.exists(target_dir) or not os.path.isdir(target_dir):
-            target_dir = u_root
-            path = ""
+        rel_from_user = (path or "").strip().strip("/\\").replace("\\", "/")
+        parts = [p for p in rel_from_user.split("/") if p]
+        target_dir = safe_join(u_root, rel_from_user) if rel_from_user else u_root
 
-        rel_from_user = os.path.relpath(target_dir, u_root).replace("\\", "/")
-        if rel_from_user == ".":
-            rel_from_user = ""
+        proj_dir, top_part, fs_map, fc_map = _load_fs_maps_for_dir(u_root, rel_from_user)
+        if proj_dir and not os.path.exists(os.path.join(proj_dir, "config", "_room_meta.json")):
+            sync_config_only(u_low, proj_dir)
+            proj_dir, top_part, fs_map, fc_map = _load_fs_maps_for_dir(u_root, rel_from_user)
 
-        proj_dir, top_part, fs_map, fc_map = _load_fs_maps_for_dir(u_root, target_dir)
         items, dir_count, file_count = [], 0, 0
+        seen_names = set()
 
-        for name in sorted(os.listdir(target_dir), key=lambda x: (not os.path.isdir(os.path.join(target_dir, x)), x.lower())):
-            full = os.path.join(target_dir, name)
-            rel_item = os.path.relpath(full, u_root).replace("\\", "/")
-            is_dir = os.path.isdir(full)
-            is_link = os.path.islink(full)
-            if is_dir:
-                dir_count += 1
-            else:
-                file_count += 1
-
-            sz = 0 if is_dir else (os.path.getsize(full) if os.path.exists(full) else 0)
-            mtime_dt = datetime.fromtimestamp(os.path.getmtime(full)) if os.path.exists(full) else datetime.now()
-            rel_in_proj = os.path.relpath(full, proj_dir).replace("\\", "/") if proj_dir else ""
+        def _fmt_item(name, rel_item, rel_in_proj, is_dir, is_link, link_target, sz, mtime_s, mtime_full):
             default_mode = "0755" if is_dir else ("0600" if name == "build.prop" else "0644")
             meta = fs_map.get(rel_in_proj, {"uid": "0", "gid": "0", "mode": default_mode})
             ctx = fc_map.get(rel_in_proj, f"u:object_r:{top_part or 'system'}_file:s0")
-
             short_oct = format_short_octal(meta["mode"])
             sym_perm = mode_octal_to_symbolic(meta["mode"], is_dir=is_dir, is_link=is_link)
             size_human = f"{sz / MB:.2f}M" if sz >= MB else (f"{sz / 1024:.2f}K" if sz >= 1024 else f"{sz}B")
-
-            items.append({
-                "name": name,
-                "rel_path": rel_item,
+            return {
+                "name": name, "rel_path": rel_item,
                 "parent_display": f"/data/DNA/{os.path.dirname(rel_item)}/".replace("//", "/"),
-                "is_dir": is_dir,
-                "is_link": is_link,
-                "link_target": os.readlink(full) if is_link else "",
-                "size": sz,
-                "size_str": size_human,
-                "size_full": f"{size_human} ({sz:,})",
-                "mtime": mtime_dt.strftime("%y-%m-%d %H:%M"),
-                "mtime_full": mtime_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                "mode": meta["mode"],
-                "short_octal": short_oct,
-                "sym_perm": sym_perm,
-                "uid": meta["uid"],
-                "gid": meta["gid"],
-                "selinux": ctx
-            })
+                "is_dir": is_dir, "is_link": is_link, "link_target": link_target,
+                "size": sz, "size_str": size_human, "size_full": f"{size_human} ({sz:,})",
+                "mtime": mtime_s, "mtime_full": mtime_full,
+                "mode": meta["mode"], "short_octal": short_oct, "sym_perm": sym_perm,
+                "uid": meta["uid"], "gid": meta["gid"], "selinux": ctx
+            }
 
-        if rel_from_user and "/" not in rel_from_user:
-            idx = room_cloud_index(u_low, rel_from_user)
-            have = {i["name"] for i in items}
-            for t_name in sorted(idx["trees"] - have):
-                items.append(_cloud_item(f"{rel_from_user}/{t_name}", t_name, True))
-                dir_count += 1
-            for f_name in sorted(n for n in idx["files"] if "/" not in n and n not in have):
-                items.append(_cloud_item(f"{rel_from_user}/{f_name}", f_name, False))
-                file_count += 1
+        # 1. Local directory items
+        if os.path.exists(target_dir) and os.path.isdir(target_dir):
+            for name in sorted(os.listdir(target_dir), key=lambda x: (not os.path.isdir(os.path.join(target_dir, x)), x.lower())):
+                if name.startswith(".restore_") or name.endswith(".part"):
+                    continue
+                full = os.path.join(target_dir, name)
+                rel_item = f"{rel_from_user}/{name}".strip("/")
+                is_dir = os.path.isdir(full)
+                is_link = os.path.islink(full)
+                seen_names.add(name)
+                dir_count += 1 if is_dir else 0
+                file_count += 0 if is_dir else 1
+                sz = 0 if is_dir else (os.path.getsize(full) if os.path.exists(full) else 0)
+                mdt = datetime.fromtimestamp(os.path.getmtime(full)) if os.path.exists(full) else datetime.now()
+                rel_in_proj = os.path.relpath(full, proj_dir).replace("\\", "/") if proj_dir else ""
+                items.append(_fmt_item(name, rel_item, rel_in_proj, is_dir, is_link, os.readlink(full) if is_link else "", sz, mdt.strftime("%y-%m-%d %H:%M"), mdt.strftime("%Y-%m-%d %H:%M:%S")))
+
+        # 2. Project Root: Show imported .img files & unpacked partition folders from HF Room
+        if len(parts) == 1 and proj_dir:
+            proj = parts[0]
+            rmeta = _get_room_meta(proj_dir)
+            for tname, tinfo in sorted(rmeta.get("trees", {}).items()):
+                if tname != "config" and tname not in seen_names:
+                    seen_names.add(tname)
+                    dir_count += 1
+                    items.append(_fmt_item(tname, f"{proj}/{tname}", tname, True, False, "", 0, tinfo.get("mtime", "26-10-24 12:00"), tinfo.get("mtime_full", "2026-10-24 12:00:00")))
+            for fn, finfo in sorted(rmeta.get("files", {}).items()):
+                if fn not in seen_names:
+                    seen_names.add(fn)
+                    file_count += 1
+                    items.append(_fmt_item(fn, f"{proj}/{fn}", fn, False, False, "", int(finfo.get("size", 0)), finfo.get("mtime", "26-10-24 12:00"), finfo.get("mtime_full", "2026-10-24 12:00:00")))
+            if room_enabled():
+                u_key = _uclean(u_low)
+                fpre, tpre = f"rooms/{u_key}/{proj}/files/", f"rooms/{u_key}/{proj}/trees/"
+                for rf in hf_list_cached():
+                    if rf.startswith(tpre) and rf.endswith(".tar.zst"):
+                        tn = rf[len(tpre):-8]
+                        if tn != "config" and tn not in seen_names:
+                            seen_names.add(tn)
+                            dir_count += 1
+                            items.append(_fmt_item(tn, f"{proj}/{tn}", tn, True, False, "", 0, "26-10-24 12:00", "2026-10-24 12:00:00"))
+                    elif rf.startswith(fpre):
+                        fn = rf[len(fpre):]
+                        if "/" not in fn and fn not in seen_names:
+                            seen_names.add(fn)
+                            file_count += 1
+                            items.append(_fmt_item(fn, f"{proj}/{fn}", fn, False, False, "", 0, "26-10-24 12:00", "2026-10-24 12:00:00"))
+
+        # 3. Inside an unpacked partition folder (e.g. Default_Project/system_ext/...)
+        elif len(parts) >= 2 and proj_dir and top_part != "config":
+            proj = parts[0]
+            sub_rel = "/".join(parts[2:])
+            for vit in _virtual_part_items(proj_dir, top_part, sub_rel):
+                nm = vit["name"]
+                if nm in seen_names:
+                    continue
+                seen_names.add(nm)
+                is_d = bool(vit.get("is_dir"))
+                dir_count += 1 if is_d else 0
+                file_count += 0 if is_d else 1
+                rel_in_proj = f"{top_part}/{vit['rel']}".strip("/")
+                items.append(_fmt_item(nm, f"{proj}/{rel_in_proj}", rel_in_proj, is_d, bool(vit.get("is_link")), vit.get("link_target", ""), int(vit.get("size", 0)), vit.get("mtime", "26-10-24 12:00"), vit.get("mtime_full", "2026-10-24 12:00:00")))
+
+        items.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
         total_disk, _used, free_disk = shutil.disk_usage(u_root)
         disk_str = f"Folders: {dir_count}  Files: {file_count}  Free: {free_disk / (1024**3):.2f}G/{total_disk / (1024**3):.2f}G"
         projects = sorted([d for d in os.listdir(u_root) if os.path.isdir(os.path.join(u_root, d))])
@@ -2775,213 +2435,195 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
     @router.get("/fs/checksum")
     def api_fs_checksum(path: str, x_dna_token: Optional[str] = Header(None)):
         u_low = _current_user(x_dna_token)
-        if not ensure_local(u_low, get_user_root(u_low), path):
-            raise HTTPException(status_code=409, detail="Still downloading from your HF room. Try again in a minute.")
         fp = safe_join(get_user_root(u_low), path)
         if not os.path.isfile(fp):
-            raise HTTPException(status_code=404, detail="File not found.")
+            raise HTTPException(status_code=404, detail="File is stored in Cloud Room.")
         md5_h, sha1_h, sha256_h, crc_v = hashlib.md5(), hashlib.sha1(), hashlib.sha256(), 0
         with open(fp, "rb") as f:
             while chunk := f.read(2 * MB):
-                md5_h.update(chunk)
-                sha1_h.update(chunk)
-                sha256_h.update(chunk)
-                crc_v = zlib.crc32(chunk, crc_v)
-        return {
-            "filename": os.path.basename(fp),
-            "md5": md5_h.hexdigest(),
-            "sha1": sha1_h.hexdigest(),
-            "sha256": sha256_h.hexdigest(),
-            "crc32": f"{crc_v & 0xFFFFFFFF:08x}"
-        }
+                md5_h.update(chunk); sha1_h.update(chunk); sha256_h.update(chunk); crc_v = zlib.crc32(chunk, crc_v)
+        return {"filename": os.path.basename(fp), "md5": md5_h.hexdigest(), "sha1": sha1_h.hexdigest(), "sha256": sha256_h.hexdigest(), "crc32": f"{crc_v & 0xFFFFFFFF:08x}"}
 
     @router.get("/fs/read")
     def api_fs_read(path: str, x_dna_token: Optional[str] = Header(None)):
         u_low = _current_user(x_dna_token)
-        if not ensure_local(u_low, get_user_root(u_low), path):
-            raise HTTPException(status_code=409, detail="Still downloading from your HF room. Try again in a minute.")
-        fp = safe_join(get_user_root(u_low), path)
+        u_root = get_user_root(u_low)
+        fp = safe_join(u_root, path)
         if not os.path.isfile(fp):
-            raise HTTPException(status_code=404, detail="File not found.")
-        if os.path.getsize(fp) > 4 * MB:
-            raise HTTPException(status_code=400, detail="File is larger than 4 MB (binary).")
+            parts = [p for p in path.replace("\\", "/").split("/") if p]
+            if len(parts) >= 3:
+                cached_t = os.path.join(u_root, parts[0], "config", "_texts", parts[1], *parts[2:])
+                if os.path.isfile(cached_t):
+                    fp = cached_t
+        if not os.path.isfile(fp):
+            raise HTTPException(status_code=404, detail="Binary or uncached file.")
         with open(fp, "r", encoding="utf-8", errors="replace") as f:
             return {"path": path, "content": f.read()}
 
     @router.post("/fs/write")
     def api_fs_write(path: str = Form(...), content: str = Form(...), x_dna_token: Optional[str] = Header(None)):
         u_low = _current_user(x_dna_token)
-        if not ensure_local(u_low, get_user_root(u_low), path):
-            raise HTTPException(status_code=409, detail="Still downloading from your HF room. Try again in a minute.")
-        fp = safe_join(get_user_root(u_low), path)
+        u_root = get_user_root(u_low)
+        parts = [p for p in path.replace("\\", "/").split("/") if p]
+        if len(parts) >= 3 and parts[1] != "config":
+            proj_dir = os.path.join(u_root, parts[0])
+            top_part = parts[1]
+            sub_rel = "/".join(parts[2:])
+            dst_t = os.path.join(proj_dir, "config", "_texts", top_part, sub_rel)
+            os.makedirs(os.path.dirname(dst_t), exist_ok=True)
+            with open(dst_t, "w", encoding="utf-8") as f:
+                f.write(content)
+            ops = _get_part_ops(proj_dir, top_part)
+            parent_rel = "/".join(parts[2:-1])
+            nm = parts[-1]
+            if not any(x.get("rel") == sub_rel for x in ops.get("added", [])):
+                ops.setdefault("added", []).append({"rel": sub_rel, "name": nm, "parent": parent_rel, "is_dir": False, "is_link": False, "link_target": "", "size": len(content.encode("utf-8")), "mtime": datetime.now().strftime("%y-%m-%d %H:%M"), "mtime_full": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+                _save_part_ops(proj_dir, top_part, ops)
+            room_mark_dirty(u_low, proj_dir, "config", delay=2)
+            dna_log(u_low, "MANAGER", f"Saved '{path}' in cloud overlay ✓")
+            return {"ok": True}
+        fp = safe_join(u_root, path)
         os.makedirs(os.path.dirname(fp), exist_ok=True)
         with open(fp, "w", encoding="utf-8") as f:
             f.write(content)
-        dna_log(u_low, "MANAGER", f"Saved modified file '{path}'")
-        room_note_change(u_low, get_user_root(u_low), path)
+        room_note_change(u_low, u_root, path)
         return {"ok": True}
 
     @router.post("/fs/op")
     def api_fs_op(
-        op: str = Form(...),
-        src: str = Form(""),
-        dst: str = Form(""),
-        mode: str = Form("0644"),
-        uid: str = Form("0"),
-        gid: str = Form("0"),
-        selinux: str = Form("u:object_r:system_file:s0"),
-        recursive: bool = Form(False),
+        op: str = Form(...), src: str = Form(""), dst: str = Form(""),
+        mode: str = Form("0644"), uid: str = Form("0"), gid: str = Form("0"),
+        selinux: str = Form("u:object_r:system_file:s0"), recursive: bool = Form(False),
         x_dna_token: Optional[str] = Header(None)
     ):
         u_low = _current_user(x_dna_token)
         u_root = get_user_root(u_low)
-        src_full = safe_join(u_root, src) if src else u_root
-        dst_full = safe_join(u_root, dst) if dst else u_root
-        if src and room_enabled():
-            _p = [x for x in src.replace("\\", "/").split("/") if x]
-            if op == "delete" and not os.path.lexists(src_full) and len(_p) == 2:
-                _idx = room_cloud_index(u_low, _p[0])
-                if _p[1] in _idx["trees"]:
-                    room_delete(u_low, _p[0], "trees", _p[1] + ".tar.zst")
-                    return {"ok": True}
-                if _p[1] in _idx["files"]:
-                    room_delete(u_low, _p[0], "files", _p[1])
-                    return {"ok": True}
-            if not ensure_local(u_low, u_root, src) or (dst and not ensure_local(u_low, u_root, dst)):
-                raise HTTPException(status_code=409, detail="Still downloading from your HF room. Try again in a minute.")
-        was_dir = os.path.isdir(src_full) and not os.path.islink(src_full)
+        src_clean = src.strip().strip("/\\").replace("\\", "/")
+        dst_clean = dst.strip().strip("/\\").replace("\\", "/")
+        parts = [p for p in src_clean.split("/") if p]
 
-        if op == "copy":
-            target = os.path.join(dst_full, os.path.basename(src_full)) if os.path.isdir(dst_full) else dst_full
-            if os.path.abspath(src_full) == os.path.abspath(target):
-                target += "_copy"
-            if os.path.isdir(src_full):
-                shutil.copytree(src_full, target, symlinks=True, dirs_exist_ok=True)
-            else:
-                shutil.copy2(src_full, target, follow_symlinks=False)
-            dna_log(u_low, "MANAGER", f"Copied '{src}' → '{dst or '/'}'")
-        elif op == "move":
-            target = os.path.join(dst_full, os.path.basename(src_full)) if os.path.isdir(dst_full) else dst_full
-            shutil.move(src_full, target)
-            dna_log(u_low, "MANAGER", f"Moved '{src}' → '{dst or '/'}'")
-        elif op == "delete":
-            if os.path.isdir(src_full) and not os.path.islink(src_full):
-                shutil.rmtree(src_full)
-            elif os.path.exists(src_full) or os.path.islink(src_full):
-                os.remove(src_full)
-            dna_log(u_low, "MANAGER", f"Deleted '{src}'")
-        elif op == "mkdir":
-            os.makedirs(src_full, exist_ok=True)
-            dna_log(u_low, "MANAGER", f"Created folder '{src}'")
-        elif op == "rename":
-            shutil.move(src_full, dst_full)
-            dna_log(u_low, "MANAGER", f"Renamed '{src}' → '{dst}'")
-        elif op == "symlink":
-            if os.path.exists(src_full) or os.path.islink(src_full):
-                os.remove(src_full)
-            os.symlink(dst, src_full)
-            dna_log(u_low, "MANAGER", f"Created symlink '{src}' → '{dst}'")
-        elif op == "chmod_chcon":
-            rel_from_user = os.path.relpath(src_full, u_root).replace("\\", "/")
-            parts = rel_from_user.split("/")
-            if len(parts) >= 2:
-                proj_dir = os.path.join(u_root, parts[0])
-                top_part = parts[1]
-                rel_in_proj = os.path.relpath(src_full, proj_dir).replace("\\", "/")
-                cfg_dir = os.path.join(proj_dir, "config")
-                os.makedirs(cfg_dir, exist_ok=True)
+        if op == "chmod_chcon" and len(parts) >= 2:
+            proj_dir = os.path.join(u_root, parts[0])
+            top_part = parts[1]
+            rel_in_proj = "/".join(parts[1:])
+            cfg_dir = os.path.join(proj_dir, "config")
+            os.makedirs(cfg_dir, exist_ok=True)
+            norm_mode = "0" + mode.strip() if len(mode.strip()) == 3 else mode.strip()
+            cp_file = os.path.join(cfg_dir, "_custom_perms.json")
+            cperms = {}
+            if os.path.exists(cp_file):
+                try:
+                    cperms = json.load(open(cp_file, "r", encoding="utf-8"))
+                except Exception:
+                    pass
+            cperms[rel_in_proj] = {"uid": uid, "gid": gid, "mode": norm_mode, "selinux": selinux}
+            with open(cp_file, "w", encoding="utf-8") as f:
+                json.dump(cperms, f, indent=2)
+
+            if top_part != "config":
                 cfg_f = os.path.join(cfg_dir, f"{top_part}_fs_config")
                 fc_f = os.path.join(cfg_dir, f"{top_part}_file_contexts")
-
-                targets = [rel_in_proj]
-                if recursive and os.path.isdir(src_full):
-                    for r, ds, fs in os.walk(src_full):
-                        for x in ds + fs:
-                            targets.append(os.path.relpath(os.path.join(r, x), proj_dir).replace("\\", "/"))
-
-                norm_mode = "0" + mode.strip() if len(mode.strip()) == 3 else mode.strip()
                 existing_cfg = {}
                 if os.path.exists(cfg_f):
                     for l in open(cfg_f, encoding="utf-8", errors="ignore"):
                         s = l.strip().split()
                         if len(s) >= 4:
                             existing_cfg[s[0]] = s[1:]
-                for t in targets:
-                    existing_cfg[t] = [uid, gid, norm_mode]
+                existing_cfg[rel_in_proj] = [uid, gid, norm_mode]
                 with open(cfg_f, "w", encoding="utf-8") as f:
                     for k, v in sorted(existing_cfg.items()):
                         f.write(f"{k} {' '.join(v)}\n")
-
                 existing_fc = {}
                 if os.path.exists(fc_f):
                     for l in open(fc_f, encoding="utf-8", errors="ignore"):
                         s = l.strip().split()
                         if len(s) >= 2:
                             existing_fc[s[0]] = s[1]
-                for t in targets:
-                    existing_fc[f"/{re.escape(t)}"] = selinux
+                existing_fc[f"/{re.escape(rel_in_proj)}"] = selinux
                 with open(fc_f, "w", encoding="utf-8") as f:
                     for k, v in sorted(existing_fc.items()):
                         f.write(f"{k} {v}\n")
-            dna_log(u_low, "MANAGER", f"Updated permissions ({mode}, {uid}:{gid}) & SELinux ({selinux}) on '{src}'")
-        elif op == "mount_archive":
-            out_d = src_full + "_unpacked"
-            os.makedirs(out_d, exist_ok=True)
-            if zipfile.is_zipfile(src_full):
-                with zipfile.ZipFile(src_full, "r") as zf:
-                    zf.extractall(out_d)
-                dna_log(u_low, "MANAGER", f"Unpacked archive '{src}'")
-            else:
-                raise HTTPException(status_code=400, detail="Not a valid ZIP/APEX/APK archive.")
-        elif op == "repack_archive":
-            orig_archive = re.sub(r"_unpacked$", "", src_full)
-            with zipfile.ZipFile(orig_archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                for r, _ds, fs in os.walk(src_full):
-                    for fn in fs:
-                        full_f = os.path.join(r, fn)
-                        arcname = os.path.relpath(full_f, src_full).replace("\\", "/")
-                        ctype = zipfile.ZIP_STORED if fn.endswith((".img", ".so", ".arsc")) else zipfile.ZIP_DEFLATED
-                        zf.write(full_f, arcname, compress_type=ctype)
-            dna_log(u_low, "MANAGER", f"Repacked folder '{src}' → '{os.path.basename(orig_archive)}'")
-        try:
+            room_mark_dirty(u_low, proj_dir, "config", delay=2)
+            dna_log(u_low, "MANAGER", f"Updated permissions ({norm_mode}) & SELinux on '{src_clean}' ✓")
+            return {"ok": True}
+
+        # Deleting a root cloud file or unpacked partition folder
+        if op == "delete" and len(parts) == 2:
+            proj, item_name = parts[0], parts[1]
+            proj_dir = os.path.join(u_root, proj)
+            rmeta = _get_room_meta(proj_dir)
+            if item_name in rmeta.get("trees", {}):
+                rmeta["trees"].pop(item_name, None)
+                room_delete(u_low, proj, "trees", f"{item_name}.tar.zst")
+            if item_name in rmeta.get("files", {}):
+                rmeta["files"].pop(item_name, None)
+                room_delete(u_low, proj, "files", item_name)
+            with open(os.path.join(proj_dir, "config", "_room_meta.json"), "w", encoding="utf-8") as f:
+                json.dump(rmeta, f, indent=2)
+            local_t = safe_join(u_root, src_clean)
+            if os.path.isdir(local_t) and not os.path.islink(local_t):
+                shutil.rmtree(local_t, ignore_errors=True)
+            elif os.path.lexists(local_t):
+                os.remove(local_t)
+            room_mark_dirty(u_low, proj_dir, "config", delay=2)
+            dna_log(u_low, "MANAGER", f"Deleted '{src_clean}' ✓")
+            return {"ok": True}
+
+        # Virtual operations inside an unpacked partition folder
+        if len(parts) >= 2 and parts[1] != "config":
+            proj_dir = os.path.join(u_root, parts[0])
+            top_part = parts[1]
+            rel_in_proj = "/".join(parts[1:])
+            sub_rel = "/".join(parts[2:])
+            ops = _get_part_ops(proj_dir, top_part)
+            now_s = datetime.now().strftime("%y-%m-%d %H:%M")
+            now_f = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             if op == "delete":
-                room_note_change(u_low, u_root, src, "dir" if was_dir else "file")
-            elif op in ("move", "rename"):
-                room_note_change(u_low, u_root, src, "dir" if was_dir else "file")
-                room_note_change(u_low, u_root, os.path.relpath(target if op == "move" else dst_full, u_root))
-            elif op == "copy":
-                room_note_change(u_low, u_root, os.path.relpath(target, u_root))
-            elif op == "chmod_chcon":
-                room_note_change(u_low, u_root, src)
-                room_note_change(u_low, u_root, src.replace("\\", "/").split("/")[0] + "/config/x")
-            else:
-                room_note_change(u_low, u_root, src)
-        except Exception:
-            pass
+                if rel_in_proj not in ops.setdefault("deleted", []):
+                    ops["deleted"].append(rel_in_proj)
+                ops.setdefault("history", []).append({"op": "delete", "src": rel_in_proj})
+            elif op == "mkdir":
+                parent_rel = "/".join(parts[2:-1])
+                ops.setdefault("added", []).append({"rel": sub_rel, "name": parts[-1], "parent": parent_rel, "is_dir": True, "is_link": False, "link_target": "", "size": 0, "mtime": now_s, "mtime_full": now_f})
+                ops.setdefault("history", []).append({"op": "mkdir", "src": rel_in_proj})
+            elif op == "symlink":
+                parent_rel = "/".join(parts[2:-1])
+                ops.setdefault("added", []).append({"rel": sub_rel, "name": parts[-1], "parent": parent_rel, "is_dir": False, "is_link": True, "link_target": dst, "size": 0, "mtime": now_s, "mtime_full": now_f})
+                ops.setdefault("history", []).append({"op": "symlink", "src": rel_in_proj, "dst": dst})
+            elif op == "rename":
+                dst_parts = [p for p in dst_clean.split("/") if p]
+                dst_in_proj = "/".join(dst_parts[1:])
+                dst_sub = "/".join(dst_parts[2:])
+                ops.setdefault("deleted", []).append(rel_in_proj)
+                ops.setdefault("added", []).append({"rel": dst_sub, "name": dst_parts[-1], "parent": "/".join(dst_parts[2:-1]), "is_dir": False, "is_link": False, "link_target": "", "size": 0, "mtime": now_s, "mtime_full": now_f})
+                ops.setdefault("history", []).append({"op": "rename", "src": rel_in_proj, "dst": dst_in_proj})
+            _save_part_ops(proj_dir, top_part, ops)
+            room_mark_dirty(u_low, proj_dir, "config", delay=2)
+            dna_log(u_low, "MANAGER", f"Applied {op} on '{src_clean}' ✓")
+            return {"ok": True}
+
+        src_full = safe_join(u_root, src_clean) if src_clean else u_root
+        dst_full = safe_join(u_root, dst_clean) if dst_clean else u_root
+        if op == "mkdir":
+            os.makedirs(src_full, exist_ok=True)
+        elif op == "delete":
+            shutil.rmtree(src_full, ignore_errors=True) if os.path.isdir(src_full) else (os.remove(src_full) if os.path.lexists(src_full) else None)
+        elif op == "rename" and os.path.lexists(src_full):
+            shutil.move(src_full, dst_full)
         return {"ok": True}
 
     @router.post("/fs/upload")
-    async def api_fs_upload(
-        path: str = Form(""),
-        project: str = Form(""),
-        file: UploadFile = File(...),
-        x_dna_token: Optional[str] = Header(None)
-    ):
+    async def api_fs_upload(path: str = Form(""), project: str = Form(""), file: UploadFile = File(...), x_dna_token: Optional[str] = Header(None)):
         u_low = _current_user(x_dna_token)
         u_root = get_user_root(u_low)
         target_dir = get_proj_dir(u_low, project.strip()) if project.strip() else (safe_join(u_root, path) if path.strip() else get_proj_dir(u_low))
         os.makedirs(target_dir, exist_ok=True)
         out_p = safe_join(target_dir, os.path.basename(file.filename))
-        try:
-            with open(out_p + ".part", "wb") as f:
-                fl = Flusher(f)
-                while chunk := await file.read(1 * MB):
-                    f.write(chunk)
-                    fl.add(len(chunk))
-            os.replace(out_p + ".part", out_p)
-        finally:
-            safe_remove(out_p + ".part")
-            free_ram()
+        with open(out_p + ".part", "wb") as f:
+            fl = Flusher(f)
+            while chunk := await file.read(1 * MB):
+                f.write(chunk); fl.add(len(chunk))
+        os.replace(out_p + ".part", out_p)
         sz_mb = os.path.getsize(out_p) / MB
         dna_log(u_low, "UPLOAD", f"Uploaded '{file.filename}' ({sz_mb:.2f} MB)")
         room_note_change(u_low, u_root, os.path.relpath(out_p, u_root))
@@ -2990,47 +2632,19 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
     @router.get("/fs/download")
     def api_fs_download(path: str, token: str = ""):
         u_low = resolve_user_from_token(token)
-        if not ensure_local(u_low, get_user_root(u_low), path, wait=600):
-            raise HTTPException(status_code=409, detail="Still downloading from your HF room. Try again in a minute.")
         fp = safe_join(get_user_root(u_low), path)
-        if not os.path.isfile(fp):
-            raise HTTPException(status_code=404, detail="File not found.")
-        return FileResponse(fp, filename=os.path.basename(fp))
+        if os.path.isfile(fp):
+            return FileResponse(fp, filename=os.path.basename(fp))
+        parts = [p for p in path.replace("\\", "/").split("/") if p]
+        if len(parts) == 2 and room_enabled():
+            url = hf_hub_url(repo_id=DATASET_REPO_REF, filename=_rp(u_low, parts[0], "files", parts[1]), repo_type="dataset")
+            return RedirectResponse(url)
+        raise HTTPException(status_code=404, detail="File not found.")
 
     @router.get("/tools")
     def api_dna_tools():
-        names = ["mkfs.erofs", "fsck.erofs", "mke2fs", "e2fsck", "resize2fs", "debugfs", "mkfs.f2fs", "fsck.f2fs",
-                 "sload.f2fs", "simg2img", "img2simg", "lpmake", "lpdump", "lpunpack", "brotli", "7z"]
-        return {"tools": {n: bool(shutil.which(n)) for n in names}, "brotli_python": BROTLI_AVAILABLE,
-                "auto_hf_save": AUTO_HF, "restore_imgs_on_start": RESTORE_IMGS, "base_dir": DNA_BASE_DIR,
-                "server_started": PROC_START.strftime("%Y-%m-%d %H:%M:%S"),
-                "uptime_s": int((datetime.now() - PROC_START).total_seconds()), "memory": mem_stats()}
-
-    @router.post("/dispatch_worker")
-    def api_dispatch_worker(
-        target_file: str = Form(...),
-        action: str = Form("unpack_img"),
-        project: str = Form("Default_Project"),
-        x_dna_token: Optional[str] = Header(None)
-    ):
-        u_low = resolve_user_from_token(x_dna_token)
-        get_proj_dir(u_low, project)
-        names = [x.strip() for x in target_file.split(",") if x.strip()]
-        if not names:
-            raise HTTPException(status_code=400, detail="No file given.")
-        tid = _dispatch_gh_worker(u_low, "unpack", ",".join(names), {"mode": "img", "delete_source": False},
-                                  f"Unpacking {', '.join(names)}")
-        return {"ok": True, "task_id": tid}
-
-    @router.get("/room_status")
-    def api_room_status(x_dna_token: Optional[str] = Header(None)):
-        u_low = _current_user(x_dna_token)
-        proj = get_user_state(u_low)["current_project"]
-        proj_dir = get_proj_dir(u_low, proj)
-        base = f"rooms/{_uclean(u_low)}/{proj}/"
-        room = [f[len(base):] for f in (hf_list_cached(force=True) if room_enabled() else []) if f.startswith(base)]
-        return {"enabled": room_enabled(), "pull_results": PULL_RESULTS, "project": proj, "base_dir": DNA_BASE_DIR,
-                "in_room": room, "local": sorted(os.listdir(proj_dir))}
+        names = ["mkfs.erofs", "fsck.erofs", "mke2fs", "e2fsck", "resize2fs", "debugfs", "mkfs.f2fs", "fsck.f2fs", "sload.f2fs", "simg2img", "img2simg", "lpmake", "lpdump", "lpunpack", "brotli", "7z"]
+        return {"tools": {n: bool(shutil.which(n)) for n in names}, "brotli_python": BROTLI_AVAILABLE, "auto_hf_save": AUTO_HF, "restore_imgs_on_start": RESTORE_IMGS, "base_dir": DNA_BASE_DIR, "server_started": PROC_START.strftime("%Y-%m-%d %H:%M:%S"), "uptime_s": int((datetime.now() - PROC_START).total_seconds()), "memory": mem_stats()}
 
     app.include_router(router)
     return inject_dna_ui(html_page)
@@ -3183,12 +2797,6 @@ DNA_TAB_HTML = r"""
               <button type="button" onclick="openUnpackModal('img')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition"><span>Unpack img</span><span class="text-slate-500">&gt;</span></button>
               <button type="button" onclick="openUnpackModal('zstd')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition"><span>Unpack zstd</span><span class="text-slate-500">&gt;</span></button>
               <button type="button" onclick="openUnpackModal('super')" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition"><span>Unpack super</span><span class="text-slate-500">&gt;</span></button>
-              
-              <!-- ADD THIS NEW BUTTON HERE -->
-              <button type="button" onclick="dispatchHeavyWorker()" class="w-full py-3 flex items-center justify-between text-left hover:text-amber-300 transition text-amber-300 font-bold">
-                <span>⚡ Unpack with 7GB Cloud Worker (GitHub)</span>
-                <span class="text-slate-500">&gt;</span>
-              </button>
             </div>
           </div>
 
@@ -3627,7 +3235,7 @@ DNA_TAB_HTML = r"""
     let currentUnpackMode = "img";
     let currentConvertMode = "img_to_simg";
     let mgrActivePane = "L";
-    let mgrPaths = { L: "", R: "" };
+    let mgrPaths = { L: "Default_Project", R: "Default_Project" };
     let mgrItems = { L: [], R: [] };
     let mgrSelected = { L: null, R: null };
     let mgrModalTarget = null;
@@ -3642,30 +3250,6 @@ DNA_TAB_HTML = r"""
       const low = String(name || "").toLowerCase();
       return extList.some(ext => low.endsWith("." + ext));
     }
-
-    async function dispatchHeavyWorker() {
-  const file = prompt("Enter the exact partition filename in your project to unpack (e.g., system_ext.img):");
-  if (!file) return;
-
-  showTaskProgress("Dispatching 7GB GitHub worker for " + file + "...", 15);
-  const fd = new FormData();
-  fd.append("target_file", file.trim());
-  fd.append("action", "unpack_img");
-  fd.append("project", dnaState.current_project || "Default_Project");
-
-  try {
-    const res = await fetch("/api/dna/dispatch_worker", {
-      method: "POST",
-      headers: dnaHeaders(),
-      body: fd
-    });
-    const data = await res.json();
-    if (!res.ok) { hideTaskProgress(); throw new Error(data.detail || "Dispatch failed"); }
-    await pollDnaTask(data.task_id);
-  } catch (e) {
-    hideTaskProgress();
-    toast(e.message, "bad");
-  }
 }
 
 
@@ -3721,8 +3305,8 @@ DNA_TAB_HTML = r"""
         toast("Signed in as @" + dnaUser + " ✓", "ok");
         await checkDnaAuth();
         refreshDnaState();
-        loadPane("L", "");
-        loadPane("R", "");
+        loadPane("L", dnaState.current_project || "Default_Project");
+        loadPane("R", dnaState.current_project || "Default_Project");
       } catch (e) {
         err.textContent = e.message;
         err.classList.remove("hidden");
