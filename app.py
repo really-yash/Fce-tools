@@ -2,6 +2,8 @@ import os
 import re
 import bz2
 import base64
+import gc
+import ctypes
 import html as htmllib
 import lzma
 import json
@@ -752,7 +754,8 @@ def sniff_format(session, url: str, filename: str):
 # ENGINE:BEGIN — streaming readers, sparse images, super.img (LP) and payload.bin   #
 # ================================================================================ #
 
-PIECE = 16 << 20          # 4 MB network/disk pieces keep fast links (300 Mbps - 1 Gbps) saturated
+PIECE = int(os.environ.get('FLUX_PIECE_MB', '4')) << 20   # 4 MB pieces: fast enough, RAM-safe on 512 MB
+PREFETCH_MB = int(os.environ.get('FLUX_PREFETCH_MB', '32'))   # total read-ahead buffer, in MB
 SPARSE_MAGIC = 0xED26FF3A
 LP_GEOMETRY_MAGIC = 0x616C4467
 LP_HEADER_MAGIC = 0x414C5030
@@ -928,9 +931,10 @@ def net_chunks(session, url, job_id, total_size):
     if total_size and done < total_size:
         raise Exception(f"Download ended early ({done / MB:.1f} of {total_size / MB:.1f} MB). The server closed the connection; nothing was saved.")
 
-def prefetch(gen, depth=24):
+def prefetch(gen, depth=None):
     """Pulls the network in a background thread, so the link keeps downloading while the main
     thread decompresses and writes to disk."""
+    depth = depth or max(2, (PREFETCH_MB << 20) // PIECE)   # memory-bounded, not count-bounded
     q = queue.Queue(maxsize=depth)
     stop = threading.Event()
     END = object()
@@ -1764,6 +1768,31 @@ def update_vault_index(work_dir: str, entry: dict):
 
 # ---------------- MAIN EXTRACTION WORKER ---------------- #
 
+STUDIO_SLOT = threading.Semaphore(int(os.environ.get("FLUX_MAX_JOBS", "1")))
+
+def free_ram():
+    try:
+        gc.collect()
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+def guarded_extraction_worker(job_id: str, raw_url: str, target: str, user_meta: dict):
+    """Runs extractions one by one: two big streams at once would blow the 512 MB limit."""
+    job = JOBS[job_id]
+    if not STUDIO_SLOT.acquire(blocking=False):
+        job["search_label"] = "Waiting for another extraction to finish (saves RAM)..."
+        while not STUDIO_SLOT.acquire(timeout=1):
+            if job.get("cancel"):
+                job["state"] = "error"
+                job["error"] = "Cancelled while waiting."
+                return
+    try:
+        run_extraction_worker(job_id, raw_url, target, user_meta)
+    finally:
+        STUDIO_SLOT.release()
+        free_ram()
+
 def run_extraction_worker(job_id: str, raw_url: str, target: str, user_meta: dict):
     job = JOBS[job_id]
     work_dir = f"/tmp/flux_{job_id}"
@@ -1982,6 +2011,9 @@ def start_job(req: ExtractRequest):
     if "." not in target:
         target += ".img"
 
+    if len(JOBS) > 12:   # drop old finished jobs (their logs keep growing in RAM)
+        for k in [k for k, v in JOBS.items() if v.get("state") in ("done", "error")][:len(JOBS) - 8]:
+            JOBS.pop(k, None)
     job_id = uuid.uuid4().hex[:12]
     user_meta = {
         "device_name": req.device_name.strip(),
@@ -2021,7 +2053,7 @@ def start_job(req: ExtractRequest):
         "result": None,
         "error": None
     }
-    threading.Thread(target=run_extraction_worker, args=(job_id, req.rom_url.strip(), target, user_meta), daemon=True).start()
+    threading.Thread(target=guarded_extraction_worker, args=(job_id, req.rom_url.strip(), target, user_meta), daemon=True).start()
     return {"job_id": job_id}
 
 @app.get("/api/status/{job_id}")
