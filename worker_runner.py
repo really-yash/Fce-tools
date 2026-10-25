@@ -1,16 +1,11 @@
-import base64
-import os
-import re
-import sys
-import json
-import shutil
-import tarfile
-import tempfile
-import traceback
-import requests
+import os, re, sys, json, base64, shutil, tarfile, tempfile, traceback, subprocess, requests
+from datetime import datetime
 from urllib.parse import urlparse
 import zstandard as zstd
 from huggingface_hub import HfApi, hf_hub_download, hf_hub_url
+
+os.environ["DNA_AUTO_HF"] = "0"
+import dna_manager
 
 ACTION = os.environ.get("TASK_ACTION", "").strip()
 USER = re.sub(r"[^a-zA-Z0-9_-]", "_", os.environ.get("TASK_USER", "guest").strip().lower()) or "guest"
