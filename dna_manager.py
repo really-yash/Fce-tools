@@ -1856,6 +1856,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
             raise HTTPException(status_code=403, detail="Your IP address is banned.")
         u_raw = username.strip()
         u_low = u_raw.lower()
+        if not USERS_DB: _load_users_db()
         user_obj = USERS_DB.get(u_low)
         if not user_obj or user_obj.get("pw_hash") != _hash_pw(u_low, password):
             raise HTTPException(status_code=401, detail="Invalid username or password.")
@@ -1883,6 +1884,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
     @router.post("/admin/list")
     def api_admin_list(admin_pass: str = Form(...)):
         _verify_admin(admin_pass)
+        if not USERS_DB: _load_users_db()
         users_out = []
         for u_low, obj in sorted(USERS_DB.items()):
             u_root = os.path.join(USERS_ROOT_DIR, re.sub(r"[^a-zA-Z0-9_-]", "_", u_low))
@@ -2726,7 +2728,7 @@ DNA_TAB_HTML = r"""
             <label class="mono text-[10px] uppercase text-slate-400 block mb-1">Password</label>
             <input id="dnaAuthPass" type="password" placeholder="Enter password" class="cyber-input w-full px-3.5 py-2.5 rounded-xl text-xs mono text-white" />
           </div>
-          <div id="dnaAuthErr" class="hidden text-xs mono text-rose-300 bg-rose-500/10 border border-rose-500/30 p-2.5 rounded-xl"></div>
+                    <div id="dnaAuthErr" class="hidden text-xs mono text-rose-300 bg-rose-500/10 border border-rose-500/30 p-2.5 rounded-xl"></div>
           <div class="grid grid-cols-2 gap-2.5 pt-1">
             <button type="button" onclick="dnaAuthSubmit('login')" class="btn rip py-3 rounded-2xl font-bold text-xs text-slate-950 bg-gradient-to-r from-violet-400 to-amber-300">🔑 Sign In</button>
             <button type="button" onclick="dnaAuthSubmit('signup')" class="btn rip py-3 rounded-2xl font-bold text-xs text-violet-200 bg-violet-500/20 border border-violet-400/40">✨ Create Account</button>
@@ -3250,8 +3252,6 @@ DNA_TAB_HTML = r"""
       const low = String(name || "").toLowerCase();
       return extList.some(ext => low.endsWith("." + ext));
     }
-}
-
 
     /* ---------- AUTH & ADMIN ---------- */
     async function checkDnaAuth() {
