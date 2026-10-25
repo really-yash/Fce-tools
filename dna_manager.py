@@ -1,3 +1,4 @@
+import base64
 import os
 import re
 import time
@@ -132,6 +133,7 @@ def resolve_user_from_token(token: Optional[str]) -> str:
     if not token:
         raise HTTPException(status_code=401, detail="Please Sign In first.")
     t = token.replace("Bearer ", "").strip()
+    if not USERS_DB: _load_users_db()
     u_low = SESSIONS.get(t)
     if not u_low and t.startswith("u:"):
         parts = t.split(":")
@@ -596,6 +598,10 @@ def room_mark_dirty(u, proj_dir, top, delay=25):
         t.start()
 
 def room_delete(u, proj, kind=None, name=None, whole=False):
+    u_k = _uclean(u)
+    ROOM_TOMB[(u_k, proj, "*" if whole else kind, "*" if whole else name)] = time.time()
+    pre = f"rooms/{u_k}/{proj}/" if whole else f"rooms/{u_k}/{proj}/{kind}/{name}"
+    _HF_LIST["v"] = [x for x in _HF_LIST.get("v", []) if not (x.startswith(pre) if whole else x == pre)]
     if not room_enabled():
         return
     ROOM_TOMB[(_uclean(u), proj, "*" if whole else kind, "*" if whole else name)] = time.time()
@@ -1831,6 +1837,8 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
             raise HTTPException(status_code=400, detail="Username must be 3–28 letters, numbers, or _ . -")
         if len(password) < 4:
             raise HTTPException(status_code=400, detail="Password must be at least 4 characters.")
+        if not USERS_DB: _load_users_db()
+        if not USERS_DB: _load_users_db()
         with AUTH_LOCK:
             if u_low in USERS_DB:
                 raise HTTPException(status_code=400, detail="Username already exists. Please Sign In instead.")
@@ -1856,6 +1864,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
             raise HTTPException(status_code=403, detail="Your IP address is banned.")
         u_raw = username.strip()
         u_low = u_raw.lower()
+        if not USERS_DB: _load_users_db()
         if not USERS_DB: _load_users_db()
         user_obj = USERS_DB.get(u_low)
         if not user_obj or user_obj.get("pw_hash") != _hash_pw(u_low, password):
@@ -1969,6 +1978,21 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
     GH_BRANCH = os.environ.get("GH_BRANCH", "main").strip()
     GH_WORKFLOW = os.environ.get("GH_WORKFLOW", "worker.yml").strip()
 
+    def _get_room_meta(proj_dir: str) -> dict:
+        mp = os.path.join(proj_dir, "config", "_room_meta.json")
+        if os.path.exists(mp):
+            try:
+                return json.load(open(mp, "r", encoding="utf-8"))
+            except Exception:
+                pass
+        return {"files": {}, "trees": {}, "deleted_root": []}
+
+    def _save_room_meta(proj_dir: str, data: dict):
+        cfg_d = os.path.join(proj_dir, "config")
+        os.makedirs(cfg_d, exist_ok=True)
+        with open(os.path.join(cfg_d, "_room_meta.json"), "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
     def _dispatch_gh_worker(u_low: str, action: str, target_file: str, options: dict, label: str) -> str:
         gh_token = (os.environ.get("GH_DISPATCH_TOKEN") or "").strip()
         if gh_token.startswith("Github_pat_"):
@@ -1984,14 +2008,16 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         headers = {"Authorization": f"Bearer {gh_token}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
 
         tid = create_bg_task(f"[GitHub 7GB Worker] {label}")
-        set_bg_task(tid, 5, "Syncing latest changes to HF room...")
+        set_bg_task(tid, 6, "Syncing project metadata to HF room...")
         try:
-            room_flush_all()
+            room_flush_all(timeout=45)
         except Exception:
             pass
 
+        hf_b64 = base64.b64encode((HF_TOKEN_REF or "").encode("utf-8")).decode("ascii")
+        opts_payload = {**options, "dataset_repo": DATASET_REPO_REF, "hf_b64": hf_b64}
         payload = {"ref": GH_BRANCH, "inputs": {"task_id": tid, "action": action, "username": _uclean(u_low), "project": proj,
-                                                "target_file": target_file, "options": json.dumps({**options, "dataset_repo": DATASET_REPO_REF})}}
+                                                "target_file": target_file, "options": json.dumps(opts_payload)}}
         res = requests.post(f"{api_url}/workflows/{GH_WORKFLOW}/dispatches", headers=headers, json=payload, timeout=20)
         if res.status_code != 204:
             msg = f"GitHub dispatch failed ({res.status_code}): {res.text[:200]}"
@@ -1999,7 +2025,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
             raise HTTPException(status_code=500, detail=msg)
 
         dna_log(u_low, "WORKER", f"Dispatched '{action}' for '{target_file}' to GitHub 7GB Server ✓")
-        set_bg_task(tid, 12, f"[GitHub 7GB] Starting: {label}...")
+        set_bg_task(tid, 14, f"[GitHub 7GB] Starting runner: {label}...")
 
         def _poll_gh():
             t0 = time.time()
@@ -2009,11 +2035,11 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                     if r.status_code == 200:
                         for run in r.json().get("workflow_runs", []):
                             if tid in (run.get("display_title") or "") or tid in (run.get("name") or ""):
-                                st, conc = run.get("status"), run.get("conclusion")
+                                run_id, st, conc = run["id"], run.get("status"), run.get("conclusion")
                                 if st in ("queued", "waiting", "pending"):
                                     set_bg_task(tid, 18, f"[GitHub 7GB] Queued: {label}...")
                                 elif st == "in_progress":
-                                    set_bg_task(tid, min(94, int(25 + (time.time() - t0) * 1.5)), f"[GitHub 7GB] Running: {label}...")
+                                    set_bg_task(tid, min(94, int(25 + (time.time() - t0) * 1.4)), f"[GitHub 7GB] Running: {label}...")
                                 elif st == "completed":
                                     if conc == "success":
                                         set_bg_task(tid, 98, "Syncing output into Manager...")
@@ -2023,8 +2049,18 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                                         BG_TASKS[tid].update({"pct": 100, "label": f"Completed: {label} ✓", "state": "done"})
                                         dna_log(u_low, "SUCCESS", f"GitHub 7GB Worker finished: {label} ✓")
                                     else:
-                                        BG_TASKS[tid].update({"state": "error", "error": f"Worker failed ({conc}). See {run.get('html_url', '')}"})
-                                        dna_log(u_low, "ERROR", f"Worker failed ({conc}) for {label}")
+                                        step_err = ""
+                                        try:
+                                            jr = requests.get(f"{api_url}/runs/{run_id}/jobs", headers=headers, timeout=12).json()
+                                            for jb in jr.get("jobs", []):
+                                                for s in jb.get("steps", []):
+                                                    if s.get("conclusion") == "failure":
+                                                        step_err = f" at '{s.get('name')}'"
+                                        except Exception:
+                                            pass
+                                        err_m = f"GitHub Worker failed ({conc}){step_err}. Check Actions tab."
+                                        BG_TASKS[tid].update({"state": "error", "error": err_m})
+                                        dna_log(u_low, "ERROR", err_m)
                                     return
                                 break
                 except Exception:
@@ -2045,24 +2081,94 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         x_dna_token: Optional[str] = Header(None)
     ):
         u_low = _current_user(x_dna_token)
-        if dest_rel_dir.strip():
-            first_p = [x for x in dest_rel_dir.replace("\\", "/").split("/") if x]
-            if first_p:
-                get_proj_dir(u_low, first_p[0])
+        u_root = get_user_root(u_low)
+        rel_parts = [x for x in dest_rel_dir.replace("\\", "/").split("/") if x]
+        if rel_parts:
+            proj_dir = get_proj_dir(u_low, rel_parts[0])
         elif project:
-            get_proj_dir(u_low, project)
+            proj_dir = get_proj_dir(u_low, project)
+        else:
+            proj_dir = get_proj_dir(u_low)
+        proj_name = os.path.basename(proj_dir)
         safe_name = os.path.basename(target_name.strip())
-        tid = _dispatch_gh_worker(u_low, "import_vault", safe_name, {"download_url": download_url, "repo_path": repo_path, "dest_rel_dir": dest_rel_dir}, f"Importing {safe_name}")
-        return {"ok": True, "task_id": tid}
+        tid = create_bg_task(f"Importing {safe_name} into {proj_name}...")
 
-    def _get_room_meta(proj_dir: str) -> dict:
-        mp = os.path.join(proj_dir, "config", "_room_meta.json")
-        if os.path.exists(mp):
+        # Look up file size & metadata without downloading into RAM
+        fsize = 0
+        sha_val = ""
+        fmt_val = "img"
+        try:
+            from app import read_vault_index
+            idx = read_vault_index()
+            if idx and isinstance(idx.get("images"), list):
+                for img in idx["images"]:
+                    if (repo_path and repo_path in (img.get("download_url") or "")) or img.get("target") == safe_name:
+                        sz_s = str(img.get("size", ""))
+                        m = re.search(r"([0-9.]+)\s*MB", sz_s, re.I)
+                        if m:
+                            fsize = int(float(m.group(1)) * MB)
+                        sha_val = img.get("sha256", "")
+                        sig = str(img.get("signature", "")).lower()
+                        if "erofs" in sig: fmt_val = "erofs"
+                        elif "ext4" in sig: fmt_val = "ext4"
+                        elif "sparse" in sig: fmt_val = "sparse"
+                        elif "super" in sig: fmt_val = "super"
+                        break
+        except Exception:
+            pass
+
+        url = download_url.strip() or (hf_hub_url(repo_id=DATASET_REPO_REF, filename=repo_path.strip(), repo_type="dataset") if repo_path.strip() else "")
+        if not fsize and url:
             try:
-                return json.load(open(mp, "r", encoding="utf-8"))
+                hdrs = {"User-Agent": "Mozilla/5.0"}
+                if HF_TOKEN_REF and "huggingface.co" in url:
+                    hdrs["Authorization"] = f"Bearer {HF_TOKEN_REF}"
+                hr = requests.head(url, headers=hdrs, allow_redirects=True, timeout=10)
+                fsize = int(hr.headers.get("Content-Length") or 0)
             except Exception:
                 pass
-        return {"files": {}, "trees": {}}
+
+        now_s = datetime.now().strftime("%y-%m-%d %H:%M")
+        now_f = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # If pulled into a subfolder of an unpacked partition in Manager
+        if len(rel_parts) >= 2 and rel_parts[1] != "config":
+            top_part = rel_parts[1]
+            sub_parent = "/".join(rel_parts[2:])
+            sub_rel = f"{sub_parent}/{safe_name}".strip("/")
+            ops = _get_part_ops(proj_dir, top_part)
+            full_rel = f"{top_part}/{sub_rel}".strip("/")
+            if full_rel in ops.get("deleted", []):
+                ops["deleted"].remove(full_rel)
+            ops["added"] = [x for x in ops.get("added", []) if x.get("rel") != sub_rel]
+            ops.setdefault("added", []).append({
+                "rel": sub_rel, "name": safe_name, "parent": sub_parent,
+                "is_dir": False, "is_link": False, "link_target": "",
+                "size": fsize, "mtime": now_s, "mtime_full": now_f,
+                "download_url": url, "repo_path": repo_path.strip()
+            })
+            _save_part_ops(proj_dir, top_part, ops)
+        else:
+            rmeta = _get_room_meta(proj_dir)
+            if safe_name in rmeta.get("deleted_root", []):
+                rmeta["deleted_root"].remove(safe_name)
+            ROOM_TOMB.pop((_uclean(u_low), proj_name, "files", safe_name), None)
+            rmeta.setdefault("files", {})[safe_name] = {
+                "size": fsize,
+                "format": fmt_val,
+                "download_url": url,
+                "repo_path": repo_path.strip(),
+                "sha256": sha_val,
+                "mtime": now_s,
+                "mtime_full": now_f
+            }
+            _save_room_meta(proj_dir, rmeta)
+
+        room_mark_dirty(u_low, proj_dir, "config", delay=1)
+        sz_mb = f"{fsize / MB:.2f} MB" if fsize else "Cloud"
+        BG_TASKS[tid].update({"pct": 100, "label": f"Imported {safe_name} ({sz_mb}) ✓", "state": "done"})
+        dna_log(u_low, "SUCCESS", f"Imported '{safe_name}' ({sz_mb}) into /sdcard/DNA/{proj_name} ✓")
+        return {"ok": True, "task_id": tid}
 
     @router.get("/state")
     def api_dna_state(project: Optional[str] = None, x_dna_token: Optional[str] = Header(None)):
@@ -2075,15 +2181,18 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         if not os.path.exists(os.path.join(proj_dir, "config", "_room_meta.json")):
             _bg(lambda: sync_config_only(u_low, proj_dir))
         rmeta = _get_room_meta(proj_dir)
+        del_root = set(rmeta.get("deleted_root", []))
         projects = sorted([d for d in os.listdir(u_root) if os.path.isdir(os.path.join(u_root, d))])
 
         img_files, unpacked_parts, zst_files, dat_br_files = [], [], [], []
         seen_files, seen_parts = set(), set()
 
         for fn, fmeta in rmeta.get("files", {}).items():
+            if fn in del_root or _tombed(u_low, proj_name, "files", fn):
+                continue
             seen_files.add(fn)
             sz_str = f"{fmeta.get('size', 0) / MB:.2f} MB" if fmeta.get("size") else "Cloud"
-            fmt_str = fmeta.get("format", "raw")
+            fmt_str = fmeta.get("format", "img")
             low = fn.lower()
             if low.endswith((".img", ".bin", ".simg")):
                 img_files.append({"name": fn, "format": fmt_str, "size": sz_str})
@@ -2093,7 +2202,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                 dat_br_files.append({"name": fn, "size": sz_str})
 
         for tname, tmeta in rmeta.get("trees", {}).items():
-            if tname != "config":
+            if tname != "config" and tname not in del_root and not _tombed(u_low, proj_name, "trees", f"{tname}.tar.zst"):
                 seen_parts.add(tname)
                 unpacked_parts.append({"name": tname, "format": tmeta.get("format", "erofs")})
 
@@ -2105,7 +2214,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                 for rf in hf_list_cached():
                     if rf.startswith(fpre):
                         fn = rf[len(fpre):]
-                        if "/" not in fn and fn not in seen_files:
+                        if "/" not in fn and fn not in seen_files and fn not in del_root and not _tombed(u_low, proj_name, "files", fn):
                             seen_files.add(fn)
                             low = fn.lower()
                             if low.endswith((".img", ".bin", ".simg")):
@@ -2116,14 +2225,14 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                                 dat_br_files.append({"name": fn, "size": "HF Room"})
                     elif rf.startswith(tpre) and rf.endswith(".tar.zst"):
                         tname = rf[len(tpre):-8]
-                        if tname != "config" and tname not in seen_parts:
+                        if tname != "config" and tname not in seen_parts and tname not in del_root and not _tombed(u_low, proj_name, "trees", f"{tname}.tar.zst"):
                             seen_parts.add(tname)
                             unpacked_parts.append({"name": tname, "format": "erofs"})
             except Exception:
                 pass
 
         for entry in sorted(os.listdir(proj_dir)):
-            if entry.startswith(".restore_") or entry.endswith(".part"):
+            if entry.startswith(".restore_") or entry.endswith(".part") or entry in del_root:
                 continue
             full = os.path.join(proj_dir, entry)
             if os.path.isfile(full) and entry not in seen_files:
@@ -2206,9 +2315,9 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
             get_proj_dir(u_low, ustate["current_project"])
             dna_log(u_low, "PROJECT", f"Cleared project '/sdcard/DNA/{ustate['current_project']}'")
         elif action == "delete":
-            target = name or ustate["current_project"]
-            p = os.path.join(u_root, re.sub(r"[^a-zA-Z0-9._-]", "_", target))
-            room_delete(u_low, re.sub(r"[^a-zA-Z0-9._-]", "_", target), whole=True)
+            target = re.sub(r"[^a-zA-Z0-9._-]", "_", (name or ustate["current_project"]).strip())
+            p = os.path.join(u_root, target)
+            room_delete(u_low, target, whole=True)
             shutil.rmtree(p, ignore_errors=True)
             ustate["current_project"] = "Default_Project"
             get_proj_dir(u_low, "Default_Project")
@@ -2218,16 +2327,49 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
     @router.post("/push_vault")
     def api_push_to_vault(filename: str = Form(...), device_name: str = Form("DNA Ported Image"), x_dna_token: Optional[str] = Header(None)):
         u_low = _current_user(x_dna_token)
+        u_root = get_user_root(u_low)
         ustate = get_user_state(u_low)
-        proj = ustate["current_project"]
+        parts = [p for p in filename.replace("\\", "/").split("/") if p]
+        proj = parts[0] if len(parts) >= 2 else ustate["current_project"]
         base_fn = os.path.basename(filename)
-        dl_url = hf_hub_url(repo_id=dataset_repo, filename=_rp(u_low, proj, "files", base_fn), repo_type="dataset")
-        dna_log(u_low, "SUCCESS", f"File available in HF Room → {dl_url}")
-        tid = create_bg_task(f"Published '{base_fn}' ✓")
-        BG_TASKS[tid].update({"pct": 100, "label": f"Published '{base_fn}' to Vault ✓", "state": "done"})
+        proj_dir = get_proj_dir(u_low, proj)
+        rmeta = _get_room_meta(proj_dir)
+        finfo = rmeta.get("files", {}).get(base_fn, {})
+        local_fp = safe_join(u_root, filename)
+
+        tid = create_bg_task(f"Publishing '{base_fn}' to Universal Vault...")
+        def _w():
+            try:
+                if os.path.isfile(local_fp):
+                    repo_p = f"dna_ported/{_uclean(u_low)}/{proj}/{base_fn}"
+                    hf_api.upload_file(path_or_fileobj=local_fp, path_in_repo=repo_p, repo_id=dataset_repo, repo_type="dataset")
+                    dl_url = hf_hub_url(repo_id=dataset_repo, filename=repo_p, repo_type="dataset")
+                    sz_mb = f"{os.path.getsize(local_fp) / MB:.2f} MB"
+                    sha = sha256_file(local_fp)
+                else:
+                    dl_url = finfo.get("download_url") or hf_hub_url(repo_id=dataset_repo, filename=_rp(u_low, proj, "files", base_fn), repo_type="dataset")
+                    sz_mb = f"{finfo.get('size', 0) / MB:.2f} MB" if finfo.get("size") else "Cloud"
+                    sha = finfo.get("sha256") or hashlib.sha256(dl_url.encode()).hexdigest()
+                from app import update_vault_index
+                entry = {
+                    "rom_key": f"DNA__{_uclean(u_low)}__{proj}",
+                    "device_name": f"{device_name} (@{USERS_DB.get(u_low, {}).get('username', u_low)})",
+                    "codename": proj, "rom_version": "DNA-Port", "rom_category": "Custom ROM",
+                    "rom_format": "DNA KITCHEN", "auto_status": "Packed in DNA Cloud Kitchen",
+                    "rom_url": dl_url, "rom_filename": base_fn, "target": base_fn,
+                    "source": f"/sdcard/DNA/{proj}", "sha256": sha, "size": sz_mb,
+                    "signature": finfo.get("format", "IMG").upper(), "download_url": dl_url,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")
+                }
+                update_vault_index(TASKS_TMP_DIR, entry)
+                BG_TASKS[tid].update({"pct": 100, "label": f"Published '{base_fn}' to Vault ✓", "state": "done"})
+                dna_log(u_low, "SUCCESS", f"Published '{base_fn}' to Universal HF Vault ✓")
+            except Exception as e:
+                BG_TASKS[tid].update({"state": "error", "error": str(e)})
+        _bg(_w)
         return {"ok": True, "task_id": tid}
 
-    # ---------------- MT MANAGER DUAL-PANE ENDPOINTS (INSTANT VIRTUAL TREE) ---------------- #
+    # ---------------- MT MANAGER DUAL-PANE ENDPOINTS ---------------- #
 
     def _get_part_ops(proj_dir: str, part_name: str) -> dict:
         op_p = os.path.join(proj_dir, "config", f"{part_name}_ops.json")
@@ -2316,13 +2458,13 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                     is_lnk = len(sp) >= 5 and not is_sub
                     is_d = is_sub or (sp[3].endswith("755") and not is_lnk and "." not in cname)
                     if cname not in seen_ch or is_sub:
-                        seen_ch[cname] = {"rel": crel, "name": cname, "parent": sub_rel, "is_dir": is_d, "is_link": is_lnk, "link_target": sp[4] if is_lnk else "", "size": 0, "mtime": "26-10-24 12:00", "mtime_full": "2026-10-24 12:00:00"}
+                        seen_ch[cname] = {"rel": crel, "name": cname, "parent": sub_rel, "is_dir": is_d, "is_link": is_lnk, "link_target": sp[4] if is_lnk else "", "size": 0, "mtime": "26-10-25 12:00", "mtime_full": "2026-10-25 12:00:00"}
                 out = list(seen_ch.values())
 
         for add_it in ops.get("added", []):
             if add_it.get("parent", "") == sub_rel and not _is_del(add_it.get("rel", "")):
-                if not any(x["name"] == add_it["name"] for x in out):
-                    out.append(add_it)
+                out = [x for x in out if x["name"] != add_it["name"]]
+                out.append(add_it)
         return out
 
     @router.get("/fs/list")
@@ -2338,6 +2480,8 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
             sync_config_only(u_low, proj_dir)
             proj_dir, top_part, fs_map, fc_map = _load_fs_maps_for_dir(u_root, rel_from_user)
 
+        rmeta = _get_room_meta(proj_dir) if proj_dir else {"files": {}, "trees": {}, "deleted_root": []}
+        del_root = set(rmeta.get("deleted_root", []))
         items, dir_count, file_count = [], 0, 0
         seen_names = set()
 
@@ -2363,6 +2507,8 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
             for name in sorted(os.listdir(target_dir), key=lambda x: (not os.path.isdir(os.path.join(target_dir, x)), x.lower())):
                 if name.startswith(".restore_") or name.endswith(".part"):
                     continue
+                if len(parts) == 1 and name in del_root:
+                    continue
                 full = os.path.join(target_dir, name)
                 rel_item = f"{rel_from_user}/{name}".strip("/")
                 is_dir = os.path.isdir(full)
@@ -2375,36 +2521,35 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                 rel_in_proj = os.path.relpath(full, proj_dir).replace("\\", "/") if proj_dir else ""
                 items.append(_fmt_item(name, rel_item, rel_in_proj, is_dir, is_link, os.readlink(full) if is_link else "", sz, mdt.strftime("%y-%m-%d %H:%M"), mdt.strftime("%Y-%m-%d %H:%M:%S")))
 
-        # 2. Project Root: Show imported .img files & unpacked partition folders from HF Room
+        # 2. Project Root: Show imported .img files & unpacked partition folders from _room_meta + HF Room
         if len(parts) == 1 and proj_dir:
             proj = parts[0]
-            rmeta = _get_room_meta(proj_dir)
             for tname, tinfo in sorted(rmeta.get("trees", {}).items()):
-                if tname != "config" and tname not in seen_names:
+                if tname != "config" and tname not in seen_names and tname not in del_root and not _tombed(u_low, proj, "trees", f"{tname}.tar.zst"):
                     seen_names.add(tname)
                     dir_count += 1
-                    items.append(_fmt_item(tname, f"{proj}/{tname}", tname, True, False, "", 0, tinfo.get("mtime", "26-10-24 12:00"), tinfo.get("mtime_full", "2026-10-24 12:00:00")))
+                    items.append(_fmt_item(tname, f"{proj}/{tname}", tname, True, False, "", 0, tinfo.get("mtime", "26-10-25 12:00"), tinfo.get("mtime_full", "2026-10-25 12:00:00")))
             for fn, finfo in sorted(rmeta.get("files", {}).items()):
-                if fn not in seen_names:
+                if fn not in seen_names and fn not in del_root and not _tombed(u_low, proj, "files", fn):
                     seen_names.add(fn)
                     file_count += 1
-                    items.append(_fmt_item(fn, f"{proj}/{fn}", fn, False, False, "", int(finfo.get("size", 0)), finfo.get("mtime", "26-10-24 12:00"), finfo.get("mtime_full", "2026-10-24 12:00:00")))
+                    items.append(_fmt_item(fn, f"{proj}/{fn}", fn, False, False, "", int(finfo.get("size", 0)), finfo.get("mtime", "26-10-25 12:00"), finfo.get("mtime_full", "2026-10-25 12:00:00")))
             if room_enabled():
                 u_key = _uclean(u_low)
                 fpre, tpre = f"rooms/{u_key}/{proj}/files/", f"rooms/{u_key}/{proj}/trees/"
                 for rf in hf_list_cached():
                     if rf.startswith(tpre) and rf.endswith(".tar.zst"):
                         tn = rf[len(tpre):-8]
-                        if tn != "config" and tn not in seen_names:
+                        if tn != "config" and tn not in seen_names and tn not in del_root and not _tombed(u_low, proj, "trees", f"{tn}.tar.zst"):
                             seen_names.add(tn)
                             dir_count += 1
-                            items.append(_fmt_item(tn, f"{proj}/{tn}", tn, True, False, "", 0, "26-10-24 12:00", "2026-10-24 12:00:00"))
+                            items.append(_fmt_item(tn, f"{proj}/{tn}", tn, True, False, "", 0, "26-10-25 12:00", "2026-10-25 12:00:00"))
                     elif rf.startswith(fpre):
                         fn = rf[len(fpre):]
-                        if "/" not in fn and fn not in seen_names:
+                        if "/" not in fn and fn not in seen_names and fn not in del_root and not _tombed(u_low, proj, "files", fn):
                             seen_names.add(fn)
                             file_count += 1
-                            items.append(_fmt_item(fn, f"{proj}/{fn}", fn, False, False, "", 0, "26-10-24 12:00", "2026-10-24 12:00:00"))
+                            items.append(_fmt_item(fn, f"{proj}/{fn}", fn, False, False, "", 0, "26-10-25 12:00", "2026-10-25 12:00:00"))
 
         # 3. Inside an unpacked partition folder (e.g. Default_Project/system_ext/...)
         elif len(parts) >= 2 and proj_dir and top_part != "config":
@@ -2419,7 +2564,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                 dir_count += 1 if is_d else 0
                 file_count += 0 if is_d else 1
                 rel_in_proj = f"{top_part}/{vit['rel']}".strip("/")
-                items.append(_fmt_item(nm, f"{proj}/{rel_in_proj}", rel_in_proj, is_d, bool(vit.get("is_link")), vit.get("link_target", ""), int(vit.get("size", 0)), vit.get("mtime", "26-10-24 12:00"), vit.get("mtime_full", "2026-10-24 12:00:00")))
+                items.append(_fmt_item(nm, f"{proj}/{rel_in_proj}", rel_in_proj, is_d, bool(vit.get("is_link")), vit.get("link_target", ""), int(vit.get("size", 0)), vit.get("mtime", "26-10-25 12:00"), vit.get("mtime_full", "2026-10-25 12:00:00")))
 
         items.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
         total_disk, _used, free_disk = shutil.disk_usage(u_root)
@@ -2437,14 +2582,25 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
     @router.get("/fs/checksum")
     def api_fs_checksum(path: str, x_dna_token: Optional[str] = Header(None)):
         u_low = _current_user(x_dna_token)
-        fp = safe_join(get_user_root(u_low), path)
-        if not os.path.isfile(fp):
-            raise HTTPException(status_code=404, detail="File is stored in Cloud Room.")
-        md5_h, sha1_h, sha256_h, crc_v = hashlib.md5(), hashlib.sha1(), hashlib.sha256(), 0
-        with open(fp, "rb") as f:
-            while chunk := f.read(2 * MB):
-                md5_h.update(chunk); sha1_h.update(chunk); sha256_h.update(chunk); crc_v = zlib.crc32(chunk, crc_v)
-        return {"filename": os.path.basename(fp), "md5": md5_h.hexdigest(), "sha1": sha1_h.hexdigest(), "sha256": sha256_h.hexdigest(), "crc32": f"{crc_v & 0xFFFFFFFF:08x}"}
+        u_root = get_user_root(u_low)
+        fp = safe_join(u_root, path)
+        parts = [p for p in path.replace("\\", "/").split("/") if p]
+        if not os.path.isfile(fp) and len(parts) >= 3:
+            cached_t = os.path.join(u_root, parts[0], "config", "_texts", parts[1], *parts[2:])
+            if os.path.isfile(cached_t):
+                fp = cached_t
+        if os.path.isfile(fp):
+            md5_h, sha1_h, sha256_h, crc_v = hashlib.md5(), hashlib.sha1(), hashlib.sha256(), 0
+            with open(fp, "rb") as f:
+                while chunk := f.read(2 * MB):
+                    md5_h.update(chunk); sha1_h.update(chunk); sha256_h.update(chunk); crc_v = zlib.crc32(chunk, crc_v)
+            return {"filename": os.path.basename(fp), "md5": md5_h.hexdigest(), "sha1": sha1_h.hexdigest(), "sha256": sha256_h.hexdigest(), "crc32": f"{crc_v & 0xFFFFFFFF:08x}"}
+        if len(parts) == 2:
+            proj_dir = os.path.join(u_root, parts[0])
+            finfo = _get_room_meta(proj_dir).get("files", {}).get(parts[1], {})
+            if finfo.get("sha256"):
+                return {"filename": parts[1], "md5": "(cloud verified)", "sha1": "(cloud verified)", "sha256": finfo["sha256"], "crc32": "verified"}
+        raise HTTPException(status_code=404, detail="Checksum available after local download.")
 
     @router.get("/fs/read")
     def api_fs_read(path: str, x_dna_token: Optional[str] = Header(None)):
@@ -2478,10 +2634,19 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
             ops = _get_part_ops(proj_dir, top_part)
             parent_rel = "/".join(parts[2:-1])
             nm = parts[-1]
-            if not any(x.get("rel") == sub_rel for x in ops.get("added", [])):
-                ops.setdefault("added", []).append({"rel": sub_rel, "name": nm, "parent": parent_rel, "is_dir": False, "is_link": False, "link_target": "", "size": len(content.encode("utf-8")), "mtime": datetime.now().strftime("%y-%m-%d %H:%M"), "mtime_full": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
-                _save_part_ops(proj_dir, top_part, ops)
-            room_mark_dirty(u_low, proj_dir, "config", delay=2)
+            full_rel = f"{top_part}/{sub_rel}".strip("/")
+            if full_rel in ops.get("deleted", []):
+                ops["deleted"].remove(full_rel)
+            ops["added"] = [x for x in ops.get("added", []) if x.get("rel") != sub_rel]
+            ops.setdefault("added", []).append({
+                "rel": sub_rel, "name": nm, "parent": parent_rel,
+                "is_dir": False, "is_link": False, "link_target": "",
+                "size": len(content.encode("utf-8")),
+                "mtime": datetime.now().strftime("%y-%m-%d %H:%M"),
+                "mtime_full": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
+            _save_part_ops(proj_dir, top_part, ops)
+            room_mark_dirty(u_low, proj_dir, "config", delay=1)
             dna_log(u_low, "MANAGER", f"Saved '{path}' in cloud overlay ✓")
             return {"ok": True}
         fp = safe_join(u_root, path)
@@ -2545,7 +2710,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                 with open(fc_f, "w", encoding="utf-8") as f:
                     for k, v in sorted(existing_fc.items()):
                         f.write(f"{k} {v}\n")
-            room_mark_dirty(u_low, proj_dir, "config", delay=2)
+            room_mark_dirty(u_low, proj_dir, "config", delay=1)
             dna_log(u_low, "MANAGER", f"Updated permissions ({norm_mode}) & SELinux on '{src_clean}' ✓")
             return {"ok": True}
 
@@ -2554,20 +2719,22 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
             proj, item_name = parts[0], parts[1]
             proj_dir = os.path.join(u_root, proj)
             rmeta = _get_room_meta(proj_dir)
-            if item_name in rmeta.get("trees", {}):
-                rmeta["trees"].pop(item_name, None)
-                room_delete(u_low, proj, "trees", f"{item_name}.tar.zst")
-            if item_name in rmeta.get("files", {}):
-                rmeta["files"].pop(item_name, None)
-                room_delete(u_low, proj, "files", item_name)
-            with open(os.path.join(proj_dir, "config", "_room_meta.json"), "w", encoding="utf-8") as f:
-                json.dump(rmeta, f, indent=2)
+            rmeta.get("trees", {}).pop(item_name, None)
+            rmeta.get("files", {}).pop(item_name, None)
+            if item_name not in rmeta.setdefault("deleted_root", []):
+                rmeta["deleted_root"].append(item_name)
+            _save_room_meta(proj_dir, rmeta)
+            room_delete(u_low, proj, "trees", f"{item_name}.tar.zst")
+            room_delete(u_low, proj, "files", item_name)
+            for fn_rm in (f"{item_name}_manifest.json", f"{item_name}_ops.json", f"{item_name}_fs_config", f"{item_name}_file_contexts", f"{item_name}_info.json"):
+                safe_remove(os.path.join(proj_dir, "config", fn_rm))
+            shutil.rmtree(os.path.join(proj_dir, "config", "_texts", item_name), ignore_errors=True)
             local_t = safe_join(u_root, src_clean)
             if os.path.isdir(local_t) and not os.path.islink(local_t):
                 shutil.rmtree(local_t, ignore_errors=True)
             elif os.path.lexists(local_t):
                 os.remove(local_t)
-            room_mark_dirty(u_low, proj_dir, "config", delay=2)
+            room_mark_dirty(u_low, proj_dir, "config", delay=1)
             dna_log(u_low, "MANAGER", f"Deleted '{src_clean}' ✓")
             return {"ok": True}
 
@@ -2583,6 +2750,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
             if op == "delete":
                 if rel_in_proj not in ops.setdefault("deleted", []):
                     ops["deleted"].append(rel_in_proj)
+                ops["added"] = [x for x in ops.get("added", []) if x.get("rel") != sub_rel]
                 ops.setdefault("history", []).append({"op": "delete", "src": rel_in_proj})
             elif op == "mkdir":
                 parent_rel = "/".join(parts[2:-1])
@@ -2592,15 +2760,29 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                 parent_rel = "/".join(parts[2:-1])
                 ops.setdefault("added", []).append({"rel": sub_rel, "name": parts[-1], "parent": parent_rel, "is_dir": False, "is_link": True, "link_target": dst, "size": 0, "mtime": now_s, "mtime_full": now_f})
                 ops.setdefault("history", []).append({"op": "symlink", "src": rel_in_proj, "dst": dst})
-            elif op == "rename":
+            elif op in ("rename", "move", "copy"):
                 dst_parts = [p for p in dst_clean.split("/") if p]
-                dst_in_proj = "/".join(dst_parts[1:])
-                dst_sub = "/".join(dst_parts[2:])
-                ops.setdefault("deleted", []).append(rel_in_proj)
-                ops.setdefault("added", []).append({"rel": dst_sub, "name": dst_parts[-1], "parent": "/".join(dst_parts[2:-1]), "is_dir": False, "is_link": False, "link_target": "", "size": 0, "mtime": now_s, "mtime_full": now_f})
-                ops.setdefault("history", []).append({"op": "rename", "src": rel_in_proj, "dst": dst_in_proj})
+                if len(dst_parts) >= 2:
+                    dst_part = dst_parts[1]
+                    dst_sub = "/".join(dst_parts[2:])
+                    if op in ("move", "copy") and (not dst_sub or not dst_sub.endswith(parts[-1])):
+                        dst_sub = f"{dst_sub}/{parts[-1]}".strip("/")
+                    dst_in_proj = f"{dst_part}/{dst_sub}".strip("/")
+                    dst_ops = ops if dst_part == top_part else _get_part_ops(proj_dir, dst_part)
+                    if op in ("rename", "move"):
+                        if rel_in_proj not in ops.setdefault("deleted", []):
+                            ops["deleted"].append(rel_in_proj)
+                    dst_ops.setdefault("added", []).append({
+                        "rel": dst_sub, "name": os.path.basename(dst_sub),
+                        "parent": os.path.dirname(dst_sub), "is_dir": False,
+                        "is_link": False, "link_target": "", "size": 0,
+                        "mtime": now_s, "mtime_full": now_f
+                    })
+                    dst_ops.setdefault("history", []).append({"op": op, "src": rel_in_proj, "dst": dst_in_proj})
+                    if dst_part != top_part:
+                        _save_part_ops(proj_dir, dst_part, dst_ops)
             _save_part_ops(proj_dir, top_part, ops)
-            room_mark_dirty(u_low, proj_dir, "config", delay=2)
+            room_mark_dirty(u_low, proj_dir, "config", delay=1)
             dna_log(u_low, "MANAGER", f"Applied {op} on '{src_clean}' ✓")
             return {"ok": True}
 
@@ -2620,27 +2802,46 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         u_root = get_user_root(u_low)
         target_dir = get_proj_dir(u_low, project.strip()) if project.strip() else (safe_join(u_root, path) if path.strip() else get_proj_dir(u_low))
         os.makedirs(target_dir, exist_ok=True)
-        out_p = safe_join(target_dir, os.path.basename(file.filename))
+        fname = os.path.basename(file.filename)
+        out_p = safe_join(target_dir, fname)
         with open(out_p + ".part", "wb") as f:
             fl = Flusher(f)
             while chunk := await file.read(1 * MB):
                 f.write(chunk); fl.add(len(chunk))
         os.replace(out_p + ".part", out_p)
-        sz_mb = os.path.getsize(out_p) / MB
-        dna_log(u_low, "UPLOAD", f"Uploaded '{file.filename}' ({sz_mb:.2f} MB)")
+        sz = os.path.getsize(out_p)
+        sz_mb = sz / MB
+        proj_dir = get_proj_dir(u_low, project.strip() if project.strip() else None)
+        rmeta = _get_room_meta(proj_dir)
+        if fname in rmeta.get("deleted_root", []):
+            rmeta["deleted_root"].remove(fname)
+        rmeta.setdefault("files", {})[fname] = {
+            "size": sz, "format": detect_img_type(out_p),
+            "mtime": datetime.now().strftime("%y-%m-%d %H:%M"),
+            "mtime_full": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        _save_room_meta(proj_dir, rmeta)
+        dna_log(u_low, "UPLOAD", f"Uploaded '{fname}' ({sz_mb:.2f} MB)")
         room_note_change(u_low, u_root, os.path.relpath(out_p, u_root))
-        return {"ok": True, "filename": file.filename, "size_mb": f"{sz_mb:.2f} MB"}
+        room_mark_dirty(u_low, proj_dir, "config", delay=1)
+        return {"ok": True, "filename": fname, "size_mb": f"{sz_mb:.2f} MB"}
 
     @router.get("/fs/download")
     def api_fs_download(path: str, token: str = ""):
         u_low = resolve_user_from_token(token)
-        fp = safe_join(get_user_root(u_low), path)
+        u_root = get_user_root(u_low)
+        fp = safe_join(u_root, path)
         if os.path.isfile(fp):
             return FileResponse(fp, filename=os.path.basename(fp))
         parts = [p for p in path.replace("\\", "/").split("/") if p]
-        if len(parts) == 2 and room_enabled():
-            url = hf_hub_url(repo_id=DATASET_REPO_REF, filename=_rp(u_low, parts[0], "files", parts[1]), repo_type="dataset")
-            return RedirectResponse(url)
+        if len(parts) == 2:
+            proj_dir = os.path.join(u_root, parts[0])
+            finfo = _get_room_meta(proj_dir).get("files", {}).get(parts[1], {})
+            if finfo.get("download_url"):
+                return RedirectResponse(finfo["download_url"])
+            if room_enabled():
+                url = hf_hub_url(repo_id=DATASET_REPO_REF, filename=_rp(u_low, parts[0], "files", parts[1]), repo_type="dataset")
+                return RedirectResponse(url)
         raise HTTPException(status_code=404, detail="File not found.")
 
     @router.get("/tools")
@@ -2728,7 +2929,7 @@ DNA_TAB_HTML = r"""
             <label class="mono text-[10px] uppercase text-slate-400 block mb-1">Password</label>
             <input id="dnaAuthPass" type="password" placeholder="Enter password" class="cyber-input w-full px-3.5 py-2.5 rounded-xl text-xs mono text-white" />
           </div>
-                    <div id="dnaAuthErr" class="hidden text-xs mono text-rose-300 bg-rose-500/10 border border-rose-500/30 p-2.5 rounded-xl"></div>
+                              <div id="dnaAuthErr" class="hidden text-xs mono text-rose-300 bg-rose-500/10 border border-rose-500/30 p-2.5 rounded-xl"></div>
           <div class="grid grid-cols-2 gap-2.5 pt-1">
             <button type="button" onclick="dnaAuthSubmit('login')" class="btn rip py-3 rounded-2xl font-bold text-xs text-slate-950 bg-gradient-to-r from-violet-400 to-amber-300">🔑 Sign In</button>
             <button type="button" onclick="dnaAuthSubmit('signup')" class="btn rip py-3 rounded-2xl font-bold text-xs text-violet-200 bg-violet-500/20 border border-violet-400/40">✨ Create Account</button>
