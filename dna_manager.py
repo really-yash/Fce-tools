@@ -398,9 +398,18 @@ def _bg(fn):
     t.start()
     return t
 
-def hf_list_cached(max_age=8.0, force=False):
+def hf_list_cached(max_age=30.0, force=False):
+    """Lists only the 'rooms/' part of the dataset (not the whole firmware cache) and keeps it for 30 s."""
     if force or time.time() - _HF_LIST["t"] > max_age:
-        _HF_LIST["v"] = list(HF_API_REF.list_repo_files(repo_id=DATASET_REPO_REF, repo_type="dataset"))
+        paths = []
+        try:
+            for it in HF_API_REF.list_repo_tree(repo_id=DATASET_REPO_REF, path_in_repo="rooms", repo_type="dataset", recursive=True):
+                if hasattr(it, "size"):
+                    paths.append(it.path)
+        except Exception as e:
+            if "404" not in str(e) and "not found" not in str(e).lower():
+                paths = [f for f in HF_API_REF.list_repo_files(repo_id=DATASET_REPO_REF, repo_type="dataset") if f.startswith("rooms/")]
+        _HF_LIST["v"] = paths
         _HF_LIST["t"] = time.time()
     return _HF_LIST["v"]
 
@@ -683,11 +692,17 @@ def room_bootstrap(u):
         pass
 
 
-def sync_config_only(u, proj_dir):
+_CFG_SYNC = {}
+
+def sync_config_only(u, proj_dir, force=False):
     """Pulls ONLY config.tar.zst (~50KB) into proj_dir/config so Render never uses RAM or creates .restore_ folders."""
     if not room_enabled():
         return
     proj = os.path.basename(proj_dir)
+    _k, _now = (_uclean(u), proj), time.time()
+    if not force and _now - _CFG_SYNC.get(_k, 0) < 45:
+        return
+    _CFG_SYNC[_k] = _now
     try:
         from huggingface_hub import hf_hub_download
         with tempfile.TemporaryDirectory(dir=TASKS_TMP_DIR) as td:
@@ -2045,7 +2060,7 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
                                         set_bg_task(tid, 98, "Syncing output into Manager...")
                                         _HF_LIST["t"] = 0.0
                                         hf_list_cached(force=True)
-                                        sync_config_only(u_low, get_proj_dir(u_low, proj))
+                                        sync_config_only(u_low, get_proj_dir(u_low, proj), force=True)
                                         BG_TASKS[tid].update({"pct": 100, "label": f"Completed: {label} ✓", "state": "done"})
                                         dna_log(u_low, "SUCCESS", f"GitHub 7GB Worker finished: {label} ✓")
                                     else:
