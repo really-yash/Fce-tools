@@ -447,34 +447,22 @@ def reconcile_metadata(user_meta: dict, rom_filename: str, archive_root: str, in
 # ---------------- URL & GOOGLE DRIVE RESOLVERS ---------------- #
 
 def make_session(target_url: str = "", job_id: str = "", force_proxy: bool = False):
-    """
-    Pooled session: keeps connections warm, retries flaky gateways, never accepts compressed transfer.
-    Locks to a single IP for the entire download, and uses a rotated proxy/Tor IP when PixelDrain
-    reaches its 5 GB quota (or when force_proxy is requested).
-    """
     s = requests.Session()
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept-Encoding": "identity",
     })
-    retry = Retry(total=3, backoff_factor=0.6, status_forcelist=(500, 502, 503, 504), allowed_methods=frozenset(["GET", "HEAD"]))
-    ad = HTTPAdapter(pool_connections=8, pool_maxsize=16, max_retries=retry)
+    retry = Retry(total=3, backoff_factor=0.3, status_forcelist=(500, 502, 503, 504), allowed_methods=frozenset(["GET", "HEAD"]))
+    ad = HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=retry)
     s.mount("https://", ad)
     s.mount("http://", ad)
 
-    want_rotated = force_proxy or (
-        is_throttled_host(target_url)
-        and (IP_STATE["force_rotated_ip"] or IP_STATE["direct_pixeldrain_bytes"] >= PIXELDRAIN_DIRECT_LIMIT or bool(PROXY_LIST))
-    )
-
-    if want_rotated:
+    if force_proxy or (ALWAYS_ROTATE_PIXELDRAIN and is_throttled_host(target_url)):
         if IP_STATE["active_proxy"]:
             p = IP_STATE["active_proxy"]
             s.proxies = {"http": p, "https": p}
-            job_log(job_id, "HTTP", f"[IP-Rotator] Locked session to rotated proxy IP for this download (Rotation #{IP_STATE['rotations_count']}).")
-        elif tor_socks_alive():
+        elif STEM_AVAILABLE and IP_STATE["last_exit_ip"] != "Direct Server IP":
             s.proxies = {"http": TOR_SOCKS_PROXY, "https": TOR_SOCKS_PROXY}
-            job_log(job_id, "HTTP", f"[IP-Rotator] Locked session to rotated Tor Exit IP ({IP_STATE['last_exit_ip']}) for this download.")
     return s
 
 def extract_gdrive_id(url: str):
@@ -764,7 +752,7 @@ def sniff_format(session, url: str, filename: str):
 # ENGINE:BEGIN — streaming readers, sparse images, super.img (LP) and payload.bin   #
 # ================================================================================ #
 
-PIECE = 4 << 20          # 4 MB network/disk pieces keep fast links (300 Mbps - 1 Gbps) saturated
+PIECE = 16 << 20          # 4 MB network/disk pieces keep fast links (300 Mbps - 1 Gbps) saturated
 SPARSE_MAGIC = 0xED26FF3A
 LP_GEOMETRY_MAGIC = 0x616C4467
 LP_HEADER_MAGIC = 0x414C5030
