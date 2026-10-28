@@ -1,4 +1,5 @@
 import os
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 import re
 import bz2
 import base64
@@ -234,6 +235,7 @@ def job_add_code(job_id: str, stage_title: str, code_snippet: str):
 
 def stage(job, key, pct, label=None):
     """Sets one of the four progress bars: search | cont | ext | fin."""
+    job["updated"] = time.time()
     job[f"{key}_progress"] = max(0, min(100, int(pct)))
     if label is not None:
         job[f"{key}_label"] = label
@@ -890,8 +892,14 @@ def zst_stream(stream):
     return Stream(zstd.ZstdDecompressor().stream_reader(stream, read_across_frames=True))
 
 def _speed(job, nbytes, t0):
-    el = max(0.05, time.time() - t0)
-    job["speed"] = f"{(nbytes * 8) / (el * 1_000_000):.0f} Mbps ({nbytes / MB / el:.1f} MB/s)"
+    """Speed over the last ~1 second (not the average since the start)."""
+    now = time.time()
+    prev = job.get("_sp")
+    if prev is None or now - prev[0] >= 1.0:
+        if prev:
+            inst = max(0, nbytes - prev[1]) / max(0.05, now - prev[0])
+            job["speed"] = f"{inst * 8 / 1_000_000:.0f} Mbps ({inst / MB:.1f} MB/s)"
+        job["_sp"] = (now, nbytes)
 
 def net_chunks(session, url, job_id, total_size):
     """Network byte source. Drives the 'Locating file' bar until the file is found.
@@ -981,16 +989,41 @@ def prefetch(gen, depth=None):
 
     return consume()
 
+class Flusher:
+    """Every 32 MB written: flush + fsync + tell the OS to drop those pages from RAM.
+    Without this, a 6 GB write fills the page cache and a 512 MB server stalls or dies."""
+    def __init__(self, f, step=32 * MB):
+        self.f, self.step, self.n = f, step, 0
+
+    def add(self, k):
+        self.n += k
+        if self.n >= self.step:
+            self.n = 0
+            try:
+                self.f.flush()
+                os.fsync(self.f.fileno())
+                os.posix_fadvise(self.f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+            except Exception:
+                pass
+
+def drop_read_cache(f):
+    try:
+        os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+    except Exception:
+        pass
+
 def copy_to_file(job_id, reader, out_path, size, label):
     job = JOBS[job_id]
     t0, copied, last = time.time(), 0, 0.0
     with open(out_path, "wb") as dst:
+        fl = Flusher(dst)
         while True:
             check_cancel(job)
             buf = reader.read(PIECE)
             if not buf:
                 break
             dst.write(buf)
+            fl.add(len(buf))
             copied += len(buf)
             now = time.time()
             if now - last >= 0.25:
@@ -1195,6 +1228,7 @@ def extract_from_super(job_id, stream, part_req, out_path, size_hint=None, cname
         return i >= 0 and ext[i][0] + ext[i][1] > off
 
     wr = [0]
+    fl_holder = [None]
 
     def write_piece(out, off, data):
         end = off + len(data)
@@ -1206,6 +1240,8 @@ def extract_from_super(job_id, stream, part_req, out_path, size_hint=None, cname
                 out.seek(dst + (a - ps))
                 out.write(data[a - off:b - off])
                 wr[0] += b - a
+                if fl_holder[0]:
+                    fl_holder[0].add(b - a)
             i += 1
 
     t0 = time.time()
@@ -1233,6 +1269,7 @@ def extract_from_super(job_id, stream, part_req, out_path, size_hint=None, cname
     reader.tick = tick
 
     with open(out_path, "wb") as out:
+        fl_holder[0] = Flusher(out)
         out.truncate(total)
         write_piece(out, 0, bytes(head))
         for off, data in pending:
@@ -1355,6 +1392,7 @@ def extract_from_payload(job_id, stream, part_name, out_path):
     t0, fetched, written = time.time(), 0, 0
     total_ops = len(todo)
     with open(out_path, "wb") as out:
+        fl = Flusher(out)
         if expected_size:
             out.truncate(expected_size)
         for idx, (otype, doff, dlen, dst, dsha) in enumerate(todo, 1):
@@ -1387,6 +1425,7 @@ def extract_from_payload(job_id, stream, part_name, out_path):
                 ln = nb * block_size
                 out.seek(sb * block_size)
                 out.write(raw[pos:pos + ln])
+                fl.add(ln)
                 pos += ln
                 written += min(ln, max(0, len(raw) - (pos - ln)))
 
@@ -1667,6 +1706,8 @@ def verify_and_hash_file(
             if expected_crc32 is not None:
                 crc_val = zlib.crc32(chunk, crc_val)
             hashed += len(chunk)
+            if hashed % (64 * MB) < len(chunk):
+                drop_read_cache(f)
             if on_progress:
                 on_progress(hashed, actual_size)
 
@@ -2060,7 +2101,9 @@ def start_job(req: ExtractRequest):
 def get_job_status(job_id: str):
     if job_id not in JOBS:
         raise HTTPException(status_code=404, detail="Job not found.")
-    return JSONResponse(JOBS[job_id], headers=NO_STORE)
+    snap = dict(JOBS[job_id])
+    snap["now"] = time.time()
+    return JSONResponse(snap, headers=NO_STORE)
 
 @app.post("/api/cancel/{job_id}")
 def cancel_job(job_id: str):
@@ -2583,6 +2626,22 @@ HTML_PAGE = """<!DOCTYPE html>
     let currentJob = null;
     let cancelling = false;
     let vaultBusy = false;
+    let pollFails = 0;
+
+    function lostJob(code) {
+      stopPolling();
+      resetLaunchUI();
+      const e = document.getElementById("errBanner");
+      e.textContent = (code === 404
+        ? "The server forgot this job: it was restarted (very likely out of memory). "
+        : "Lost connection to the server (it is probably restarting after running out of memory). ")
+        + "Nothing was added to the Vault. Try again with a smaller target, or use the GitHub worker for big partitions.";
+      e.classList.remove("hidden");
+      e.classList.remove("slide-open");
+      void e.offsetWidth;
+      e.classList.add("slide-open");
+      toast("Server restarted during the job", "bad");
+    }
 
     const STAGES = [
       { k: "search", ico: "🔎", color: "c-violet" },
@@ -2916,12 +2975,18 @@ HTML_PAGE = """<!DOCTYPE html>
       const errBanner = document.getElementById("errBanner");
       try {
         const res = await fetch("/api/status/" + jobId, { cache: "no-store" });
-        if (!res.ok) return;
+        if (!res.ok) {
+          pollFails++;
+          if (res.status === 404 || pollFails > 25) lostJob(res.status);
+          return;
+        }
+        pollFails = 0;
         const job = await res.json();
 
         applyStages(job);
         setText(document.getElementById("scanEntryText"), job.current_scan !== "—" ? "Scanning: " + job.current_scan : "Streaming in cloud RAM (0 MB client data used)");
-        setText(document.getElementById("hudSpeed"), job.speed);
+        const idle = (job.now && job.updated) ? job.now - job.updated : 0;
+        setText(document.getElementById("hudSpeed"), (job.state === "running" && idle > 20) ? "⚠ no progress for " + Math.round(idle) + "s" : job.speed);
 
         setText(document.getElementById("conSpeed"), job.speed);
         setText(document.getElementById("conOffset"), job.bytes_streamed_mb + " (" + job.hex_offset + ")");
@@ -3005,7 +3070,7 @@ HTML_PAGE = """<!DOCTYPE html>
           errBanner.classList.add("slide-open");
           toast("Extraction failed", "bad");
         }
-      } catch (ignore) {} finally { pollBusy = false; }
+      } catch (ignore) { pollFails++; if (pollFails > 25) lostJob(0); } finally { pollBusy = false; }
     }
 
     /* ---------- vault ---------- */
