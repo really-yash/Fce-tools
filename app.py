@@ -2038,32 +2038,8 @@ def run_extraction_worker(job_id: str, raw_url: str, target: str, user_meta: dic
 
 # ---------------- API ENDPOINTS ---------------- #
 
-@app.post("/api/start")
-def start_job(req: ExtractRequest):
-    if not HF_TOKEN:
-        raise HTTPException(status_code=500, detail="Missing HF_TOKEN in Render Environment Variables.")
-    if not req.rom_url.strip():
-        raise HTTPException(status_code=400, detail="Please paste a valid ROM download link.")
-
-    # basename() blocks path traversal like "../../x"; matching itself is case-insensitive
-    target = os.path.basename(req.target.strip().replace("\\", "/"))
-    if not target:
-        raise HTTPException(status_code=400, detail="Please select or type a target file.")
-    if "." not in target:
-        target += ".img"
-
-    if len(JOBS) > 12:   # drop old finished jobs (their logs keep growing in RAM)
-        for k in [k for k, v in JOBS.items() if v.get("state") in ("done", "error")][:len(JOBS) - 8]:
-            JOBS.pop(k, None)
-    job_id = uuid.uuid4().hex[:12]
-    user_meta = {
-        "device_name": req.device_name.strip(),
-        "rom_version": req.rom_version.strip(),
-        "rom_category": req.rom_category.strip().lower(),
-        "rom_format": req.rom_format.strip().lower() if req.rom_category.strip().lower() == "stock" else "custom"
-    }
-
-    JOBS[job_id] = {
+def make_job(target: str) -> dict:
+    return {
         "state": "running",
         "cancel": False,
         "target": target,
@@ -2094,7 +2070,148 @@ def start_job(req: ExtractRequest):
         "result": None,
         "error": None
     }
-    threading.Thread(target=guarded_extraction_worker, args=(job_id, req.rom_url.strip(), target, user_meta), daemon=True).start()
+
+
+# ---------------- BIG PARTITIONS RUN ON THE GITHUB 7 GB SERVER ---------------- #
+GH_REPO = os.environ.get("GH_REPO", "really-yash/Fce-tools").strip()
+GH_BRANCH = os.environ.get("GH_BRANCH", "main").strip()
+GH_WORKFLOW = os.environ.get("GH_WORKFLOW", "worker.yml").strip()
+SMALL_TARGETS = {"boot", "init_boot", "vendor_boot", "dtbo", "recovery", "vbmeta", "vbmeta_system", "vbmeta_vendor", "lk",
+                 "preloader", "preloader_raw", "logo", "md1img", "spmfw", "scp", "sspm", "tee", "gz", "mcupm", "pi_img", "dpm"}
+
+def studio_on_gh(target: str) -> bool:
+    """STUDIO_ON_GH = big (default: everything except small boot-type images) | all | off"""
+    mode = os.environ.get("STUDIO_ON_GH", "big").strip().lower()
+    if mode == "off" or not os.environ.get("GH_DISPATCH_TOKEN", "").strip():
+        return False
+    if mode == "all":
+        return True
+    return os.path.splitext(target.lower())[0] not in SMALL_TARGETS
+
+def run_studio_on_github(job_id: str, raw_url: str, target: str, user_meta: dict):
+    import math
+    job = JOBS[job_id]
+    tok = os.environ.get("GH_DISPATCH_TOKEN", "").strip()
+    if tok.startswith("Github_pat_"):
+        tok = "g" + tok[1:]
+    api = f"https://api.github.com/repos/{GH_REPO}/actions"
+    hdr = {"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+
+    def fail(msg):
+        job_log(job_id, "ERROR", msg)
+        job["error"] = msg
+        job["state"] = "error"
+
+    try:
+        job["cont_skip"] = True
+        stage(job, "cont", 100, "Not needed — the GitHub server downloads it")
+        stage(job, "search", 4, "Starting the GitHub 7 GB server...")
+        job_log(job_id, "INFO", "Big partition → running on the GitHub 7 GB server (no 512 MB RAM limit).")
+        payload = {"ref": GH_BRANCH, "inputs": {
+            "task_id": job_id, "action": "studio_extract", "username": "studio", "project": "studio", "target_file": target,
+            "options": json.dumps({"job_id": job_id, "rom_url": raw_url, "target": target, "user_meta": user_meta, "dataset_repo": DATASET_REPO})}}
+        r = requests.post(f"{api}/workflows/{GH_WORKFLOW}/dispatches", headers=hdr, json=payload, timeout=20)
+        if r.status_code != 204:
+            hint = {404: f"'{GH_WORKFLOW}' not found on branch '{GH_BRANCH}' of {GH_REPO}.", 401: "GH_DISPATCH_TOKEN is invalid or expired.",
+                    403: "GH_DISPATCH_TOKEN needs 'Actions: Read and write'.", 422: "worker.yml inputs mismatch."}.get(r.status_code, "")
+            return fail(f"GitHub dispatch failed ({r.status_code}). {hint} {r.text[:160]}")
+
+        t0, run_id, run_url = time.time(), None, ""
+        while time.time() - t0 < 3 * 3600:
+            time.sleep(5)
+            try:
+                rr = requests.get(f"{api}/workflows/{GH_WORKFLOW}/runs?event=workflow_dispatch&per_page=30", headers=hdr, timeout=15)
+                run = next((x for x in rr.json().get("workflow_runs", []) if job_id in (x.get("display_title") or "")), None) if rr.status_code == 200 else None
+            except Exception:
+                run = None
+            if run:
+                run_id, run_url = run["id"], run.get("html_url", "")
+            if job.get("cancel"):
+                if run_id:
+                    try:
+                        requests.post(f"{api}/runs/{run_id}/cancel", headers=hdr, timeout=15)
+                    except Exception:
+                        pass
+                job["error"], job["state"] = "Cancelled", "cancelled"
+                job_log(job_id, "INFO", "Cancelled; the GitHub run was stopped.")
+                return
+            el = time.time() - t0
+            if run is None:
+                if el > 150:
+                    return fail("GitHub accepted the job but no run appeared. Check that worker.yml has run-name + the task_id input.")
+                stage(job, "search", 6, "Waiting for the GitHub server...")
+                continue
+            st, conc = run.get("status"), run.get("conclusion")
+            if st in ("queued", "waiting", "pending"):
+                stage(job, "search", 8, "GitHub 7 GB server: queued...")
+            elif st == "in_progress":
+                stage(job, "search", 100, "GitHub 7 GB server is working on it")
+                stage(job, "ext", 90 * (1 - math.exp(-el / 240)), f"Downloading + extracting {target} on GitHub ({int(el)}s)...")
+                job["speed"] = "GitHub 7 GB server"
+                job["current_scan"] = run_url
+            elif st == "completed":
+                data = None
+                for _ in range(10):
+                    try:
+                        p = hf_hub_download(repo_id=DATASET_REPO, filename=f"studio_jobs/{job_id}.json", repo_type="dataset",
+                                            token=HF_TOKEN, force_download=True)
+                        with open(p, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        break
+                    except Exception:
+                        time.sleep(3)
+                if data:
+                    for lg in data.get("logs", []):
+                        job["logs"].append(lg)
+                    try:
+                        hf_api.delete_file(path_in_repo=f"studio_jobs/{job_id}.json", repo_id=DATASET_REPO, repo_type="dataset")
+                    except Exception:
+                        pass
+                if conc == "success" and data and data.get("state") == "done" and data.get("result"):
+                    for k in ("search", "cont", "ext", "fin"):
+                        stage(job, k, 100)
+                    stage(job, "fin", 100, "Verified & synced to Vault ✓ (GitHub server)")
+                    job["result"] = data["result"]
+                    job_log(job_id, "SUCCESS", "Done on the GitHub 7 GB server. File is in the Vault.")
+                    job["state"] = "done"
+                else:
+                    msg = (data or {}).get("error") or f"GitHub run failed ({conc}). Logs: {run_url}"
+                    return fail(msg)
+                return
+        fail("Timed out waiting for the GitHub server.")
+    except Exception as e:
+        fail(f"GitHub job error: {e}")
+
+@app.post("/api/start")
+def start_job(req: ExtractRequest):
+    if not HF_TOKEN:
+        raise HTTPException(status_code=500, detail="Missing HF_TOKEN in Render Environment Variables.")
+    if not req.rom_url.strip():
+        raise HTTPException(status_code=400, detail="Please paste a valid ROM download link.")
+
+    # basename() blocks path traversal like "../../x"; matching itself is case-insensitive
+    target = os.path.basename(req.target.strip().replace("\\", "/"))
+    if not target:
+        raise HTTPException(status_code=400, detail="Please select or type a target file.")
+    if "." not in target:
+        target += ".img"
+
+    if len(JOBS) > 12:   # drop old finished jobs (their logs keep growing in RAM)
+        for k in [k for k, v in JOBS.items() if v.get("state") in ("done", "error")][:len(JOBS) - 8]:
+            JOBS.pop(k, None)
+    job_id = uuid.uuid4().hex[:12]
+    user_meta = {
+        "device_name": req.device_name.strip(),
+        "rom_version": req.rom_version.strip(),
+        "rom_category": req.rom_category.strip().lower(),
+        "rom_format": req.rom_format.strip().lower() if req.rom_category.strip().lower() == "stock" else "custom"
+    }
+
+    JOBS[job_id] = make_job(target)
+    if studio_on_gh(target):
+        threading.Thread(target=run_studio_on_github, args=(job_id, req.rom_url.strip(), target, user_meta), daemon=True).start()
+    else:
+        threading.Thread(target=guarded_extraction_worker, args=(job_id, req.rom_url.strip(), target, user_meta), daemon=True).start()
     return {"job_id": job_id}
 
 @app.get("/api/status/{job_id}")
