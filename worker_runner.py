@@ -459,6 +459,28 @@ def main():
             push_file_to_hf(f"{stem}.transfer.list", remove_after=True)
         push_tree_to_hf("config")
 
+    elif ACTION == "studio_extract":
+        # Studio download+extract of a big partition: runs here (7 GB RAM) instead of on the 512 MB Render server
+        os.environ["DATASET_REPO"] = REPO
+        os.environ["HF_TOKEN"] = HF_TOKEN
+        job_id = OPTIONS["job_id"]
+        import app as flux
+        flux.DATASET_REPO, flux.HF_TOKEN = REPO, HF_TOKEN
+        flux.hf_api = HfApi(token=HF_TOKEN)
+        flux.JOBS[job_id] = flux.make_job(OPTIONS["target"])
+        try:
+            flux.run_extraction_worker(job_id, OPTIONS["rom_url"], OPTIONS["target"], OPTIONS["user_meta"])
+        finally:
+            _j = flux.JOBS[job_id]
+            _out = {"state": _j.get("state"), "result": _j.get("result"), "error": _j.get("error"), "logs": _j.get("logs", [])[-80:]}
+            _p = os.path.join(SCRATCH, f"{job_id}.json")
+            with open(_p, "w", encoding="utf-8") as _f:
+                json.dump(_out, _f)
+            api.upload_file(path_or_fileobj=_p, path_in_repo=f"studio_jobs/{job_id}.json", repo_id=REPO, repo_type="dataset",
+                            commit_message=f"studio job {job_id}")
+        if flux.JOBS[job_id].get("state") != "done":
+            raise Exception(flux.JOBS[job_id].get("error") or "Studio extraction failed")
+
 if __name__ == "__main__":
     try:
         main()
