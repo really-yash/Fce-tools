@@ -1501,13 +1501,23 @@ def _pack_single_inner(username: str, req: PackSingleRequest, tid: str = None) -
         target_blks = (target_sz + 4095) // 4096
 
         opts = ["^has_journal"] if req.rw_mode == "ro" else []
-        cmd = ["mke2fs", "-t", "ext4", "-b", "4096", "-L", part_name, "-M", f"/{part_name}", "-d", part_dir]
+        cmd = ["mke2fs", "-t", "ext4", "-b", "4096", "-L", part_name, "-M", f"/{part_name}", "-d", part_dir] + (["-m", "0"] if req.rw_mode == "ro" else [])
         if opts:
             cmd.extend(["-O", ",".join(opts)])
         cmd.extend([out_img_raw, str(target_blks)])
         rc, err = run_quiet(cmd)
         if rc != 0 or not os.path.exists(out_img_raw):
             raise Exception(f"mke2fs failed: {err}")
+
+        # SELinux labels + uid/gid/mode: mke2fs -d cannot set them. Without this Android boots with unlabeled files -> bootloop.
+        if shutil.which("e2fsdroid") and os.path.exists(fc_file) and os.path.exists(fs_cfg):
+            rc, err = run_quiet(["e2fsdroid", "-e", "-C", fs_cfg, "-S", fc_file, "-a", f"/{part_name}", out_img_raw])
+            if rc != 0:
+                safe_remove(out_img_raw)
+                raise Exception(f"e2fsdroid failed (SELinux labels not applied, image NOT saved): {err[-200:]}")
+            dna_log(username, "SUCCESS", "e2fsdroid applied SELinux labels + permissions ✓")
+        else:
+            dna_log(username, "WARN", "ext4 image has NO SELinux labels (e2fsdroid missing): it will probably BOOTLOOP. Use EROFS, or add e2fsdroid to the image.")
 
         if req.compress_ext4 and shutil.which("resize2fs"):
             run_quiet(["e2fsck", "-f", "-y", out_img_raw])
@@ -1524,7 +1534,12 @@ def _pack_single_inner(username: str, req: PackSingleRequest, tid: str = None) -
         if rc != 0:
             raise Exception(f"mkfs.f2fs failed: {err}")
         if shutil.which("sload.f2fs"):
-            rc, err = run_quiet(["sload.f2fs", "-f", part_dir, "-t", f"/{part_name}", out_img_raw])
+            _sl = ["sload.f2fs", "-f", part_dir, "-t", f"/{part_name}"]
+            if os.path.exists(fs_cfg):
+                _sl += ["-C", fs_cfg]
+            if os.path.exists(fc_file):
+                _sl += ["-s", fc_file]
+            rc, err = run_quiet(_sl + [out_img_raw])
             if rc != 0:
                 raise Exception(f"sload.f2fs failed: {err}")
     else:
@@ -1609,6 +1624,11 @@ def _build_super_inner(username: str, req: PackSuperRequest, tid: str = None) ->
     part_entries = []
     expect = []
     data_cursor = 1024 * 1024
+    for _chk in (req.selected_imgs or []):
+        _cp = safe_join(proj_dir, _chk)
+        _t = detect_img_type(_cp) if not is_sparse_file(_cp) else "sparse"
+        if os.path.getsize(_cp) < 8192 or _t == "unknown":
+            raise Exception(f"'{_chk}' is not a valid erofs/ext4/f2fs image (type: {_t}, {os.path.getsize(_cp)} bytes). Refusing to build a super that would not boot.")
 
     with open(raw_super, "wb") as out:
         out.truncate(total_bytes)
@@ -2671,6 +2691,112 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         room_note_change(u_low, u_root, path)
         return {"ok": True}
 
+    def _hf_server_copy(u_low, src_proj, dst_proj, kind, room_name, new_room_name, move):
+        """Copies (or moves) one object inside the HF dataset WITHOUT downloading it. Falls back to download+upload for small non-LFS files."""
+        from huggingface_hub import CommitOperationCopy
+        src_p, dst_p = _rp(u_low, src_proj, kind, room_name), _rp(u_low, dst_proj, kind, new_room_name)
+        try:
+            HF_API_REF.create_commit(repo_id=DATASET_REPO_REF, repo_type="dataset",
+                                     operations=[CommitOperationCopy(src_path_in_repo=src_p, path_in_repo=dst_p)],
+                                     commit_message=f"{'move' if move else 'copy'} {src_proj}/{room_name} -> {dst_proj}/{new_room_name}")
+        except Exception:
+            from huggingface_hub import hf_hub_download
+            with tempfile.TemporaryDirectory(dir=TASKS_TMP_DIR) as td:
+                p = hf_hub_download(repo_id=DATASET_REPO_REF, filename=src_p, repo_type="dataset", token=HF_TOKEN_REF, local_dir=td)
+                HF_API_REF.upload_file(path_or_fileobj=p, path_in_repo=dst_p, repo_id=DATASET_REPO_REF, repo_type="dataset",
+                                       commit_message=f"copy {src_proj}/{room_name} -> {dst_proj}/{new_room_name}")
+        ROOM_TOMB.pop((_uclean(u_low), dst_proj, kind, new_room_name), None)
+        hf_list_invalidate() if "hf_list_invalidate" in globals() else _HF_LIST.update({"t": 0.0})
+
+    def _root_copy_move(u_low, u_root, src_proj, name, dst_clean, move):
+        dparts = [p for p in dst_clean.split("/") if p]
+        if not dparts:
+            raise HTTPException(status_code=400, detail="Pick a destination pane/project first.")
+        dst_proj = dparts[0]
+        new_name = dparts[1] if len(dparts) >= 2 else name
+        src_dir, dst_dir = os.path.join(u_root, src_proj), os.path.join(u_root, dst_proj)
+        if not os.path.isdir(src_dir):
+            raise HTTPException(status_code=404, detail="Source project not found.")
+        os.makedirs(os.path.join(dst_dir, "config"), exist_ok=True)
+        if dst_proj == src_proj and new_name == name:
+            raise HTTPException(status_code=400, detail="Source and destination are the same. Select the other project in the other pane.")
+        sm, dm = _get_room_meta(src_dir), _get_room_meta(dst_dir)
+        idx = room_cloud_index(u_low, src_proj) if room_enabled() else {"trees": set(), "files": set()}
+        local_src = os.path.join(src_dir, name)
+        is_tree = os.path.isdir(local_src) and not os.path.islink(local_src) or name in sm.get("trees", {}) or name in idx["trees"]
+        kind = "trees" if is_tree else "files"
+        if is_tree and new_name != name:
+            raise HTTPException(status_code=400, detail="An unpacked folder keeps its name when copied to another project.")
+        room_name, new_room_name = (f"{name}.tar.zst", f"{new_name}.tar.zst") if is_tree else (name, new_name)
+        dst_local = os.path.join(dst_dir, new_name)
+        already = os.path.lexists(dst_local) or (new_name in dm.get(kind, {}) and new_name not in dm.get("deleted_root", []))
+        if already:
+            raise HTTPException(status_code=409, detail=f"'{new_name}' already exists in '{dst_proj}'. Delete or rename it first.")
+        in_room = room_enabled() and (name in idx[kind] or name in sm.get(kind, {}))
+        has_local = os.path.lexists(local_src)
+        if not has_local and not in_room:
+            raise HTTPException(status_code=404, detail=f"'{name}' was not found locally or in your HF room.")
+
+        # ---- 1. the data
+        if in_room:
+            _hf_server_copy(u_low, src_proj, dst_proj, kind, room_name, new_room_name, move)
+        if has_local:
+            if move:
+                shutil.move(local_src, dst_local)                      # same disk = instant rename
+                if not in_room:
+                    (room_mark_dirty(u_low, dst_dir, new_name) if is_tree else room_push_file(u_low, dst_dir, new_name))
+            elif not in_room:
+                def _copy_job():
+                    try:
+                        if is_tree:
+                            shutil.copytree(local_src, dst_local, symlinks=True)
+                            room_mark_dirty(u_low, dst_dir, new_name, delay=1)
+                        else:
+                            with open(local_src, "rb") as a, open(dst_local + ".part", "wb") as b:
+                                copy_lowram(a, b)
+                            os.replace(dst_local + ".part", dst_local)
+                            room_push_file(u_low, dst_dir, new_name)
+                        dna_log(u_low, "MANAGER", f"Copied '{name}' → {dst_proj}/{new_name} ✓")
+                    except Exception as e:
+                        dna_log(u_low, "ERROR", f"Copy failed: {e}")
+                _bg(_copy_job)
+        # ---- 2. the project metadata (this is what the Manager lists)
+        entry = dict(sm.get(kind, {}).get(name) or {})
+        if has_local and not is_tree and not entry:
+            try:
+                entry = {"size": os.path.getsize(dst_local if (move and os.path.exists(dst_local)) else local_src), "format": detect_img_type(dst_local if (move and os.path.exists(dst_local)) else local_src)}
+            except Exception:
+                entry = {}
+        entry["mtime"], entry["mtime_full"] = datetime.now().strftime("%y-%m-%d %H:%M"), datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry.pop("download_url", None)
+        dm.setdefault(kind, {})[new_name] = entry
+        if new_name in dm.get("deleted_root", []):
+            dm["deleted_root"].remove(new_name)
+        if is_tree:   # the partition's permission/label/ops files travel with the folder
+            for fn in (f"{name}_fs_config", f"{name}_file_contexts", f"{name}_info.json", f"{name}_manifest.json", f"{name}_ops.json"):
+                sp = os.path.join(src_dir, "config", fn)
+                if os.path.exists(sp):
+                    shutil.copy2(sp, os.path.join(dst_dir, "config", fn))
+            tsrc = os.path.join(src_dir, "config", "_texts", name)
+            if os.path.isdir(tsrc):
+                shutil.copytree(tsrc, os.path.join(dst_dir, "config", "_texts", name), dirs_exist_ok=True)
+        _save_room_meta(dst_dir, dm)
+        room_mark_dirty(u_low, dst_dir, "config", delay=1)
+        if move:
+            sm.get(kind, {}).pop(name, None)
+            if name not in sm.setdefault("deleted_root", []):
+                sm["deleted_root"].append(name)
+            _save_room_meta(src_dir, sm)
+            if in_room:
+                room_delete(u_low, src_proj, kind, room_name)
+            if is_tree:
+                for fn in (f"{name}_fs_config", f"{name}_file_contexts", f"{name}_info.json", f"{name}_manifest.json", f"{name}_ops.json"):
+                    safe_remove(os.path.join(src_dir, "config", fn))
+                shutil.rmtree(os.path.join(src_dir, "config", "_texts", name), ignore_errors=True)
+            room_mark_dirty(u_low, src_dir, "config", delay=1)
+        dna_log(u_low, "MANAGER", f"{'Moved' if move else 'Copied'} '{name}' → {dst_proj}/{new_name} ✓" + (" (done inside HF, nothing downloaded)" if in_room else ""))
+        return {"ok": True}
+
     @router.post("/fs/op")
     def api_fs_op(
         op: str = Form(...), src: str = Form(""), dst: str = Form(""),
@@ -2683,6 +2809,9 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
         src_clean = src.strip().strip("/\\").replace("\\", "/")
         dst_clean = dst.strip().strip("/\\").replace("\\", "/")
         parts = [p for p in src_clean.split("/") if p]
+
+        if op in ("copy", "move") and len(parts) == 2 and parts[1] != "config":
+            return _root_copy_move(u_low, u_root, parts[0], parts[1], dst_clean, op == "move")
 
         if op == "chmod_chcon" and len(parts) >= 2:
             proj_dir = os.path.join(u_root, parts[0])
@@ -2809,6 +2938,8 @@ def setup_dna_manager(app, html_page: str, jobs_dict: dict, hf_api, dataset_repo
             shutil.rmtree(src_full, ignore_errors=True) if os.path.isdir(src_full) else (os.remove(src_full) if os.path.lexists(src_full) else None)
         elif op == "rename" and os.path.lexists(src_full):
             shutil.move(src_full, dst_full)
+        elif op in ("copy", "move"):
+            raise HTTPException(status_code=400, detail="Copy/Move works on files and folders in a project root, or inside an unpacked partition. Select one of those.")
         return {"ok": True}
 
     @router.post("/fs/upload")
